@@ -16,7 +16,9 @@ jobs:
   # ---------------------------------------------------------------------
   deb-rpm:
     name: .deb and .rpm
-    runs-on: ubuntu-22.04
+    # 24.04 is the floor: the GTK4 bindings we enable need GTK >= 4.12 and
+    # libadwaita >= 1.5, which 22.04 (4.6 / 1.1) cannot provide.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +55,7 @@ jobs:
   # ---------------------------------------------------------------------
   tarball:
     name: Portable tarball
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -110,10 +112,13 @@ jobs:
       - name: Build with makepkg
         run: |
           set -euo pipefail
+          # `makepkg -p` takes a filename in the current directory, not a
+          # path, and the PKGBUILD expects $startdir to be the repo root.
+          cp packaging/PKGBUILD ./PKGBUILD
           # makepkg refuses to run as root.
           useradd -m builder
           chown -R builder:builder .
-          sudo -u builder makepkg -f --nodeps --noconfirm -p packaging/PKGBUILD
+          sudo -u builder makepkg -f --nodeps --noconfirm
         env:
           CARGO_TERM_COLOR: always
 

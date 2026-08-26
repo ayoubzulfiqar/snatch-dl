@@ -79,6 +79,9 @@ copied, so it is instant and lossless.
 
 Torrents need nothing installed: librqbit is compiled in.
 
+Snatch needs **GTK 4.12+ and libadwaita 1.5+** — Fedora 39+, Ubuntu 24.04+,
+Debian 13+, or any rolling distribution. Older releases cannot build it.
+
 gallery-dl is not in most distribution repositories. It moved to
 [Codeberg](https://codeberg.org/mikf/gallery-dl) and publishes a standalone
 Linux binary, which the installer can fetch and verify for you:
