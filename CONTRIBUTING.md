@@ -22,6 +22,10 @@ bash -n install.sh
 CI runs exactly these. `clippy` is `-D warnings`, so a new warning fails the
 build.
 
+CI uses the current `stable`. If your local toolchain is older, clippy will
+pass locally and fail in CI on a lint your compiler does not know about yet —
+run `rustup update stable` before pushing.
+
 ## House rules
 
 **No `.unwrap()`, `.expect()`, `panic!` or `unreachable!` in a production

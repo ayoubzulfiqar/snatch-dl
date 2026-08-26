@@ -501,10 +501,14 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     message.extend_from_slice(&bit_length.to_be_bytes());
 
-    for block in message.chunks_exact(64) {
+    // Padding guarantees a whole number of 64-byte blocks, so the remainder
+    // both chunkings produce is always empty.
+    let (blocks, _) = message.as_chunks::<64>();
+    for block in blocks {
         let mut w = [0u32; 64];
-        for (index, word) in block.chunks_exact(4).enumerate() {
-            w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, _) = block.as_chunks::<4>();
+        for (index, word) in words.iter().enumerate() {
+            w[index] = u32::from_be_bytes(*word);
         }
         for index in 16..64 {
             let s0 = w[index - 15].rotate_right(7)
