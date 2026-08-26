@@ -142,6 +142,7 @@ pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
         move |entry| sniff_button.set_sensitive(!entry.text().trim().is_empty())
     });
 
+    let autostart = prefill.is_some();
     if let Some(url) = prefill {
         entry.set_text(url.trim());
     } else {
@@ -280,6 +281,12 @@ pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
     });
 
     dialog.present(Some(ui.window()));
+
+    // A URL handed over from the browser or the socket was already chosen by
+    // the user; making them press Sniff as well is pure friction.
+    if autostart {
+        sniff_button.emit_clicked();
+    }
 }
 
 /// Keep a long page title from stretching the header bar.
@@ -330,11 +337,6 @@ fn fill_results(
             continue;
         }
 
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .build();
-
         // Video and audio are almost always what the user came for.
         let default_on = matches!(kind, MediaKind::Video | MediaKind::Audio);
 
@@ -375,7 +377,6 @@ fn fill_results(
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name(kind.icon()));
             row.add_suffix(&check);
-            list.append(&row);
             group.add(&row);
 
             checks.push(check.clone());

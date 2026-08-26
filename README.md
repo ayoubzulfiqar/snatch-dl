@@ -9,6 +9,10 @@ the browser starts them, and four purpose-built engines behind one window.
 
 ![Downloads](docs/downloads.png)
 
+Point it at a page and pick what you want:
+
+![Media sniffer](docs/sniffer.png)
+
 ---
 
 ## What it does
