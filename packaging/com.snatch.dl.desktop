@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Snatch
+GenericName=Download Manager
+Comment=Fast, resumable downloads powered by aria2, librqbit, yt-dlp and gallery-dl
+Exec=snatch-gui
+Icon=folder-download
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=download;manager;aria2;torrent;magnet;video;gallery;idm;
+StartupNotify=true
+StartupWMClass=com.snatch.dl

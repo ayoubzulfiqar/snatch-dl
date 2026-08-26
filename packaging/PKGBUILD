@@ -1,0 +1,47 @@
+# Maintainer: Ayoub Zulfiqar <ayoubzulfiqar3@gmail.com>
+pkgname=snatch-dl
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Download manager for Linux: aria2, BitTorrent, yt-dlp and gallery-dl behind one GTK4 window"
+arch=('x86_64')
+url="https://github.com/ayoubzulfiqar/snatch-dl"
+license=('GPL-3.0-or-later')
+depends=('gtk4' 'libadwaita' 'aria2')
+# Torrents are built in; the rest are only needed for their own features.
+optdepends=(
+  'ffmpeg: post-processing, conversion and trimming'
+  'yt-dlp: site video extraction'
+  'gallery-dl: image gallery scraping'
+)
+makedepends=('cargo' 'pkgconf')
+options=('!lto')
+
+# Built from the checkout this PKGBUILD ships in.
+build() {
+  cd "${startdir}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features
+}
+
+check() {
+  cd "${startdir}"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "${startdir}"
+  install -Dm755 "target/release/snatch-gui" "${pkgdir}/usr/bin/snatch-gui"
+  install -Dm755 "target/release/snatch-nmh" "${pkgdir}/usr/bin/snatch-nmh"
+  install -Dm644 "packaging/com.snatch.dl.desktop" \
+    "${pkgdir}/usr/share/applications/com.snatch.dl.desktop"
+  install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+  # The WebExtension source, so a user can load it unpacked.
+  install -Dm644 "extension/manifest.base.json" \
+    "${pkgdir}/usr/share/${pkgname}/extension/manifest.base.json"
+  install -Dm644 "extension/background.js" \
+    "${pkgdir}/usr/share/${pkgname}/extension/background.js"
+}

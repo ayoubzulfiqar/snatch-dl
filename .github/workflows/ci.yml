@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI failure should be a real failure, not a flaky network retry.
+  CARGO_NET_RETRY: 3
+
+jobs:
+  check:
+    name: Build, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GTK4 and libadwaita are C libraries; the Rust bindings need their
+      # headers and pkg-config files at build time.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libgtk-4-dev libadwaita-1-dev pkg-config
+
+      # ffmpeg is optional at runtime but the processor has an end-to-end test
+      # that exercises the real binary; without it that test skips itself.
+      - name: Install test dependencies
+        run: sudo apt-get install --no-install-recommends -y ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --release
+
+      - name: Extension syntax
+        run: |
+          node --check extension/background.js
+          python3 -c "import json; json.load(open('extension/manifest.base.json'))"
+
+      - name: Installer syntax
+        run: bash -n install.sh

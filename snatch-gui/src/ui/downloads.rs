@@ -1,0 +1,1011 @@
+//! The Downloads page: aria2 transfers plus the ffmpeg jobs they feed.
+//!
+//! Two lists live here. The upper one shows conversions in flight, because a
+//! post-process job belongs next to the download that produced it rather than
+//! on a page of its own. The lower one is the aria2 queue.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Duration;
+
+use adw::prelude::*;
+
+use super::format::{
+    boxed_list, boxed_list_page, caption_label, control_button, heading_label, human_bytes,
+    human_duration, plain_row, row_body,
+};
+use super::{PageSummary, Ui};
+use crate::aria2::DownloadStatus;
+use crate::processor::{MediaAction, MediaEvent, MediaJob, format_duration};
+use crate::ytdlp::VideoEvent;
+use crate::{adw, gtk};
+use gtk::{gio, glib};
+
+const PAGE_EMPTY: &str = "empty";
+const PAGE_LIST: &str = "list";
+
+/// Extensions we offer post-processing for. Anything else gets no menu.
+const MEDIA_EXTENSIONS: [&str; 14] = [
+    "mp4", "mkv", "webm", "avi", "mov", "flv", "wmv", "m4v", "ts", "mpg", "mpeg", "m4a", "aac",
+    "opus",
+];
+
+fn is_media(path: &Path) -> bool {
+    path.extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|extension| MEDIA_EXTENSIONS.contains(&extension.as_str()))
+}
+
+pub struct DownloadsPage {
+    root: gtk::Box,
+    stack: gtk::Stack,
+    list: gtk::ListBox,
+    jobs_list: gtk::ListBox,
+    jobs_frame: gtk::Box,
+    rows: RefCell<HashMap<String, Rc<Row>>>,
+    jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
+    summary: RefCell<PageSummary>,
+}
+
+impl DownloadsPage {
+    pub fn new() -> Self {
+        let list = boxed_list();
+        let jobs_list = boxed_list();
+
+        let jobs_heading = gtk::Label::builder()
+            .xalign(0.0)
+            .label("Tasks")
+            .css_classes(["snatch-section-heading"])
+            .build();
+
+        let jobs_frame = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_bottom(12)
+            .visible(false)
+            .css_classes(["snatch-tasks"])
+            .build();
+        jobs_frame.append(&jobs_heading);
+        jobs_frame.append(&jobs_list);
+
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(0)
+            .build();
+        column.append(&jobs_frame);
+        column.append(&list);
+
+        let scroller = boxed_list_page(&column);
+
+        let empty = adw::StatusPage::builder()
+            .icon_name("folder-download-symbolic")
+            .title("No Downloads Yet")
+            .description(
+                "Links you click in your browser land here.\n\
+                 You can also paste one with the + button.",
+            )
+            .vexpand(true)
+            .build();
+
+        let stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        stack.add_named(&empty, Some(PAGE_EMPTY));
+        stack.add_named(&scroller, Some(PAGE_LIST));
+        stack.set_visible_child_name(PAGE_EMPTY);
+
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        root.append(&stack);
+
+        Self {
+            root,
+            stack,
+            list,
+            jobs_list,
+            jobs_frame,
+            rows: RefCell::new(HashMap::new()),
+            jobs: RefCell::new(HashMap::new()),
+            summary: RefCell::new(PageSummary::default()),
+        }
+    }
+
+    pub fn widget(&self) -> &gtk::Box {
+        &self.root
+    }
+
+    pub fn summary(&self) -> PageSummary {
+        *self.summary.borrow()
+    }
+
+    /// Reconcile the visible rows with what aria2 reports. aria2 is the single
+    /// source of truth; the UI holds no download state of its own.
+    pub fn apply(&self, ui: &Rc<Ui>, downloads: &[DownloadStatus]) -> PageSummary {
+        let mut seen = HashSet::with_capacity(downloads.len());
+        let mut summary = PageSummary {
+            total: downloads.len(),
+            ..PageSummary::default()
+        };
+
+        {
+            let mut rows = self.rows.borrow_mut();
+
+            for download in downloads {
+                seen.insert(download.gid.as_str());
+                let row = rows.entry(download.gid.clone()).or_insert_with(|| {
+                    let row = Row::new(&download.gid, ui);
+                    self.list.append(&row.root);
+                    row
+                });
+                row.update(download);
+
+                if download.is_active() {
+                    summary.active += 1;
+                    summary.speed += download.download_speed;
+                }
+            }
+
+            rows.retain(|gid, row| {
+                let keep = seen.contains(gid.as_str());
+                if !keep {
+                    self.list.remove(&row.root);
+                }
+                keep
+            });
+        }
+
+        self.stack.set_visible_child_name(if downloads.is_empty() {
+            PAGE_EMPTY
+        } else {
+            PAGE_LIST
+        });
+        *self.summary.borrow_mut() = summary;
+        summary
+    }
+
+    /// Reflect one ffmpeg event in the Processing list.
+    pub fn handle_media(&self, ui: &Rc<Ui>, event: MediaEvent) {
+        match event {
+            MediaEvent::Started { job_id, label } => {
+                let mut jobs = self.jobs.borrow_mut();
+                let row = jobs.entry(job_id).or_insert_with(|| {
+                    let row = JobRow::new(label);
+                    row.on_cancel(ui, job_id, false);
+                    self.jobs_list.append(&row.root);
+                    row
+                });
+                row.set_label(label);
+                self.jobs_frame.set_visible(true);
+            }
+            MediaEvent::Progress { job_id, progress } => {
+                if let Some(row) = self.jobs.borrow().get(&job_id) {
+                    row.update(&progress);
+                }
+            }
+            MediaEvent::Finished { job_id, output } => {
+                self.drop_job(job_id);
+                ui.toast(&format!(
+                    "Finished {}",
+                    output
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| output.display().to_string())
+                ));
+            }
+            MediaEvent::Failed { job_id, error } => {
+                self.drop_job(job_id);
+                ui.toast(&format!("Conversion failed: {error}"));
+            }
+        }
+        self.stack
+            .set_visible_child_name(if self.rows.borrow().is_empty() {
+                if self.jobs.borrow().is_empty() {
+                    PAGE_EMPTY
+                } else {
+                    PAGE_LIST
+                }
+            } else {
+                PAGE_LIST
+            });
+    }
+
+    /// Reflect one yt-dlp event in the task list. Video jobs share the row
+    /// widget with conversions: both are "a subprocess producing a file".
+    pub fn handle_video(&self, ui: &Rc<Ui>, event: VideoEvent) {
+        match event {
+            VideoEvent::Started { job_id, url } => {
+                let mut jobs = self.jobs.borrow_mut();
+                let row = jobs.entry(job_id).or_insert_with(|| {
+                    let row = JobRow::new("Extracting video");
+                    row.on_cancel(ui, job_id, true);
+                    self.jobs_list.append(&row.root);
+                    row
+                });
+                row.set_subtitle(&url);
+                self.jobs_frame.set_visible(true);
+                self.stack.set_visible_child_name(PAGE_LIST);
+            }
+            VideoEvent::Title { job_id, title } => {
+                if let Some(row) = self.jobs.borrow().get(&job_id) {
+                    row.set_label(&format!("Extracting {title}"));
+                }
+            }
+            VideoEvent::Progress { job_id, progress } => {
+                if let Some(row) = self.jobs.borrow().get(&job_id) {
+                    row.update_video(&progress);
+                }
+            }
+            VideoEvent::Finished { job_id, output } => {
+                self.drop_job(job_id);
+                match output {
+                    Some(path) => ui.toast(&format!(
+                        "Saved {}",
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string())
+                    )),
+                    None => ui.toast("Extraction finished"),
+                }
+            }
+            VideoEvent::Failed { job_id, error } => {
+                self.drop_job(job_id);
+                ui.toast(&format!("Extraction failed: {error}"));
+            }
+        }
+    }
+
+    fn drop_job(&self, job_id: i64) {
+        let mut jobs = self.jobs.borrow_mut();
+        if let Some(row) = jobs.remove(&job_id) {
+            self.jobs_list.remove(&row.root);
+        }
+        self.jobs_frame.set_visible(!jobs.is_empty());
+    }
+}
+
+/// A conversion in progress.
+struct JobRow {
+    root: gtk::ListBoxRow,
+    title: gtk::Label,
+    detail: gtk::Label,
+    progress: gtk::ProgressBar,
+    cancel: gtk::Button,
+}
+
+impl JobRow {
+    fn new(label: &str) -> Rc<Self> {
+        let title = heading_label();
+        title.set_text(label);
+        title.add_css_class("snatch-title");
+        let detail = caption_label(false);
+        detail.add_css_class("snatch-detail");
+        let progress = gtk::ProgressBar::builder().hexpand(true).build();
+        let cancel = control_button("process-stop-symbolic", "Stop this job");
+
+        let heading = gtk::Box::builder().spacing(12).build();
+        heading.append(&title);
+        heading.append(&cancel);
+
+        let body = row_body();
+        body.append(&heading);
+        body.append(&progress);
+        body.append(&detail);
+
+        let root = plain_row(&body);
+        root.add_css_class("snatch-row");
+
+        Rc::new(Self {
+            root,
+            title,
+            detail,
+            progress,
+            cancel,
+        })
+    }
+
+    /// Wire the stop button to whichever engine owns this job.
+    fn on_cancel(&self, ui: &Rc<Ui>, job_id: i64, video: bool) {
+        let weak = Rc::downgrade(ui);
+        self.cancel.connect_clicked(move |button| {
+            let Some(ui) = weak.upgrade() else { return };
+            if video {
+                ui.backend().video.cancel(job_id);
+            } else {
+                // ffmpeg jobs are queued serially and are not individually
+                // abortable yet; say so rather than doing nothing.
+                ui.toast("A conversion cannot be stopped once it has started");
+                return;
+            }
+            button.set_sensitive(false);
+            ui.toast("Stopping");
+        });
+    }
+
+    fn set_label(&self, label: &str) {
+        self.title.set_text(label);
+    }
+
+    fn set_subtitle(&self, text: &str) {
+        self.detail.set_text(text);
+    }
+
+    fn update_video(&self, progress: &crate::ytdlp::VideoProgress) {
+        match progress.fraction() {
+            Some(fraction) => self.progress.set_fraction(fraction),
+            // A live stream has no total; show motion, not a false 0%.
+            None => self.progress.pulse(),
+        }
+
+        let mut parts = Vec::new();
+        parts.push(match progress.total {
+            Some(total) => format!(
+                "{} of {}",
+                human_bytes(progress.downloaded),
+                human_bytes(total)
+            ),
+            None => format!("{} downloaded", human_bytes(progress.downloaded)),
+        });
+        if let Some((index, count)) = progress.fragment {
+            parts.push(format!("fragment {index}/{count}"));
+        }
+        if let Some(speed) = progress.speed {
+            parts.push(format!("{}/s", human_bytes(speed as u64)));
+        }
+        if let Some(eta) = progress.eta_seconds.filter(|eta| *eta > 0) {
+            parts.push(format!("{} left", human_duration(eta)));
+        }
+        self.detail.set_text(&parts.join(" · "));
+    }
+
+    fn update(&self, progress: &crate::processor::MediaProgress) {
+        match progress.fraction() {
+            Some(fraction) => self.progress.set_fraction(fraction),
+            // ffprobe could not read a duration: show motion, not a false 0%.
+            None => self.progress.pulse(),
+        }
+
+        let mut parts = vec![format_duration(progress.elapsed)];
+        if let Some(total) = progress.total {
+            parts.push(format!("of {}", format_duration(total)));
+        }
+        if let Some(speed) = progress.speed {
+            parts.push(format!("{speed:.1}x"));
+        }
+        if let Some(eta) = progress.eta() {
+            parts.push(format!("{} left", human_duration(eta.as_secs())));
+        }
+        if progress.output_bytes > 0 {
+            parts.push(human_bytes(progress.output_bytes));
+        }
+        self.detail.set_text(&parts.join(" · "));
+    }
+}
+
+/// The mutable bits a row's button callbacks need to read at click time.
+#[derive(Default)]
+struct RowState {
+    paused: bool,
+    finished: bool,
+    complete: bool,
+    name: String,
+    path: Option<String>,
+    folder: Option<String>,
+}
+
+/// One download: title, progress bar, live detail line and controls.
+struct Row {
+    root: gtk::ListBoxRow,
+    title: gtk::Label,
+    status: gtk::Label,
+    progress: gtk::ProgressBar,
+    detail: gtk::Label,
+    toggle: gtk::Button,
+    open: gtk::Button,
+    process: gtk::MenuButton,
+    state: Rc<RefCell<RowState>>,
+}
+
+impl Row {
+    fn new(gid: &str, ui: &Rc<Ui>) -> Rc<Self> {
+        let state = Rc::new(RefCell::new(RowState::default()));
+
+        let title = heading_label();
+        title.add_css_class("snatch-title");
+        let status = caption_label(true);
+        status.add_css_class("snatch-status");
+        let progress = gtk::ProgressBar::builder().hexpand(true).build();
+        let detail = caption_label(false);
+        detail.add_css_class("snatch-detail");
+
+        let toggle = control_button("media-playback-pause-symbolic", "Pause");
+        let open = control_button("folder-open-symbolic", "Show in file manager");
+        let remove = control_button("user-trash-symbolic", "Remove");
+        open.set_visible(false);
+
+        // The post-process menu appears only on a finished media file.
+        let process = gtk::MenuButton::builder()
+            .icon_name("applications-multimedia-symbolic")
+            .tooltip_text("Post-process this file")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .visible(false)
+            .build();
+        process.set_menu_model(Some(&post_process_menu(gid)));
+
+        let top = gtk::Box::builder().spacing(12).build();
+        top.append(&title);
+        top.append(&status);
+
+        let bottom = gtk::Box::builder().spacing(6).build();
+        bottom.append(&detail);
+        bottom.append(&toggle);
+        bottom.append(&process);
+        bottom.append(&open);
+        bottom.append(&remove);
+
+        let body = row_body();
+        body.append(&top);
+        body.append(&progress);
+        body.append(&bottom);
+        let root = plain_row(&body);
+        root.add_css_class("snatch-row");
+
+        // A right-click anywhere on the row opens the same menu.
+        let gesture = gtk::GestureClick::builder()
+            .button(gdk_button_secondary())
+            .build();
+        gesture.connect_pressed({
+            let process = process.clone();
+            move |_, _, _, _| {
+                if process.is_visible() {
+                    process.popup();
+                }
+            }
+        });
+        root.add_controller(gesture);
+
+        toggle.connect_clicked({
+            let backend = ui.backend().clone();
+            let weak = Rc::downgrade(ui);
+            let state = Rc::clone(&state);
+            let gid = gid.to_owned();
+            move |button| {
+                let resume = state.borrow().paused;
+                button.set_sensitive(false);
+
+                let button = button.clone();
+                let backend = backend.clone();
+                let weak = weak.clone();
+                let gid = gid.clone();
+
+                glib::spawn_future_local(async move {
+                    let client = backend.aria2.clone();
+                    let result = backend
+                        .offload(async move {
+                            if resume {
+                                client.unpause(&gid).await
+                            } else {
+                                client.pause(&gid).await
+                            }
+                        })
+                        .await;
+
+                    button.set_sensitive(true);
+                    if let Err(error) = result
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.toast(&format!("{error:#}"));
+                    }
+                });
+            }
+        });
+
+        open.connect_clicked({
+            let weak = Rc::downgrade(ui);
+            let state = Rc::clone(&state);
+            move |_| {
+                let Some(ui) = weak.upgrade() else { return };
+                let target = {
+                    let state = state.borrow();
+                    state.path.clone().or_else(|| state.folder.clone())
+                };
+                match target {
+                    Some(target) => ui.reveal(Path::new(&target)),
+                    None => ui.toast("aria2 has not chosen a location yet"),
+                }
+            }
+        });
+
+        remove.connect_clicked({
+            let weak = Rc::downgrade(ui);
+            let state = Rc::clone(&state);
+            let gid = gid.to_owned();
+            move |_| {
+                let Some(ui) = weak.upgrade() else { return };
+                let (finished, name, path) = {
+                    let state = state.borrow();
+                    (state.finished, state.name.clone(), state.path.clone())
+                };
+                confirm_remove(&ui, &gid, &name, finished, path);
+            }
+        });
+
+        // Each row installs its own actions, scoped by GID so two rows never
+        // collide in the window's action map.
+        install_row_actions(ui, gid, &state);
+
+        Rc::new(Self {
+            root,
+            title,
+            status,
+            progress,
+            detail,
+            toggle,
+            open,
+            process,
+            state,
+        })
+    }
+
+    fn update(&self, download: &DownloadStatus) {
+        let name = download.display_name();
+        self.title.set_text(&name);
+        self.title.set_tooltip_text(download.path());
+
+        {
+            let mut state = self.state.borrow_mut();
+            state.paused = download.is_paused();
+            state.finished = download.is_finished();
+            state.complete = download.is_complete();
+            state.name = name;
+            state.path = download.path().map(str::to_owned);
+            state.folder = download.folder().map(str::to_owned);
+        }
+
+        self.progress.set_fraction(download.fraction());
+
+        // The row class drives the progress-bar colour; the pill class drives
+        // the label. Both are replaced wholesale so states never accumulate.
+        let (label, pill, row_state): (&str, &[&str], &str) = if download.is_complete() {
+            ("Completed", &["snatch-status", "done"], "done")
+        } else if download.is_error() {
+            ("Failed", &["snatch-status", "failed"], "failed")
+        } else if download.is_paused() {
+            ("Paused", &["snatch-status"], "paused")
+        } else if download.is_waiting() {
+            ("Queued", &["snatch-status"], "")
+        } else if download.is_active() {
+            ("Downloading", &["snatch-status", "active"], "")
+        } else {
+            ("Cancelled", &["snatch-status"], "")
+        };
+        self.status.set_text(label);
+        self.status.set_css_classes(pill);
+        self.root.set_css_classes(&["snatch-row", row_state]);
+        self.detail.set_text(&detail_line(download));
+
+        let running = !download.is_finished();
+        self.toggle.set_visible(running);
+        if running {
+            let (icon, tooltip) = if download.is_paused() {
+                ("media-playback-start-symbolic", "Resume")
+            } else {
+                ("media-playback-pause-symbolic", "Pause")
+            };
+            self.toggle.set_icon_name(icon);
+            self.toggle.set_tooltip_text(Some(tooltip));
+        }
+
+        self.open.set_visible(
+            download.is_complete() && (download.path().is_some() || download.folder().is_some()),
+        );
+
+        // Offering "Extract audio" on a half-downloaded ZIP would just produce
+        // an ffmpeg error, so the menu is gated on a finished media file.
+        let processable =
+            download.is_complete() && download.path().map(Path::new).is_some_and(is_media);
+        self.process.set_visible(processable);
+    }
+}
+
+fn gdk_button_secondary() -> u32 {
+    // GDK_BUTTON_SECONDARY
+    3
+}
+
+fn post_process_menu(gid: &str) -> gio::Menu {
+    let menu = gio::Menu::new();
+    menu.append(
+        Some("Extract Audio (MP3)"),
+        Some(&format!("win.extract-audio::{gid}")),
+    );
+    menu.append(
+        Some("Convert to MP4"),
+        Some(&format!("win.convert-mp4::{gid}")),
+    );
+    menu.append(Some("Trim…"), Some(&format!("win.trim::{gid}")));
+    menu.append(Some("Mux With Audio…"), Some(&format!("win.mux::{gid}")));
+    menu
+}
+
+/// Install the three post-process actions for one row.
+///
+/// GTK actions are addressed by name plus a string parameter, so all rows share
+/// three action names and pass their own GID as the parameter. Installing them
+/// once per row would be wrong, so this is a no-op after the first row.
+fn install_row_actions(ui: &Rc<Ui>, _gid: &str, _state: &Rc<RefCell<RowState>>) {
+    let window = ui.window();
+    if window.lookup_action("extract-audio").is_some() {
+        return;
+    }
+
+    for (name, action) in [
+        (
+            "extract-audio",
+            MediaAction::ExtractAudio { bitrate_kbps: 192 },
+        ),
+        ("convert-mp4", MediaAction::ConvertToMp4),
+    ] {
+        let simple = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(ui);
+        let action = action.clone();
+        simple.connect_activate(move |_, parameter| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(gid) = parameter.and_then(|value| value.str().map(str::to_owned)) else {
+                return;
+            };
+            start_post_process(&ui, &gid, action.clone());
+        });
+        window.add_action(&simple);
+    }
+
+    let trim = gio::SimpleAction::new("trim", Some(glib::VariantTy::STRING));
+    let weak = Rc::downgrade(ui);
+    trim.connect_activate(move |_, parameter| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(gid) = parameter.and_then(|value| value.str().map(str::to_owned)) else {
+            return;
+        };
+        present_trim_dialog(&ui, &gid);
+    });
+    window.add_action(&trim);
+
+    let mux = gio::SimpleAction::new("mux", Some(glib::VariantTy::STRING));
+    let weak = Rc::downgrade(ui);
+    mux.connect_activate(move |_, parameter| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(gid) = parameter.and_then(|value| value.str().map(str::to_owned)) else {
+            return;
+        };
+        choose_audio_and_mux(&ui, &gid);
+    });
+    window.add_action(&mux);
+}
+
+/// Ask for an audio file, then queue a stream-copy mux with the video.
+fn choose_audio_and_mux(ui: &Rc<Ui>, gid: &str) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Audio"));
+    for pattern in [
+        "*.m4a", "*.aac", "*.mp3", "*.opus", "*.ogg", "*.flac", "*.wav",
+    ] {
+        filter.add_pattern(pattern);
+    }
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+
+    let chooser = gtk::FileDialog::builder()
+        .title("Choose the audio track to mux in")
+        .filters(&filters)
+        .modal(true)
+        .build();
+
+    let weak = Rc::downgrade(ui);
+    let gid = gid.to_owned();
+    chooser.open(Some(ui.window()), gio::Cancellable::NONE, move |result| {
+        let Some(ui) = weak.upgrade() else { return };
+        match result {
+            Ok(file) => match file.path() {
+                Some(audio) => start_post_process(&ui, &gid, MediaAction::Mux { audio }),
+                None => ui.toast("That file has no local path"),
+            },
+            // Dismissing the chooser is not an error worth reporting.
+            Err(error) if error.matches(gtk::DialogError::Dismissed) => {}
+            Err(error) => ui.toast(&format!("Could not choose a file: {error}")),
+        }
+    });
+}
+
+/// Look the download's path up from aria2, then queue the ffmpeg job.
+fn start_post_process(ui: &Rc<Ui>, gid: &str, action: MediaAction) {
+    let weak = Rc::downgrade(ui);
+    let backend = ui.backend().clone();
+    let gid = gid.to_owned();
+
+    glib::spawn_future_local(async move {
+        let client = backend.aria2.clone();
+        let lookup = backend
+            .offload(async move { client.snapshot().await })
+            .await;
+
+        let Some(ui) = weak.upgrade() else { return };
+        let input = match lookup {
+            Ok(list) => list
+                .into_iter()
+                .find(|download| download.gid == gid)
+                .and_then(|download| download.path().map(PathBuf::from)),
+            Err(error) => {
+                ui.toast(&format!("{error:#}"));
+                return;
+            }
+        };
+        let Some(input) = input else {
+            ui.toast("That download no longer has a file on disk");
+            return;
+        };
+
+        let job = MediaJob::beside_input(input, action);
+        let label = job.action.label();
+        let queue = backend.media.clone();
+        // Detached: the queue reports progress through MediaEvent.
+        backend.spawn(async move {
+            if let Err(error) = queue.submit(job).await {
+                log::warn!("media job failed: {error:#}");
+            }
+        });
+        ui.toast(&format!("{label}…"));
+    });
+}
+
+fn present_trim_dialog(ui: &Rc<Ui>, gid: &str) {
+    let start = gtk::Entry::builder()
+        .placeholder_text("Start, e.g. 0:30")
+        .activates_default(true)
+        .build();
+    let end = gtk::Entry::builder()
+        .placeholder_text("End, e.g. 2:15 (blank for the end of the file)")
+        .activates_default(true)
+        .build();
+
+    let fields = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .build();
+    fields.append(&start);
+    fields.append(&end);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Trim Video")
+        .body("Streams are copied, so the cut is instant and lossless.")
+        .extra_child(&fields)
+        .build();
+    dialog.add_responses(&[("close", "Cancel"), ("trim", "Trim")]);
+    dialog.set_response_appearance("trim", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("trim"));
+    dialog.set_close_response("close");
+
+    let weak = Rc::downgrade(ui);
+    let gid = gid.to_owned();
+    dialog.connect_response(None, move |_, response| {
+        if response != "trim" {
+            return;
+        }
+        let Some(ui) = weak.upgrade() else { return };
+
+        let from = match parse_timecode(&start.text()) {
+            Some(value) => value,
+            None => {
+                ui.toast("Could not read the start time; use mm:ss or hh:mm:ss");
+                return;
+            }
+        };
+        let to = if end.text().trim().is_empty() {
+            None
+        } else {
+            match parse_timecode(&end.text()) {
+                Some(value) => Some(value),
+                None => {
+                    ui.toast("Could not read the end time; use mm:ss or hh:mm:ss");
+                    return;
+                }
+            }
+        };
+        if let Some(to) = to
+            && to <= from
+        {
+            ui.toast("The end time must be after the start time");
+            return;
+        }
+
+        start_post_process(
+            &ui,
+            &gid,
+            MediaAction::Trim {
+                start: from,
+                end: to,
+            },
+        );
+    });
+
+    dialog.present(Some(ui.window()));
+}
+
+/// Accept `ss`, `mm:ss` or `hh:mm:ss`, with optional fractional seconds.
+fn parse_timecode(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut seconds = 0f64;
+    for part in value.split(':') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let number: f64 = part.parse().ok()?;
+        if number < 0.0 || !number.is_finite() {
+            return None;
+        }
+        seconds = seconds * 60.0 + number;
+    }
+    if value.split(':').count() > 3 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
+}
+
+/// Ask before throwing away data the user is still waiting for.
+fn confirm_remove(ui: &Rc<Ui>, gid: &str, name: &str, finished: bool, path: Option<String>) {
+    if finished {
+        // Nothing is in flight: just forget the entry, keep the file.
+        remove_download(ui, gid.to_owned(), None);
+        return;
+    }
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Cancel Download?")
+        .body(format!(
+            "“{name}” will be cancelled and the data downloaded so far will be deleted."
+        ))
+        .build();
+    dialog.add_responses(&[("keep", "Keep Downloading"), ("drop", "Cancel Download")]);
+    dialog.set_response_appearance("drop", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("keep"));
+    dialog.set_close_response("keep");
+
+    let weak = Rc::downgrade(ui);
+    let gid = gid.to_owned();
+    dialog.connect_response(None, move |_, response| {
+        if response != "drop" {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            remove_download(&ui, gid.clone(), path.clone());
+        }
+    });
+
+    dialog.present(Some(ui.window()));
+}
+
+/// Drop a download from aria2, optionally deleting its partial payload.
+fn remove_download(ui: &Rc<Ui>, gid: String, partial: Option<String>) {
+    let weak = Rc::downgrade(ui);
+    let backend = ui.backend().clone();
+
+    glib::spawn_future_local(async move {
+        let client = backend.aria2.clone();
+        let result = backend
+            .offload(async move {
+                client.remove(&gid).await?;
+                if let Some(path) = partial {
+                    delete_partial(&path).await;
+                }
+                Ok(())
+            })
+            .await;
+
+        if let Err(error) = result
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.toast(&format!("{error:#}"));
+        }
+    });
+}
+
+/// Delete a cancelled download's payload and aria2's control file.
+async fn delete_partial(path: &str) {
+    for candidate in [path.to_owned(), format!("{path}.aria2")] {
+        match tokio::fs::remove_file(&candidate).await {
+            Ok(()) => log::info!("deleted partial file {candidate}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!("could not delete {candidate}: {error}"),
+        }
+    }
+}
+
+fn detail_line(download: &DownloadStatus) -> String {
+    if download.is_error() {
+        let code = download.error_code.as_deref().unwrap_or("?");
+        return match download
+            .error_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            Some(message) => format!("Error {code}: {message}"),
+            None => format!("aria2 error {code}"),
+        };
+    }
+
+    if download.is_complete() {
+        return match download.path() {
+            Some(path) => format!("{} · {path}", human_bytes(download.total_length)),
+            None => human_bytes(download.total_length),
+        };
+    }
+
+    let mut parts = vec![if download.total_length > 0 {
+        format!(
+            "{} of {}",
+            human_bytes(download.completed_length),
+            human_bytes(download.total_length)
+        )
+    } else {
+        format!("{} downloaded", human_bytes(download.completed_length))
+    }];
+
+    if download.is_active() {
+        parts.push(format!("{}/s", human_bytes(download.download_speed)));
+        if download.connections > 0 {
+            parts.push(format!("{} connections", download.connections));
+        }
+        if let Some(eta) = download.eta_seconds() {
+            parts.push(format!("{} left", human_duration(eta)));
+        }
+    } else if download.is_paused() {
+        parts.push("paused".to_owned());
+    } else if download.is_waiting() {
+        parts.push("waiting for a free slot".to_owned());
+    }
+
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timecodes_accept_the_three_common_shapes() {
+        assert_eq!(parse_timecode("90"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_timecode("1:30"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_timecode("1:01:01"), Some(Duration::from_secs(3661)));
+        assert_eq!(
+            parse_timecode(" 0:02.5 "),
+            Some(Duration::from_secs_f64(2.5))
+        );
+    }
+
+    #[test]
+    fn timecodes_reject_nonsense() {
+        assert_eq!(parse_timecode(""), None);
+        assert_eq!(parse_timecode("abc"), None);
+        assert_eq!(parse_timecode("1:"), None);
+        assert_eq!(parse_timecode("-5"), None);
+        assert_eq!(parse_timecode("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn only_media_files_offer_post_processing() {
+        assert!(is_media(Path::new("/x/movie.mkv")));
+        assert!(is_media(Path::new("/x/CLIP.MP4")));
+        assert!(is_media(Path::new("/x/song.m4a")));
+        // Offering "extract audio" on an archive would only produce an error.
+        assert!(!is_media(Path::new("/x/archive.zip")));
+        assert!(!is_media(Path::new("/x/no-extension")));
+    }
+}

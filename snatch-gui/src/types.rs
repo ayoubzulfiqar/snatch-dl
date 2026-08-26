@@ -1,0 +1,372 @@
+//! Types shared between the IPC layer, the aria2 client and the UI.
+
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::aria2::DownloadStatus;
+use crate::gallery::GalleryEvent;
+use crate::processor::MediaEvent;
+use crate::torrent::TorrentSnapshot;
+
+/// Schemes we are willing to hand to aria2. Anything else (`file:`, `data:`,
+/// `javascript:` …) is rejected: this payload arrives from a web page.
+const ALLOWED_SCHEMES: [&str; 4] = ["http", "https", "ftp", "ftps"];
+
+/// What the browser (or a socket client) is asking Snatch to do.
+///
+/// Absent on the wire means [`JobKind::Download`], so a payload written for the
+/// first release of the extension still parses unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobKind {
+    /// A direct HTTP/FTP link for aria2.
+    #[default]
+    Download,
+    /// A `magnet:` URI for the BitTorrent engine.
+    Magnet,
+    /// A page to hand to gallery-dl.
+    Scrape,
+    /// A watch page to hand to yt-dlp.
+    Video,
+}
+
+impl JobKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            JobKind::Download => "download",
+            JobKind::Magnet => "torrent",
+            JobKind::Scrape => "scrape",
+            JobKind::Video => "video",
+        }
+    }
+}
+
+/// A download hand-off, as produced by the browser extension and forwarded by
+/// `snatch-nmh`. Must stay wire-compatible with the struct of the same name in
+/// the `snatch-nmh` crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRequest {
+    /// Which engine should take this. Defaults to [`JobKind::Download`].
+    #[serde(default)]
+    pub kind: JobKind,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookies: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+impl DownloadRequest {
+    /// A magnet link, for the torrent engine.
+    pub fn magnet(url: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Magnet,
+            ..Self::from_url(url)
+        }
+    }
+
+    /// A page for gallery-dl to scrape.
+    pub fn scrape(url: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Scrape,
+            ..Self::from_url(url)
+        }
+    }
+
+    /// A watch page for yt-dlp to extract.
+    pub fn video(url: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Video,
+            ..Self::from_url(url)
+        }
+    }
+
+    /// Infer the kind from the URL when the sender did not say.
+    pub fn inferred_kind(&self) -> JobKind {
+        if self.kind == JobKind::Download && self.url.trim_start().starts_with("magnet:") {
+            return JobKind::Magnet;
+        }
+        self.kind
+    }
+
+    /// A bare request, as produced by the "Add download" dialog.
+    pub fn from_url(url: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Download,
+            url: url.into(),
+            filename: None,
+            cookies: None,
+            referer: None,
+            user_agent: None,
+            mime: None,
+            size: None,
+        }
+    }
+
+    /// Reject anything the chosen engine should never be asked to fetch.
+    pub fn validate(&self) -> Result<()> {
+        let url = self.url.trim();
+        if url.is_empty() {
+            bail!("the URL is empty");
+        }
+        if self.inferred_kind() == JobKind::Magnet {
+            // A magnet has no `://`, so it is checked on its own terms.
+            if !url.starts_with("magnet:") {
+                bail!("a torrent job needs a magnet: link");
+            }
+            if url.len() > 8192 || url.contains(['\r', '\n']) {
+                bail!("the magnet link is malformed");
+            }
+            return Ok(());
+        }
+        if url.len() > 8192 {
+            bail!("the URL is unreasonably long ({} bytes)", url.len());
+        }
+        if url.contains(['\r', '\n']) {
+            bail!("the URL contains a line break");
+        }
+
+        let Some((scheme, rest)) = url.split_once("://") else {
+            bail!(
+                "the URL has no scheme (expected one of {})",
+                ALLOWED_SCHEMES.join(", ")
+            );
+        };
+        let scheme = scheme.to_ascii_lowercase();
+        if !ALLOWED_SCHEMES.contains(&scheme.as_str()) {
+            bail!("unsupported URL scheme '{scheme}'");
+        }
+        if rest.is_empty() {
+            bail!("the URL has no host");
+        }
+        Ok(())
+    }
+
+    /// The `out` option for aria2: a plain basename with no path components,
+    /// control characters or leading dots.
+    pub fn sanitized_filename(&self) -> Option<String> {
+        let raw = self.filename.as_deref()?.trim();
+        // Take the last path component so "../../.bashrc" can never escape.
+        let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+        let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+        let cleaned = cleaned.trim().trim_start_matches('.').trim();
+        if cleaned.is_empty() {
+            return None;
+        }
+        Some(clamp_bytes(cleaned, 200))
+    }
+
+    /// A human-readable label, used for toasts before an engine reports a path.
+    pub fn display_name(&self) -> String {
+        if let Some(name) = self.sanitized_filename() {
+            return name;
+        }
+        // A magnet has no path to take a basename from; its `dn` parameter is
+        // the display name the standard provides for exactly this purpose.
+        // Without one, show the whole link — `name_from_url` would reduce it
+        // to the bare string "magnet:", which identifies nothing.
+        if self.inferred_kind() == JobKind::Magnet {
+            return magnet_display_name(&self.url)
+                .unwrap_or_else(|| clamp_bytes(self.url.trim(), 200));
+        }
+        name_from_url(&self.url).unwrap_or_else(|| self.url.trim().to_owned())
+    }
+}
+
+/// Pull `dn=` (display name) out of a magnet link, percent/plus decoded.
+pub fn magnet_display_name(magnet: &str) -> Option<String> {
+    let query = magnet.split_once('?')?.1;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key != "dn" || value.is_empty() {
+            continue;
+        }
+        // `+` is a space in a query string; everything else is percent-encoded.
+        let decoded = percent_decode_lossy(&value.replace('+', " "));
+        let trimmed = decoded.trim();
+        if !trimmed.is_empty() {
+            return Some(clamp_bytes(trimmed, 200));
+        }
+    }
+    None
+}
+
+/// Best-effort percent decoding; invalid escapes are kept verbatim.
+fn percent_decode_lossy(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(byte) = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Derive a filename from the path component of a URL.
+pub fn name_from_url(url: &str) -> Option<String> {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = without_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let last = path.rsplit('/').next()?.trim();
+    if last.is_empty() {
+        None
+    } else {
+        Some(clamp_bytes(last, 200))
+    }
+}
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 character.
+fn clamp_bytes(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// The line-delimited JSON answer sent back over the Unix socket. Must stay
+/// wire-compatible with `Reply` in the `snatch-nmh` crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl IpcResponse {
+    pub fn accepted(gid: String) -> Self {
+        Self {
+            ok: true,
+            gid: Some(gid),
+            error: None,
+        }
+    }
+
+    pub fn rejected(error: String) -> Self {
+        Self {
+            ok: false,
+            gid: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Everything the background tasks push at the GLib main loop.
+#[derive(Debug)]
+pub enum UiEvent {
+    /// A job was accepted by an engine (from the browser or the CLI socket).
+    /// `kind` lets the window show the page that job landed on.
+    Added { name: String, kind: JobKind },
+    /// A full picture of every download aria2 currently knows about.
+    Snapshot(Vec<DownloadStatus>),
+    /// The aria2 RPC endpoint is answering.
+    Aria2Up(String),
+    /// aria2 is unavailable; the string explains why.
+    Aria2Down(String),
+    /// A signal asked us to shut down.
+    Quit,
+    /// A fresh picture of every torrent in the session.
+    Torrents(Vec<TorrentSnapshot>),
+    /// The BitTorrent session could not be started.
+    TorrentsUnavailable(String),
+    /// Progress from a `gallery-dl` batch.
+    Gallery(GalleryEvent),
+    /// Progress from an `ffmpeg` job.
+    Media(MediaEvent),
+    /// Progress from a `yt-dlp` extraction.
+    Video(crate::ytdlp::VideoEvent),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn magnet_names_come_from_the_dn_parameter() {
+        let request = DownloadRequest::magnet(
+            "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny",
+        );
+        // Without this the toast would read "Added magnet:".
+        assert_eq!(request.display_name(), "Big Buck Bunny");
+    }
+
+    #[test]
+    fn magnet_names_are_percent_decoded() {
+        let request =
+            DownloadRequest::magnet("magnet:?xt=urn:btih:abc&dn=Cosmos%20Laundromat%20%282015%29");
+        assert_eq!(request.display_name(), "Cosmos Laundromat (2015)");
+    }
+
+    #[test]
+    fn a_magnet_without_dn_falls_back_to_the_link() {
+        let request = DownloadRequest::magnet("magnet:?xt=urn:btih:abc");
+        assert_eq!(request.display_name(), "magnet:?xt=urn:btih:abc");
+    }
+
+    #[test]
+    fn kind_is_inferred_from_a_magnet_scheme() {
+        // The extension may omit `kind` entirely.
+        let request = DownloadRequest::from_url("magnet:?xt=urn:btih:abc");
+        assert_eq!(request.kind, JobKind::Download);
+        assert_eq!(request.inferred_kind(), JobKind::Magnet);
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn magnets_are_validated_on_their_own_terms() {
+        // A magnet has no "://", so the http path would have rejected it.
+        assert!(
+            DownloadRequest::magnet("magnet:?xt=urn:btih:abc")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            DownloadRequest::magnet("https://example.com/x")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            DownloadRequest::magnet("magnet:?dn=a\r\nX: y")
+                .validate()
+                .is_err(),
+            "a CRLF must never reach the engine"
+        );
+    }
+
+    #[test]
+    fn absent_kind_still_parses_from_an_older_extension() {
+        let request: DownloadRequest =
+            serde_json::from_str(r#"{"url":"https://example.com/a.zip"}"#)
+                .expect("a payload without `kind` must still parse");
+        assert_eq!(request.kind, JobKind::Download);
+        assert_eq!(request.inferred_kind(), JobKind::Download);
+    }
+}

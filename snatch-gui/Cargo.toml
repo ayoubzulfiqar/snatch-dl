@@ -1,0 +1,96 @@
+[package]
+name = "snatch-gui"
+description = "GTK4/libadwaita front-end and aria2 orchestrator for Snatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "snatch-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+dirs.workspace = true
+env_logger.workspace = true
+futures.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+gtk4 = { version = "0.11", features = ["v4_12"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
+
+# rustls (not native-tls) so there is no OpenSSL build dependency; `socks`
+# lets a download be routed through a SOCKS5 proxy by the ProxyManager.
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "socks",
+  "rustls",
+  # Trust the distribution's CA bundle rather than shipping our own.
+  "rustls-native-certs",
+] }
+
+# Pure-Rust BitTorrent engine: DHT, ut_pex, magnet links, sequential streaming
+# and SOCKS5 outbound, with no C toolchain required.
+librqbit = { version = "9.0", default-features = false, features = ["rust-tls"] }
+
+# `bundled` compiles SQLite from source, so there is no libsqlite3-dev to chase
+# across distributions.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+url = "2.5"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "process", "sync", "fs", "signal"] }
+
+# --- Debian / Ubuntu -------------------------------------------------------
+# `cargo deb -p snatch-gui`
+[package.metadata.deb]
+name = "snatch-dl"
+maintainer = "Ayoub Zulfiqar <ayoubzulfiqar3@gmail.com>"
+copyright = "2026, Snatch contributors"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Snatch is a download manager for Linux. HTTP and FTP transfers run through \
+aria2 with segmented connections and resume; torrents run through a built-in \
+librqbit session with DHT, peer exchange and sequential streaming; site video \
+goes to yt-dlp and image galleries to gallery-dl. A browser extension captures \
+downloads before the browser starts them."""
+section = "net"
+priority = "optional"
+# gtk4/libadwaita are resolved by shlibs from the linked binary; aria2 is a
+# runtime subprocess so it has to be named explicitly.
+depends = "$auto, aria2"
+recommends = "ffmpeg, yt-dlp"
+assets = [
+  ["../target/release/snatch-gui", "usr/bin/", "755"],
+  ["../target/release/snatch-nmh", "usr/bin/", "755"],
+  ["../packaging/com.snatch.dl.desktop", "usr/share/applications/", "644"],
+  ["../README.md", "usr/share/doc/snatch-dl/README.md", "644"],
+  ["../extension/manifest.base.json", "usr/share/snatch-dl/extension/", "644"],
+  ["../extension/background.js", "usr/share/snatch-dl/extension/", "644"],
+]
+
+# --- Fedora / RHEL / openSUSE ---------------------------------------------
+# `cargo generate-rpm -p snatch-gui`
+[package.metadata.generate-rpm]
+name = "snatch-dl"
+summary = "Download manager for Linux with aria2, BitTorrent, yt-dlp and gallery-dl"
+license = "GPL-3.0-or-later"
+assets = [
+  { source = "../target/release/snatch-gui", dest = "/usr/bin/snatch-gui", mode = "755" },
+  { source = "../target/release/snatch-nmh", dest = "/usr/bin/snatch-nmh", mode = "755" },
+  { source = "../packaging/com.snatch.dl.desktop", dest = "/usr/share/applications/com.snatch.dl.desktop", mode = "644" },
+  { source = "../LICENSE", dest = "/usr/share/licenses/snatch-dl/LICENSE", mode = "644", doc = true },
+  { source = "../README.md", dest = "/usr/share/doc/snatch-dl/README.md", mode = "644", doc = true },
+  { source = "../extension/manifest.base.json", dest = "/usr/share/snatch-dl/extension/manifest.base.json", mode = "644" },
+  { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension/background.js", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+aria2 = "*"
+gtk4 = "*"
+libadwaita = "*"

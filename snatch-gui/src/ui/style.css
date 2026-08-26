@@ -1,0 +1,121 @@
+/*
+ * Snatch's own styling, layered on top of libadwaita.
+ *
+ * Deliberately restrained: libadwaita already matches the user's system theme,
+ * accent colour and light/dark preference, and fighting it produces an app
+ * that looks foreign on every desktop. Everything below is either a
+ * readability fix or a density change that libadwaita has no opinion about.
+ *
+ * Colours come from libadwaita's named palette (@accent_color, @card_bg_color
+ * and friends), so a custom accent or a dark theme is picked up for free.
+ */
+
+/* --- transfer rows ------------------------------------------------------ */
+
+/* The stock progress bar is a hairline; a download manager is mostly progress
+   bars, so they earn a little more weight. */
+.snatch-row progressbar > trough,
+.snatch-row progressbar > trough > progress {
+  min-height: 7px;
+  border-radius: 6px;
+}
+
+.snatch-row progressbar > trough > progress {
+  background-image: none;
+  background-color: @accent_bg_color;
+}
+
+/* A finished transfer should read as done at a glance, not just by its label. */
+.snatch-row.done progressbar > trough > progress {
+  background-color: @success_color;
+}
+
+.snatch-row.failed progressbar > trough > progress {
+  background-color: @error_color;
+}
+
+.snatch-row.paused progressbar > trough > progress {
+  background-color: alpha(currentColor, 0.35);
+}
+
+/* Numbers that tick every 500 ms must not reflow the row as digits change
+   width, so the detail line uses tabular figures. */
+.snatch-detail {
+  font-feature-settings: "tnum" 1;
+  opacity: 0.72;
+}
+
+.snatch-title {
+  font-weight: 700;
+}
+
+/* --- status pills ------------------------------------------------------- */
+
+.snatch-status {
+  font-size: 0.82em;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.10);
+}
+
+.snatch-status.active {
+  color: @accent_color;
+  background-color: alpha(@accent_color, 0.13);
+}
+
+.snatch-status.done {
+  color: @success_color;
+  background-color: alpha(@success_color, 0.13);
+}
+
+.snatch-status.failed {
+  color: @error_color;
+  background-color: alpha(@error_color, 0.13);
+}
+
+/* --- task list (conversions and extractions) ---------------------------- */
+
+.snatch-tasks {
+  background-color: alpha(@accent_bg_color, 0.06);
+  border-radius: 12px;
+  padding: 6px;
+}
+
+.snatch-section-heading {
+  font-size: 0.85em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.6;
+  margin: 2px 4px;
+}
+
+/* --- scraper thumbnails ------------------------------------------------- */
+
+.snatch-thumb {
+  border-radius: 8px;
+  padding: 0;
+  min-width: 96px;
+  min-height: 96px;
+  background-color: @card_bg_color;
+}
+
+.snatch-thumb:hover {
+  background-color: alpha(@accent_bg_color, 0.20);
+}
+
+/* --- torrent peer line -------------------------------------------------- */
+
+.snatch-peers {
+  font-size: 0.85em;
+  font-feature-settings: "tnum" 1;
+  opacity: 0.62;
+}
+
+/* --- empty states ------------------------------------------------------- */
+
+.snatch-hint {
+  font-size: 0.9em;
+  opacity: 0.6;
+}

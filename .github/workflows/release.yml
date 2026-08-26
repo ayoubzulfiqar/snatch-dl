@@ -1,0 +1,136 @@
+name: Release
+
+# Packaging runs on a tag, and can be dry-run by hand from the Actions tab.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Debian / Ubuntu / Mint .deb and Fedora / RHEL / openSUSE .rpm are built
+  # on the oldest sensible glibc so the binary runs on newer systems too.
+  # ---------------------------------------------------------------------
+  deb-rpm:
+    name: .deb and .rpm
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libgtk-4-dev libadwaita-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packagers
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build .deb
+        run: cargo deb -p snatch-gui --no-build --output dist/
+
+      - name: Build .rpm
+        run: |
+          mkdir -p dist
+          cargo generate-rpm -p snatch-gui --output dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/*
+
+  # ---------------------------------------------------------------------
+  # A portable tarball for every other distribution, plus the Arch PKGBUILD.
+  # ---------------------------------------------------------------------
+  tarball:
+    name: Portable tarball
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libgtk-4-dev libadwaita-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Assemble
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "${VERSION}" = "${GITHUB_REF_NAME}" ] && VERSION="dev"
+          STAGE="snatch-${VERSION}-x86_64-linux"
+          mkdir -p "dist/${STAGE}"
+          cp target/release/snatch-gui target/release/snatch-nmh "dist/${STAGE}/"
+          cp -r extension install.sh README.md LICENSE "dist/${STAGE}/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          rm -rf "dist/${STAGE}"
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-tarball
+          path: dist/*
+
+  # ---------------------------------------------------------------------
+  # Arch: build inside an Arch container so makepkg and the real dependency
+  # names are available.
+  # ---------------------------------------------------------------------
+  arch:
+    name: Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed rust gtk4 libadwaita git sudo
+
+      - name: Build with makepkg
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root.
+          useradd -m builder
+          chown -R builder:builder .
+          sudo -u builder makepkg -f --nodeps --noconfirm -p packaging/PKGBUILD
+        env:
+          CARGO_TERM_COLOR: always
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: "*.pkg.tar.zst"
+
+  publish:
+    name: Attach to the release
+    needs: [deb-rpm, tarball, arch]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

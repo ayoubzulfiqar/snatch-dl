@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["snatch-gui", "snatch-nmh"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+authors = ["Snatch contributors"]
+repository = "https://github.com/snatch-dl/snatch"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-channel = "2.3"
+dirs = "6.0"
+env_logger = "0.11"
+futures = "0.3"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44", default-features = false }
+
+# Optimise the release build for a desktop app: small, fast, single codegen unit.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
