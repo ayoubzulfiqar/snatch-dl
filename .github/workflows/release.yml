@@ -72,8 +72,13 @@ jobs:
       - name: Assemble
         run: |
           set -euo pipefail
+          # A manual dispatch has no tag, so fall back to a dev name.
+          # Written as an if: `[ ... ] && x` returns non-zero when the test
+          # fails, which trips `set -e`.
           VERSION="${GITHUB_REF_NAME#v}"
-          [ "${VERSION}" = "${GITHUB_REF_NAME}" ] && VERSION="dev"
+          if [ "${VERSION}" = "${GITHUB_REF_NAME}" ]; then
+            VERSION="dev"
+          fi
           STAGE="snatch-${VERSION}-x86_64-linux"
           mkdir -p "dist/${STAGE}"
           cp target/release/snatch-gui target/release/snatch-nmh "dist/${STAGE}/"
