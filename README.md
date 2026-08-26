@@ -1,4 +1,10 @@
+<div align="center">
+
+<img src="docs/icon.png" width="128" alt="Snatch">
+
 # Snatch
+
+</div>
 
 A download manager for Linux that behaves the way IDM users expect, built out
 of engines that are already good at their jobs rather than a homegrown
@@ -30,6 +36,7 @@ Every engine option is configurable, IDM-style:
 | Conversion / trimming | **ffmpeg** | Post-process without leaving the app. |
 | Finding media on a page | built-in **sniffer** | Reads the DOM *and* asks yt-dlp, then lets you pick. |
 | A second HTTP engine | **Wget2** | Also multithreaded; some servers prefer its request pattern. |
+| Downloads behind a login | **cURL import** | Paste "Copy as cURL" and the cookies, referer and user agent come with it. |
 
 Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
 every socket and subprocess, and the two meet through a single event channel —
@@ -79,6 +86,18 @@ the real media is behind a DASH/HLS manifest that appears nowhere in the HTML.
 Each link is probed with a `HEAD` for its true type and size, so a download
 link with no extension is still classified correctly. Results are grouped by
 kind with per-group select-all; tick what you want and it queues.
+
+**Download something that needs your login.**
+In the browser's network inspector, right-click the request → **Copy as cURL**,
+then paste the whole thing into Snatch's Add box. The URL, cookies, referer and
+user agent are read straight out of it, so a file behind a session works
+without you reconstructing any of that. Chrome, Firefox and the Windows `cmd`
+dialects all parse.
+
+**Pull one file from several mirrors.**
+Paste several URLs, tick *Treat multiple URLs as mirrors of one file*, and
+aria2 spreads its connections across all of them and fails over automatically.
+Untick it and each line becomes its own download instead.
 
 **Trim a clip without re-encoding.**
 Right-click a finished video → **Trim…**, give a start and end. Streams are
@@ -178,6 +197,7 @@ are generated from `extension/manifest.base.json`.
 | `Ctrl+F` | Find all media on a page |
 | `Ctrl+P` | Pause everything |
 | `Ctrl+,` | Settings |
+| `F9` | Show or hide the sidebar |
 | `Ctrl+?` | Shortcuts |
 
 From the browser, right-click gives you **Download with Snatch**, **Send Magnet
@@ -215,10 +235,15 @@ The reply is one line of JSON: `{"ok":true,"gid":"..."}` or
 
 ## Settings
 
-Snatch is navigated from a sidebar: **Downloads**, **Torrents**, **Scraper**
-and **Settings**, each a real page rather than a dialog. Live counts appear
-next to a destination, so activity on a page you are not looking at is still
-visible. It reopens on whichever page you left it.
+Snatch is navigated from a sidebar drawer: **Downloads**, **Torrents**,
+**Scraper** and **Settings**, each a real page rather than a dialog. Live
+counts appear next to a destination, so activity on a page you are not looking
+at is still visible.
+
+The drawer is toggled with the button in the header or **F9**, and it stays
+however you left it — it is never closed for you. On a narrow window it floats
+over the content instead of pushing it aside, and picking a destination there
+gets it out of the way. Snatch also reopens on whichever page you left it.
 
 Settings covers what the underlying engines expose — segments per download,
 connections per server, minimum split size, simultaneous downloads, overall
@@ -322,6 +347,7 @@ download of the page's HTML.
 | `sniff.rs` | Page fetch, DOM walk, extractor pass, HEAD probing |
 | `wget.rs` | Wget2 engine, progress measured from the file on disk |
 | `settings.rs` | Persisted configuration and where each value applies |
+| `curl.rs` | Parsing a browser's "Copy as cURL" into a request |
 | `deps.rs` | Tool discovery and verified self-installation |
 | `gallery.rs` | gallery-dl subprocess, two-stream output merge |
 | `processor.rs` | ffmpeg jobs and the serial encode queue |
@@ -357,7 +383,7 @@ Three things in here are counter-intuitive and are all covered by tests:
 
 ```bash
 cargo build --release
-cargo test --workspace       # 86 tests
+cargo test --workspace       # 97 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -371,6 +397,24 @@ fixtures, because every one of those formats has a quirk that invented
 fixtures would miss.
 
 ---
+
+## Prior art
+
+[Surge](https://github.com/SurgeDM/Surge) is an excellent Go TUI download
+manager. It cannot be linked into a GTK4/Rust application — it is a separate
+language with its own daemon and a terminal interface — but three of its ideas
+were worth taking, and are credited in the code:
+
+- **Paste a cURL command.** Surge parses one from the clipboard in its TUI;
+  Snatch accepts one in the Add box. It is the fastest route to a download
+  that needs a session.
+- **Multiple mirrors for one file.** aria2 has supported this all along and
+  Snatch simply was not exposing it.
+- **Batch add.** Several URLs at once, one per line.
+
+Snatch already had the other things Surge highlights — a background daemon
+other processes queue into, sequential/streaming download, and segmented
+transfers.
 
 ## License
 

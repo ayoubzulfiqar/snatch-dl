@@ -189,6 +189,9 @@ pub struct InterfaceSettings {
     pub download_dir: String,
     /// The page shown at startup, so Snatch reopens where you left it.
     pub last_page: String,
+    /// Whether the sidebar drawer is open. Remembered across restarts, and
+    /// never closed automatically.
+    pub sidebar_open: bool,
 }
 
 impl Default for InterfaceSettings {
@@ -198,6 +201,7 @@ impl Default for InterfaceSettings {
             confirm_cancel: true,
             download_dir: String::new(),
             last_page: "downloads".to_owned(),
+            sidebar_open: true,
         }
     }
 }

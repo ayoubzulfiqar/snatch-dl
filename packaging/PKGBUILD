@@ -46,6 +46,11 @@ package() {
   install -Dm755 "target/release/snatch-nmh" "${pkgdir}/usr/bin/snatch-nmh"
   install -Dm644 "packaging/com.snatch.dl.desktop" \
     "${pkgdir}/usr/share/applications/com.snatch.dl.desktop"
+  local size
+  for size in 16 24 32 48 64 96 128 256 512; do
+    install -Dm644 "assets/icons/com.snatch.dl-${size}.png" \
+      "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/com.snatch.dl.png"
+  done
   install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 

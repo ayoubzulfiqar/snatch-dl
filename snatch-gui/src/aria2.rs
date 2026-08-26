@@ -207,9 +207,12 @@ impl Aria2Client {
             options.insert("header".to_owned(), json!([format!("Cookie: {cookies}")]));
         }
 
+        // Every source for the same file. aria2 spreads its connections
+        // across the mirrors and fails over between them, so one slow host
+        // does not decide the speed.
         self.call(
             "aria2.addUri",
-            vec![json!([request.url.trim()]), Value::Object(options)],
+            vec![json!(request.sources()), Value::Object(options)],
         )
         .await
     }

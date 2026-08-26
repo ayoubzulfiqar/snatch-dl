@@ -65,9 +65,27 @@ pub struct DownloadRequest {
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Additional sources for the *same* file. aria2 spreads its connections
+    /// across every mirror and fails over between them, so a slow or flaky
+    /// primary does not decide the speed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
 }
 
 impl DownloadRequest {
+    /// Every source for this file: the primary followed by any mirrors,
+    /// trimmed and deduplicated.
+    pub fn sources(&self) -> Vec<String> {
+        let mut sources = vec![self.url.trim().to_owned()];
+        for mirror in &self.mirrors {
+            let mirror = mirror.trim();
+            if !mirror.is_empty() && !sources.iter().any(|existing| existing == mirror) {
+                sources.push(mirror.to_owned());
+            }
+        }
+        sources
+    }
+
     /// A magnet link, for the torrent engine.
     pub fn magnet(url: impl Into<String>) -> Self {
         Self {
@@ -119,6 +137,7 @@ impl DownloadRequest {
             user_agent: None,
             mime: None,
             size: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -383,5 +402,37 @@ mod tests {
                 .expect("a payload without `kind` must still parse");
         assert_eq!(request.kind, JobKind::Download);
         assert_eq!(request.inferred_kind(), JobKind::Download);
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_request_has_one_source() {
+        let request = DownloadRequest::from_url("https://a.example/f.iso");
+        assert_eq!(request.sources(), vec!["https://a.example/f.iso"]);
+    }
+
+    #[test]
+    fn mirrors_follow_the_primary_and_deduplicate() {
+        let mut request = DownloadRequest::from_url("https://a.example/f.iso");
+        request.mirrors = vec![
+            "  https://b.example/f.iso ".to_owned(),
+            // A repeat of the primary would make aria2 open two connections
+            // to the same host thinking they were different mirrors.
+            "https://a.example/f.iso".to_owned(),
+            String::new(),
+            "https://c.example/f.iso".to_owned(),
+        ];
+        assert_eq!(
+            request.sources(),
+            vec![
+                "https://a.example/f.iso",
+                "https://b.example/f.iso",
+                "https://c.example/f.iso",
+            ]
+        );
     }
 }

@@ -83,7 +83,8 @@ pub struct Ui {
     banner: adw::Banner,
     toasts: adw::ToastOverlay,
     stack: adw::ViewStack,
-    split: adw::NavigationSplitView,
+    split: adw::OverlaySplitView,
+    drawer_toggle: gtk::ToggleButton,
     sidebar_list: gtk::ListBox,
     /// Page name paired with its sidebar count badge.
     sidebar_rows: Vec<(String, gtk::Label)>,
@@ -100,7 +101,7 @@ pub struct Ui {
 
 impl Ui {
     fn new(app: &adw::Application, backend: Backend) -> Rc<Self> {
-        let title = adw::WindowTitle::new("Snatch", "No downloads");
+        let title = adw::WindowTitle::new("Downloads", "Idle");
 
         let downloads = downloads::DownloadsPage::new();
         let torrents = torrents::TorrentsPage::new();
@@ -237,7 +238,14 @@ impl Ui {
         toasts.set_child(Some(&stack));
         let banner = adw::Banner::builder().revealed(false).build();
 
+        let drawer_toggle = gtk::ToggleButton::builder()
+            .icon_name("sidebar-show-symbolic")
+            .tooltip_text("Show or hide the sidebar (F9)")
+            .active(true)
+            .build();
+
         let header = adw::HeaderBar::builder().title_widget(&title).build();
+        header.pack_start(&drawer_toggle);
         header.pack_end(
             &gtk::MenuButton::builder()
                 .icon_name("open-menu-symbolic")
@@ -251,21 +259,17 @@ impl Ui {
         content_toolbar.add_top_bar(&header);
         content_toolbar.add_top_bar(&banner);
 
-        let split = adw::NavigationSplitView::builder()
-            .sidebar(
-                &adw::NavigationPage::builder()
-                    .title("Snatch")
-                    .child(&sidebar_toolbar)
-                    .build(),
-            )
-            .content(
-                &adw::NavigationPage::builder()
-                    .title("Downloads")
-                    .child(&content_toolbar)
-                    .build(),
-            )
-            .min_sidebar_width(240.0)
-            .max_sidebar_width(300.0)
+        // OverlaySplitView, not NavigationSplitView: this one is a drawer. It
+        // can be toggled open and shut at any width, and it never closes
+        // itself — a narrow window only changes it from pushing the content
+        // aside to floating over it.
+        let split = adw::OverlaySplitView::builder()
+            .sidebar(&sidebar_toolbar)
+            .content(&content_toolbar)
+            .min_sidebar_width(250.0)
+            .max_sidebar_width(320.0)
+            .sidebar_width_fraction(0.24)
+            .show_sidebar(true)
             .build();
 
         let window = adw::ApplicationWindow::builder()
@@ -278,7 +282,8 @@ impl Ui {
             .content(&split)
             .build();
 
-        // On a narrow window the split view shows one pane at a time.
+        // Narrow: the drawer floats over the content instead of pushing it.
+        // It is not closed — only the way it is presented changes.
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             700.0,
@@ -294,6 +299,7 @@ impl Ui {
             toasts,
             stack,
             split,
+            drawer_toggle,
             sidebar_list,
             sidebar_rows,
             backend,
@@ -308,6 +314,7 @@ impl Ui {
         ui.scraper.wire(&ui);
         ui.settings_page.build(&ui);
         ui.wire_sidebar();
+        ui.wire_drawer();
 
         // Reopen where the user left off.
         let last = ui.backend.settings().interface.last_page;
@@ -317,6 +324,53 @@ impl Ui {
             .unwrap_or(PAGE_DOWNLOADS);
         ui.select_page(start);
         ui
+    }
+
+    /// Bind the drawer toggle to the split view, both ways.
+    fn wire_drawer(self: &Rc<Self>) {
+        let open = self.backend.settings().interface.sidebar_open;
+        self.split.set_show_sidebar(open);
+        self.drawer_toggle.set_active(open);
+
+        // The button drives the drawer.
+        self.drawer_toggle.connect_toggled({
+            let weak = Rc::downgrade(self);
+            move |button| {
+                let Some(ui) = weak.upgrade() else { return };
+                let wanted = button.is_active();
+                if ui.split.shows_sidebar() != wanted {
+                    ui.split.set_show_sidebar(wanted);
+                }
+                ui.remember_drawer(wanted);
+            }
+        });
+
+        // And the drawer keeps the button honest, since it can also be closed
+        // by tapping outside it while collapsed.
+        self.split.connect_show_sidebar_notify({
+            let weak = Rc::downgrade(self);
+            move |split| {
+                let Some(ui) = weak.upgrade() else { return };
+                let open = split.shows_sidebar();
+                if ui.drawer_toggle.is_active() != open {
+                    ui.drawer_toggle.set_active(open);
+                }
+            }
+        });
+    }
+
+    fn remember_drawer(&self, open: bool) {
+        let backend = self.backend.clone();
+        backend.clone().spawn(async move {
+            let mut settings = backend.settings();
+            if settings.interface.sidebar_open == open {
+                return;
+            }
+            settings.interface.sidebar_open = open;
+            if let Err(error) = backend.persist_only(settings).await {
+                log::debug!("could not remember the drawer state: {error:#}");
+            }
+        });
     }
 
     /// Selecting a sidebar row shows its page.
@@ -331,14 +385,12 @@ impl Ui {
             }
             ui.stack.set_visible_child_name(&name);
             ui.remember_page(&name);
-            // Keep the content pane's own title in step, which is what the
-            // collapsed layout shows as a back-navigable page name.
-            if let Some(page) = ui.split.content() {
-                page.set_title(&pretty_page_name(&name));
-            }
-            // On a narrow window, choosing a destination should reveal it.
+            // The header names the page; the subtitle stays as live activity.
+            ui.title.set_title(&pretty_page_name(&name));
+            // While the drawer floats over the content, picking a destination
+            // should reveal what was chosen. At full width it stays put.
             if ui.split.is_collapsed() {
-                ui.split.set_show_content(true);
+                ui.split.set_show_sidebar(false);
             }
         });
     }
@@ -436,6 +488,10 @@ impl Ui {
         self.add_action("sniff", |ui| sniff::present(ui, None));
         self.add_action("dependencies", deps::present);
         self.add_action("show-settings", |ui| ui.select_page(PAGE_SETTINGS));
+        self.add_action("toggle-sidebar", |ui| {
+            let wanted = !ui.drawer_toggle.is_active();
+            ui.drawer_toggle.set_active(wanted);
+        });
         self.add_action("shortcuts", |ui| ui.present_shortcuts());
         self.add_action("about", |ui| ui.present_about());
 
@@ -444,6 +500,7 @@ impl Ui {
         app.set_accels_for_action("win.extract-video", &["<Primary>d"]);
         app.set_accels_for_action("win.sniff", &["<Primary>f"]);
         app.set_accels_for_action("win.show-settings", &["<Primary>comma"]);
+        app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
         app.set_accels_for_action("win.shortcuts", &["<Primary>question"]);
         app.set_accels_for_action("window.close", &["<Primary>w"]);
     }
@@ -742,14 +799,36 @@ impl Ui {
     }
 
     fn present_add_dialog(self: &Rc<Self>) {
-        let entry = gtk::Entry::builder()
-            .placeholder_text("https://example.com/file.iso, magnet:?xt=…, or a gallery page")
-            .input_purpose(gtk::InputPurpose::Url)
-            .activates_default(true)
-            .hexpand(true)
+        // A text view, not an entry: this accepts one URL, a list of URLs, or
+        // a whole multi-line "Copy as cURL" command pasted from a browser's
+        // network inspector.
+        let buffer = gtk::TextBuffer::new(None);
+        let input = gtk::TextView::builder()
+            .buffer(&buffer)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
+            .monospace(true)
+            .build();
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(120)
+            .max_content_height(220)
+            .child(&input)
+            .css_classes(["card"])
             .build();
 
-        // The kind is inferred from the URL, but the user can override it.
+        let hint = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["snatch-hint"])
+            .label(
+                "One URL, several on separate lines, or a whole “Copy as cURL”                  command pasted from your browser's network inspector — cookies,                  referer and user agent are taken from it.",
+            )
+            .build();
+
         let kinds = gtk::DropDown::from_strings(&[
             "Detect automatically",
             "Direct download",
@@ -760,19 +839,25 @@ impl Ui {
         ]);
         kinds.set_selected(0);
 
+        // Several URLs can mean several downloads, or several sources for one
+        // file. aria2 supports the latter natively and it is much faster on a
+        // slow mirror, so it is worth offering rather than assuming.
+        let as_mirrors = gtk::CheckButton::builder()
+            .label("Treat multiple URLs as mirrors of one file")
+            .active(false)
+            .build();
+
         let fields = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
             .build();
-        fields.append(&entry);
+        fields.append(&scroller);
+        fields.append(&hint);
         fields.append(&kinds);
+        fields.append(&as_mirrors);
 
         let dialog = adw::AlertDialog::builder()
             .heading("Add to Snatch")
-            .body(
-                "Direct links go to aria2 with up to 16 connections, magnets to the \
-                 BitTorrent engine, and gallery pages to gallery-dl.",
-            )
             .extra_child(&fields)
             .build();
         dialog.add_responses(&[("close", "Cancel"), ("add", "Add")]);
@@ -781,14 +866,24 @@ impl Ui {
         dialog.set_default_response(Some("add"));
         dialog.set_close_response("close");
 
-        entry.connect_changed({
+        buffer.connect_changed({
             let dialog = dialog.clone();
-            move |entry| dialog.set_response_enabled("add", !entry.text().trim().is_empty())
+            let as_mirrors = as_mirrors.clone();
+            move |buffer| {
+                let text = buffer_text(buffer);
+                dialog.set_response_enabled("add", !text.trim().is_empty());
+                // Mirrors only mean something with more than one URL, and
+                // never for a pasted cURL command.
+                let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+                as_mirrors.set_sensitive(lines > 1 && !crate::curl::looks_like_curl(&text));
+            }
         });
+        as_mirrors.set_sensitive(false);
 
-        // Pre-fill from the clipboard when it already holds something usable.
+        // Offer the clipboard: a cURL command is exactly what is on it after
+        // "Copy as cURL", and it is tedious to paste by hand.
         glib::spawn_future_local({
-            let entry = entry.clone();
+            let buffer = buffer.clone();
             async move {
                 let Some(display) = gdk::Display::default() else {
                     return;
@@ -798,8 +893,9 @@ impl Ui {
                     if text.starts_with("http://")
                         || text.starts_with("https://")
                         || text.starts_with("magnet:")
+                        || crate::curl::looks_like_curl(text)
                     {
-                        entry.set_text(text);
+                        buffer.set_text(text);
                     }
                 }
             }
@@ -811,11 +907,43 @@ impl Ui {
                 return;
             }
             let Some(ui) = weak.upgrade() else { return };
-            let url = entry.text().trim().to_owned();
-            if url.is_empty() {
-                return;
+            let text = buffer_text(&buffer);
+            ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active());
+        });
+
+        dialog.present(Some(&self.window));
+    }
+
+    /// Turn whatever was typed into one or more jobs.
+    fn add_from_text(self: &Rc<Self>, text: &str, kind_choice: u32, as_mirrors: bool) {
+        // A pasted cURL command carries its own credentials, so it bypasses
+        // the kind selector entirely.
+        if crate::curl::looks_like_curl(text) {
+            match crate::curl::parse(text) {
+                Ok(request) => {
+                    let name = request.display_name();
+                    self.enqueue(request);
+                    self.toast(&format!("Imported {name} from the cURL command"));
+                }
+                Err(error) => self.toast(&format!("Could not read that cURL command: {error:#}")),
             }
-            let request = match kinds.selected() {
+            return;
+        }
+
+        let urls: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+
+        let Some((first, rest)) = urls.split_first() else {
+            self.toast("Enter a URL");
+            return;
+        };
+
+        let build = |url: String| -> DownloadRequest {
+            match kind_choice {
                 1 => DownloadRequest::from_url(url),
                 2 => DownloadRequest::magnet(url),
                 3 => DownloadRequest::scrape(url),
@@ -823,11 +951,24 @@ impl Ui {
                 5 => DownloadRequest::sniff(url),
                 // 0: let `inferred_kind` decide from the scheme.
                 _ => DownloadRequest::from_url(url),
-            };
-            ui.enqueue(request);
-        });
+            }
+        };
 
-        dialog.present(Some(&self.window));
+        if as_mirrors && !rest.is_empty() {
+            let mut request = build(first.clone());
+            request.mirrors = rest.to_vec();
+            let count = request.mirrors.len() + 1;
+            self.enqueue(request);
+            self.toast(&format!("Added one file with {count} sources"));
+            return;
+        }
+
+        for url in &urls {
+            self.enqueue(build(url.clone()));
+        }
+        if urls.len() > 1 {
+            self.toast(&format!("Added {} items", urls.len()));
+        }
     }
 
     /// Pick a `.torrent` from disk and hand it to the engine.
@@ -988,6 +1129,7 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
 
+    /// A video extraction with the options yt-dlp actually needs.
     fn present_about(self: &Rc<Self>) {
         let torrent_line = match self.backend.torrents.as_ref() {
             Some(engine) => match engine.proxy_label() {
@@ -999,7 +1141,7 @@ impl Ui {
 
         adw::AboutDialog::builder()
             .application_name("Snatch")
-            .application_icon("folder-download-symbolic")
+            .application_icon("com.snatch.dl")
             .developer_name("Snatch contributors")
             .version(env!("CARGO_PKG_VERSION"))
             .comments(format!(
@@ -1069,6 +1211,13 @@ fn pretty_page_name(name: &str) -> String {
         other => other,
     }
     .to_owned()
+}
+
+/// Read a text buffer's whole contents.
+fn buffer_text(buffer: &gtk::TextBuffer) -> String {
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
 }
 
 fn main_menu() -> gio::Menu {

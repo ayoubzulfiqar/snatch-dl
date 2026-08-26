@@ -29,6 +29,7 @@ readonly DATA_DIR="${DATA_HOME}/snatch-dl"
 # uninstalling Snatch cannot remove something installed for other uses.
 readonly MANAGED_BIN="${DATA_DIR}/bin"
 readonly APPS_DIR="${DATA_HOME}/applications"
+readonly ICONS_DIR="${DATA_HOME}/icons/hicolor"
 # The signing key stays in the data directory: it is a private key and has no
 # business sitting in a source tree that might get committed or pushed.
 readonly KEY_FILE="${DATA_DIR}/chromium-extension-key.pem"
@@ -153,6 +154,16 @@ uninstall() {
     fi
   done
 
+  step "Removing icons"
+  local size
+  for size in 16 24 32 48 64 96 128 256 512; do
+    rm -f "${ICONS_DIR}/${size}x${size}/apps/com.snatch.dl.png"
+  done
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f "${ICONS_DIR}" 2>/dev/null || true
+  fi
+  info "removed icons from ${ICONS_DIR}"
+
   step "Removing desktop entry"
   if [ -e "${APPS_DIR}/${DESKTOP_FILE_NAME}" ]; then
     rm -f "${APPS_DIR}/${DESKTOP_FILE_NAME}"
@@ -189,6 +200,28 @@ install_binaries() {
   done
 }
 
+# Install the application icon into the hicolor theme, which is where the
+# shell, the dock and the window manager all look it up by name.
+install_icons() {
+  local source="${SOURCE_DIR}/assets/icons"
+  if [ ! -d "${source}" ]; then
+    warn "no generated icons in ${source}; run assets/make-icons.sh"
+    return
+  fi
+  local size
+  for size in 16 24 32 48 64 96 128 256 512; do
+    local file="${source}/com.snatch.dl-${size}.png"
+    [ -f "${file}" ] || continue
+    install -Dm644 "${file}" \
+      "${ICONS_DIR}/${size}x${size}/apps/com.snatch.dl.png"
+  done
+  info "installed icons into ${ICONS_DIR}"
+  # Without a refreshed cache the shell keeps showing the old icon.
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f "${ICONS_DIR}" 2>/dev/null || true
+  fi
+}
+
 write_desktop_entry() {
   mkdir -p "${APPS_DIR}"
   cat > "${APPS_DIR}/${DESKTOP_FILE_NAME}" <<DESKTOP
@@ -198,7 +231,7 @@ Name=Snatch
 GenericName=Download Manager
 Comment=Fast, resumable downloads powered by aria2
 Exec=${BIN_DIR}/snatch-gui
-Icon=folder-download
+Icon=com.snatch.dl
 Terminal=false
 Categories=Network;FileTransfer;
 Keywords=download;manager;aria2;idm;
@@ -617,7 +650,8 @@ main() {
   step "Registering the native messaging host"
   register_hosts "${chromium_id}"
 
-  step "Installing the desktop entry"
+  step "Installing the icon and desktop entry"
+  install_icons
   write_desktop_entry
 
   if [ "${want_deps}" -eq 1 ]; then
