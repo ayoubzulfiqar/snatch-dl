@@ -14,6 +14,7 @@
 mod deps;
 mod downloads;
 mod format;
+mod history;
 mod proxy;
 mod scraper;
 mod settings;
@@ -38,6 +39,7 @@ const WINDOW_HEIGHT: i32 = 640;
 pub const PAGE_DOWNLOADS: &str = "downloads";
 pub const PAGE_TORRENTS: &str = "torrents";
 pub const PAGE_SCRAPER: &str = "scraper";
+pub const PAGE_HISTORY: &str = "history";
 pub const PAGE_SETTINGS: &str = "settings";
 
 /// Construct the window on first activation; raise it on every later one.
@@ -92,6 +94,7 @@ pub struct Ui {
     downloads: downloads::DownloadsPage,
     torrents: torrents::TorrentsPage,
     scraper: scraper::ScraperPage,
+    history: history::HistoryPage,
     settings_page: settings::SettingsPage,
     /// Set once if the torrent session failed, so the page can explain itself.
     torrent_error: RefCell<Option<String>>,
@@ -107,6 +110,7 @@ impl Ui {
         let torrents = torrents::TorrentsPage::new();
         let scraper = scraper::ScraperPage::new();
 
+        let history = history::HistoryPage::new();
         let settings_page = settings::SettingsPage::new();
 
         let stack = adw::ViewStack::new();
@@ -127,6 +131,12 @@ impl Ui {
             Some(PAGE_SCRAPER),
             "Scraper",
             "image-x-generic-symbolic",
+        );
+        stack.add_titled_with_icon(
+            history.widget(),
+            Some(PAGE_HISTORY),
+            "History",
+            "document-open-recent-symbolic",
         );
         stack.add_titled_with_icon(
             settings_page.widget(),
@@ -163,6 +173,12 @@ impl Ui {
                 "Scraper",
                 "Whole galleries, filed by site",
                 "image-x-generic-symbolic",
+            ),
+            (
+                PAGE_HISTORY,
+                "History",
+                "Finished downloads and their files",
+                "document-open-recent-symbolic",
             ),
             (
                 PAGE_SETTINGS,
@@ -246,6 +262,8 @@ impl Ui {
 
         let header = adw::HeaderBar::builder().title_widget(&title).build();
         header.pack_start(&drawer_toggle);
+        history.select_toggle().set_visible(false);
+        header.pack_end(history.select_toggle());
         header.pack_end(
             &gtk::MenuButton::builder()
                 .icon_name("open-menu-symbolic")
@@ -306,6 +324,7 @@ impl Ui {
             downloads,
             torrents,
             scraper,
+            history,
             settings_page,
             torrent_error: RefCell::new(None),
             settings_dirty: std::cell::Cell::new(false),
@@ -313,15 +332,23 @@ impl Ui {
         ui.install_actions(app);
         ui.scraper.wire(&ui);
         ui.settings_page.build(&ui);
+        ui.history.wire(&ui);
+        ui.history.reload(&ui);
         ui.wire_sidebar();
         ui.wire_drawer();
 
         // Reopen where the user left off.
         let last = ui.backend.settings().interface.last_page;
-        let start = [PAGE_DOWNLOADS, PAGE_TORRENTS, PAGE_SCRAPER, PAGE_SETTINGS]
-            .into_iter()
-            .find(|page| *page == last)
-            .unwrap_or(PAGE_DOWNLOADS);
+        let start = [
+            PAGE_DOWNLOADS,
+            PAGE_TORRENTS,
+            PAGE_SCRAPER,
+            PAGE_HISTORY,
+            PAGE_SETTINGS,
+        ]
+        .into_iter()
+        .find(|page| *page == last)
+        .unwrap_or(PAGE_DOWNLOADS);
         ui.select_page(start);
         ui
     }
@@ -387,6 +414,11 @@ impl Ui {
             ui.remember_page(&name);
             // The header names the page; the subtitle stays as live activity.
             ui.title.set_title(&pretty_page_name(&name));
+            // Selection mode is a History-only affordance.
+            ui.history.select_toggle().set_visible(name == PAGE_HISTORY);
+            if name == PAGE_HISTORY {
+                ui.history.reload(&ui);
+            }
             // While the drawer floats over the content, picking a destination
             // should reveal what was chosen. At full width it stays put.
             if ui.split.is_collapsed() {
@@ -487,6 +519,41 @@ impl Ui {
         self.add_action("extract-video", |ui| ui.present_video_dialog());
         self.add_action("sniff", |ui| sniff::present(ui, None));
         self.add_action("dependencies", deps::present);
+        self.add_action("show-history", |ui| ui.select_page(PAGE_HISTORY));
+        self.add_action("clear-history", |ui| {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Clear History?")
+                .body("Every record is forgotten. The downloaded files are not touched.")
+                .build();
+            dialog.add_responses(&[("keep", "Cancel"), ("clear", "Clear")]);
+            dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+            dialog.set_close_response("keep");
+
+            let weak = Rc::downgrade(ui);
+            dialog.connect_response(None, move |_, response| {
+                if response != "clear" {
+                    return;
+                }
+                let Some(ui) = weak.upgrade() else { return };
+                let backend = ui.backend().clone();
+                let inner = Rc::downgrade(&ui);
+                glib::spawn_future_local(async move {
+                    let db = backend.db.clone();
+                    let cleared = backend
+                        .offload(async move { db.clear_history().await })
+                        .await;
+                    let Some(ui) = inner.upgrade() else { return };
+                    match cleared {
+                        Ok(count) => {
+                            ui.toast(&format!("Forgot {count} entries; files kept"));
+                            ui.history.reload(&ui);
+                        }
+                        Err(error) => ui.toast(&format!("{error:#}")),
+                    }
+                });
+            });
+            dialog.present(Some(ui.window()));
+        });
         self.add_action("show-settings", |ui| ui.select_page(PAGE_SETTINGS));
         self.add_action("toggle-sidebar", |ui| {
             let wanted = !ui.drawer_toggle.is_active();
@@ -501,6 +568,7 @@ impl Ui {
         app.set_accels_for_action("win.sniff", &["<Primary>f"]);
         app.set_accels_for_action("win.show-settings", &["<Primary>comma"]);
         app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
+        app.set_accels_for_action("win.show-history", &["<Primary>h"]);
         app.set_accels_for_action("win.shortcuts", &["<Primary>question"]);
         app.set_accels_for_action("window.close", &["<Primary>w"]);
     }
@@ -1188,6 +1256,23 @@ impl Ui {
         }
     }
 
+    /// A desktop notification, for a download that finished while the window
+    /// was not in front. Silent when the setting is off.
+    pub fn notify(&self, title: &str, body: &str) {
+        if !self.backend.settings().interface.notify_on_finish {
+            return;
+        }
+        let Some(app) = self.window.application() else {
+            return;
+        };
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        notification.set_priority(gio::NotificationPriority::Low);
+        // A stable id replaces the previous one instead of stacking a tower
+        // of notifications during a batch.
+        app.send_notification(Some("snatch-finished"), &notification);
+    }
+
     pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
@@ -1207,6 +1292,7 @@ fn pretty_page_name(name: &str) -> String {
         PAGE_DOWNLOADS => "Downloads",
         PAGE_TORRENTS => "Torrents",
         PAGE_SCRAPER => "Scraper",
+        PAGE_HISTORY => "History",
         PAGE_SETTINGS => "Settings",
         other => other,
     }
@@ -1233,6 +1319,8 @@ fn main_menu() -> gio::Menu {
     transfers.append(Some("Clear Finished"), Some("win.clear-finished"));
 
     let settings = gio::Menu::new();
+    settings.append(Some("History"), Some("win.show-history"));
+    settings.append(Some("Clear History…"), Some("win.clear-history"));
     settings.append(Some("Settings"), Some("win.show-settings"));
     settings.append(Some("Dependencies…"), Some("win.dependencies"));
     settings.append(Some("Proxy Settings…"), Some("win.proxies"));

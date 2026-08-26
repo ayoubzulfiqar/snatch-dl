@@ -18,6 +18,7 @@ use super::format::{
 };
 use super::{PageSummary, Ui};
 use crate::aria2::DownloadStatus;
+use crate::db::{JobState, NewHistoryEntry, Origin};
 use crate::processor::{MediaAction, MediaEvent, MediaJob, format_duration};
 use crate::wget::WgetEvent;
 use crate::ytdlp::VideoEvent;
@@ -40,6 +41,8 @@ fn is_media(path: &Path) -> bool {
 }
 
 pub struct DownloadsPage {
+    /// GIDs already written to history, so a repeated poll does not re-record.
+    recorded: RefCell<HashSet<String>>,
     root: gtk::Box,
     stack: gtk::Stack,
     list: gtk::ListBox,
@@ -108,6 +111,7 @@ impl DownloadsPage {
             list,
             jobs_list,
             jobs_frame,
+            recorded: RefCell::new(HashSet::new()),
             rows: RefCell::new(HashMap::new()),
             jobs: RefCell::new(HashMap::new()),
             summary: RefCell::new(PageSummary::default()),
@@ -142,6 +146,7 @@ impl DownloadsPage {
                     row
                 });
                 row.update(download);
+                self.record_if_finished(ui, download);
 
                 if download.is_active() {
                     summary.active += 1;
@@ -165,6 +170,51 @@ impl DownloadsPage {
         });
         *self.summary.borrow_mut() = summary;
         summary
+    }
+
+    /// Write a download to history the first time it is seen finished.
+    ///
+    /// The poll returns the same completed entry until the user clears it, and
+    /// the database ignores a duplicate engine id anyway, but skipping the
+    /// round trip keeps a finished queue from issuing an insert twice a second.
+    fn record_if_finished(&self, ui: &Rc<Ui>, download: &DownloadStatus) {
+        if !download.is_finished() {
+            return;
+        }
+        if !self.recorded.borrow_mut().insert(download.gid.clone()) {
+            return;
+        }
+
+        if download.is_complete() {
+            ui.notify(
+                "Download finished",
+                &format!("{} is ready", download.display_name()),
+            );
+        }
+
+        let entry = NewHistoryEntry {
+            engine_id: format!("aria2:{}", download.gid),
+            url: download.source_uri().unwrap_or_default().to_owned(),
+            filename: download.display_name(),
+            path: download.path().map(PathBuf::from),
+            size: download.total_length,
+            origin: Origin::Aria2,
+            state: if download.is_complete() {
+                JobState::Complete
+            } else if download.is_error() {
+                JobState::Failed
+            } else {
+                JobState::Cancelled
+            },
+            error: download.error_message.clone(),
+        };
+
+        let backend = ui.backend().clone();
+        backend.clone().spawn(async move {
+            if let Err(error) = backend.db.record_download(entry).await {
+                log::warn!("could not record a download in history: {error:#}");
+            }
+        });
     }
 
     /// Reflect one ffmpeg event in the Processing list.
@@ -512,9 +562,10 @@ impl Row {
         detail.add_css_class("snatch-detail");
 
         let toggle = control_button("media-playback-pause-symbolic", "Pause");
-        let open = control_button("folder-open-symbolic", "Show in file manager");
+        // Shown from the start: knowing where a download is going is useful
+        // while it runs, not only once it has finished.
+        let open = control_button("folder-open-symbolic", "Open the destination folder");
         let remove = control_button("user-trash-symbolic", "Remove");
-        open.set_visible(false);
 
         // The post-process menu appears only on a finished media file.
         let process = gtk::MenuButton::builder()
@@ -690,9 +741,13 @@ impl Row {
             self.toggle.set_tooltip_text(Some(tooltip));
         }
 
-        self.open.set_visible(
-            download.is_complete() && (download.path().is_some() || download.folder().is_some()),
-        );
+        self.open
+            .set_visible(download.path().is_some() || download.folder().is_some());
+        self.open.set_tooltip_text(Some(if download.is_complete() {
+            "Show the file in the file manager"
+        } else {
+            "Open the destination folder"
+        }));
 
         // Offering "Extract audio" on a half-downloaded ZIP would just produce
         // an ffmpeg error, so the menu is gated on a finished media file.
@@ -952,8 +1007,47 @@ fn parse_timecode(value: &str) -> Option<Duration> {
 /// Ask before throwing away data the user is still waiting for.
 fn confirm_remove(ui: &Rc<Ui>, gid: &str, name: &str, finished: bool, path: Option<String>) {
     if finished {
-        // Nothing is in flight: just forget the entry, keep the file.
-        remove_download(ui, gid.to_owned(), None);
+        // Nothing is in flight, so removing the row and deleting the file are
+        // genuinely different things. Offer both rather than guessing.
+        let has_file = path.as_deref().map(Path::new).is_some_and(Path::is_file);
+        if !has_file {
+            remove_download(ui, gid.to_owned(), None);
+            return;
+        }
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("Remove Download?")
+            .body(format!(
+                "“{name}” has finished. Remove it from the list, or also erase \
+                 the file from disk?"
+            ))
+            .build();
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("list", "Remove From List"),
+            ("file", "Delete File"),
+        ]);
+        dialog.set_response_appearance("file", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("list"));
+        dialog.set_close_response("cancel");
+
+        let weak = Rc::downgrade(ui);
+        let gid = gid.to_owned();
+        dialog.connect_response(None, move |_, response| {
+            let delete_file = match response {
+                "list" => false,
+                "file" => true,
+                _ => return,
+            };
+            let Some(ui) = weak.upgrade() else { return };
+            remove_download(
+                &ui,
+                gid.clone(),
+                if delete_file { path.clone() } else { None },
+            );
+        });
+
+        dialog.present(Some(ui.window()));
         return;
     }
 

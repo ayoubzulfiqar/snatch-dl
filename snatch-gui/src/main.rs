@@ -146,6 +146,7 @@ fn run() -> Result<glib::ExitCode> {
 
     let aria2_options = Arc::new(std::sync::RwLock::new(current.aria2_download_options()));
     let aria2_client = aria2::Aria2Client::new(download_dir.clone(), Arc::clone(&aria2_options))?;
+    aria2_client.set_categorise(current.download.categorise);
 
     // The BitTorrent session binds sockets and reads resume data, so it is
     // started up front — but a failure only disables the Torrents page.

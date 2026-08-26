@@ -199,6 +199,25 @@ impl SettingsPage {
         });
         group.add(&allocation);
 
+        let categorise = adw::SwitchRow::builder()
+            .title("Sort downloads into folders by type")
+            .subtitle(
+                "Video, Music, Images, Documents, Compressed and Programs \
+                 subfolders under your download folder. Applies to new downloads.",
+            )
+            .active(draft.download.categorise)
+            .build();
+        categorise.connect_active_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let on = row.is_active();
+                this.edit(&ui, |settings| settings.download.categorise = on);
+            }
+        });
+        group.add(&categorise);
+
         // This is the ".aria2 file" question, phrased as what it actually costs.
         let resume = adw::SwitchRow::builder()
             .title("Write resume data while downloading")
@@ -451,6 +470,12 @@ impl SettingsPage {
                 0usize,
             ),
             (
+                "Notify when a download finishes",
+                "Send a desktop notification as each download completes.",
+                draft.interface.notify_on_finish,
+                2usize,
+            ),
+            (
                 "Confirm before cancelling",
                 "Ask before discarding a download in progress.",
                 draft.interface.confirm_cancel,
@@ -468,12 +493,10 @@ impl SettingsPage {
                 move |row| {
                     let Some(ui) = ui.upgrade() else { return };
                     let on = row.is_active();
-                    this.edit(&ui, |settings| {
-                        if which == 0 {
-                            settings.interface.raise_on_capture = on;
-                        } else {
-                            settings.interface.confirm_cancel = on;
-                        }
+                    this.edit(&ui, |settings| match which {
+                        0 => settings.interface.raise_on_capture = on,
+                        2 => settings.interface.notify_on_finish = on,
+                        _ => settings.interface.confirm_cancel = on,
                     });
                 }
             });

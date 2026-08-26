@@ -103,6 +103,9 @@ pub struct DownloadSettings {
     /// data if the machine loses power mid-download.
     pub auto_save_interval: u32,
     pub user_agent: String,
+    /// File the download into a subfolder chosen by its type, instead of
+    /// dropping everything into one directory.
+    pub categorise: bool,
 }
 
 impl Default for DownloadSettings {
@@ -122,6 +125,7 @@ impl Default for DownloadSettings {
             auto_save_interval: 60,
             user_agent: "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
                 .to_owned(),
+            categorise: true,
         }
     }
 }
@@ -181,6 +185,8 @@ impl Default for MediaSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct InterfaceSettings {
+    /// Show a desktop notification when a download finishes.
+    pub notify_on_finish: bool,
     /// Bring the window forward when the browser hands over a job.
     pub raise_on_capture: bool,
     /// Confirm before cancelling a running download.
@@ -197,6 +203,7 @@ pub struct InterfaceSettings {
 impl Default for InterfaceSettings {
     fn default() -> Self {
         Self {
+            notify_on_finish: true,
             raise_on_capture: true,
             confirm_cancel: true,
             download_dir: String::new(),
@@ -369,6 +376,29 @@ impl Settings {
     }
 }
 
+/// The folder a file of this kind belongs in.
+///
+/// Names match what people expect from a download manager, and the sort is by
+/// extension because that is all that is known before the transfer starts.
+pub fn category_for(filename: &str) -> Option<&'static str> {
+    let extension = filename.rsplit_once('.').map(|(_, ext)| ext)?;
+    Some(match extension.to_ascii_lowercase().as_str() {
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "wmv" | "m4v" | "mpg" | "mpeg" | "ts"
+        | "ogv" | "3gp" => "Video",
+        "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" | "wma" | "aiff" | "mka" => "Music",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif" | "jxl" | "svg" | "tif"
+        | "tiff" | "heic" => "Images",
+        "pdf" | "epub" | "mobi" | "azw3" | "doc" | "docx" | "odt" | "rtf" | "txt" | "xls"
+        | "xlsx" | "ods" | "ppt" | "pptx" | "odp" | "djvu" | "cbz" | "cbr" => "Documents",
+        "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" => "Compressed",
+        "deb" | "rpm" | "apk" | "dmg" | "exe" | "msi" | "appimage" | "snap" | "flatpak" | "iso"
+        | "img" | "run" => "Programs",
+        // An unknown type is left in the root rather than filed under a
+        // guess: a wrong folder is worse than no folder.
+        _ => return None,
+    })
+}
+
 /// aria2 wants bytes per second; `0` means unlimited in both.
 fn kib_to_bytes(kib: u64) -> String {
     kib.saturating_mul(1024).to_string()
@@ -512,5 +542,29 @@ mod tests {
         );
         assert_eq!(loaded.torrent, TorrentSettings::default());
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+
+    #[test]
+    fn files_are_sorted_the_way_people_expect() {
+        assert_eq!(category_for("movie.mkv"), Some("Video"));
+        assert_eq!(category_for("Song.FLAC"), Some("Music"));
+        assert_eq!(category_for("photo.jpeg"), Some("Images"));
+        assert_eq!(category_for("manual.pdf"), Some("Documents"));
+        assert_eq!(category_for("release.tar.gz"), Some("Compressed"));
+        assert_eq!(category_for("app.AppImage"), Some("Programs"));
+        assert_eq!(category_for("ubuntu-24.04.iso"), Some("Programs"));
+    }
+
+    #[test]
+    fn an_unknown_type_is_left_in_the_root() {
+        // A wrong folder is worse than no folder: the user cannot find it.
+        assert_eq!(category_for("data.qqq"), None);
+        assert_eq!(category_for("no-extension"), None);
+        assert_eq!(category_for(""), None);
     }
 }

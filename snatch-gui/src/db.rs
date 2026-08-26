@@ -103,6 +103,69 @@ pub struct GalleryFile {
     pub skipped: bool,
 }
 
+/// Which engine produced a finished download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Aria2,
+    Wget,
+    Video,
+    Torrent,
+}
+
+impl Origin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Origin::Aria2 => "aria2",
+            Origin::Wget => "wget",
+            Origin::Video => "yt-dlp",
+            Origin::Torrent => "torrent",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "wget" => Origin::Wget,
+            "yt-dlp" => Origin::Video,
+            "torrent" => Origin::Torrent,
+            _ => Origin::Aria2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+/// One finished download, kept after it leaves the active list.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub url: String,
+    pub filename: String,
+    /// Where the file was written. `None` if the engine never said.
+    pub path: Option<PathBuf>,
+    pub size: u64,
+    pub origin: Origin,
+    pub state: JobState,
+    pub error: Option<String>,
+    pub finished_at: i64,
+}
+
+impl HistoryEntry {
+    /// The directory the file went into.
+    pub fn folder(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+    }
+
+    /// Whether the file is still on disk.
+    pub fn exists(&self) -> bool {
+        self.path.as_ref().is_some_and(|path| path.is_file())
+    }
+}
+
 /// A queued or finished ffmpeg job.
 #[allow(dead_code, reason = "returned by recent_media_jobs")]
 #[derive(Debug, Clone)]
@@ -115,6 +178,20 @@ pub struct MediaJobRecord {
     pub error: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
+}
+
+/// What to record when a download finishes.
+#[derive(Debug, Clone)]
+pub struct NewHistoryEntry {
+    /// The engine's identifier: an aria2 GID, a wget job id, a torrent hash.
+    pub engine_id: String,
+    pub url: String,
+    pub filename: String,
+    pub path: Option<PathBuf>,
+    pub size: u64,
+    pub origin: Origin,
+    pub state: JobState,
+    pub error: Option<String>,
 }
 
 /// A handle to the job database.
@@ -362,6 +439,94 @@ impl Database {
         .await
     }
 
+    // -- download history --------------------------------------------------
+
+    /// Record a finished download.
+    ///
+    /// Keyed by the engine's own id so the same download cannot be inserted
+    /// twice: the UI notices a transition from a poll and may see it again
+    /// before the row disappears.
+    pub async fn record_download(&self, entry: NewHistoryEntry) -> Result<()> {
+        let now = unix_now();
+        self.with(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO downloads
+                       (engine_id, url, filename, path, size, engine, state, error, finished_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(engine_id) DO NOTHING",
+                    params![
+                        entry.engine_id,
+                        entry.url,
+                        entry.filename,
+                        entry
+                            .path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        entry.size as i64,
+                        entry.origin.as_str(),
+                        entry.state.as_str(),
+                        entry.error,
+                        now
+                    ],
+                )
+                .context("could not record the finished download")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Most recent downloads first.
+    pub async fn history(&self, limit: u32) -> Result<Vec<HistoryEntry>> {
+        self.with(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, url, filename, path, size, engine, state, error, finished_at
+                     FROM downloads ORDER BY finished_at DESC, id DESC LIMIT ?1",
+                )
+                .context("could not prepare the history query")?;
+            let rows = statement
+                .query_map(params![limit], map_history)
+                .context("could not read the history")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("could not decode the history")
+        })
+        .await
+    }
+
+    /// Forget specific entries. Does not touch the files.
+    pub async fn forget_downloads(&self, ids: Vec<i64>) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.with(move |connection| {
+            let mut removed = 0;
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction
+                    .prepare("DELETE FROM downloads WHERE id = ?1")
+                    .context("could not prepare the delete")?;
+                for id in ids {
+                    removed += statement.execute(params![id])?;
+                }
+            }
+            transaction
+                .commit()
+                .context("could not commit the delete")?;
+            Ok(removed)
+        })
+        .await
+    }
+
+    pub async fn clear_history(&self) -> Result<usize> {
+        self.with(move |connection| {
+            connection
+                .execute("DELETE FROM downloads", [])
+                .context("could not clear the history")
+        })
+        .await
+    }
+
     // -- media jobs --------------------------------------------------------
 
     pub async fn create_media_job(
@@ -439,6 +604,20 @@ impl Database {
     }
 }
 
+fn map_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    Ok(HistoryEntry {
+        id: row.get(0)?,
+        url: row.get(1)?,
+        filename: row.get(2)?,
+        path: row.get::<_, Option<String>>(3)?.map(PathBuf::from),
+        size: row.get::<_, i64>(4)?.max(0) as u64,
+        origin: Origin::parse(&row.get::<_, String>(5)?),
+        state: JobState::parse(&row.get::<_, String>(6)?),
+        error: row.get(7)?,
+        finished_at: row.get(8)?,
+    })
+}
+
 fn map_batch(row: &rusqlite::Row<'_>) -> rusqlite::Result<GalleryBatch> {
     Ok(GalleryBatch {
         id: row.get(0)?,
@@ -499,6 +678,22 @@ CREATE TABLE IF NOT EXISTS media_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS media_jobs_recent ON media_jobs (started_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS downloads (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- The engine's own identifier, so one finished download is recorded once.
+    engine_id   TEXT    NOT NULL UNIQUE,
+    url         TEXT    NOT NULL,
+    filename    TEXT    NOT NULL,
+    path        TEXT,
+    size        INTEGER NOT NULL DEFAULT 0,
+    engine      TEXT    NOT NULL,
+    state       TEXT    NOT NULL,
+    error       TEXT,
+    finished_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS downloads_recent ON downloads (finished_at DESC, id DESC);
 "#;
 
 #[cfg(test)]
@@ -617,5 +812,108 @@ mod tests {
         let recent = db.recent_batches(10).await.expect("recent reads");
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, batch);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    async fn scratch(name: &str) -> Database {
+        let path = std::env::temp_dir().join(format!("snatch-hist-{name}.sqlite"));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        Database::open(path).await.expect("the database opens")
+    }
+
+    fn entry(id: &str, name: &str) -> NewHistoryEntry {
+        NewHistoryEntry {
+            engine_id: id.to_owned(),
+            url: format!("https://example.com/{name}"),
+            filename: name.to_owned(),
+            path: Some(PathBuf::from(format!("/tmp/dl/{name}"))),
+            size: 1024,
+            origin: Origin::Aria2,
+            state: JobState::Complete,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_download_is_recorded_once() {
+        let db = scratch("dedupe").await;
+        // The UI can observe the same completion on consecutive polls.
+        for _ in 0..3 {
+            db.record_download(entry("gid-1", "a.iso"))
+                .await
+                .expect("record works");
+        }
+        db.record_download(entry("gid-2", "b.iso"))
+            .await
+            .expect("record works");
+
+        let history = db.history(10).await.expect("history reads");
+        assert_eq!(history.len(), 2, "{history:?}");
+    }
+
+    #[tokio::test]
+    async fn history_is_newest_first_and_round_trips() {
+        let db = scratch("order").await;
+        db.record_download(entry("g1", "first.iso"))
+            .await
+            .expect("record");
+        db.record_download(entry("g2", "second.iso"))
+            .await
+            .expect("record");
+
+        let history = db.history(10).await.expect("history reads");
+        assert_eq!(history.len(), 2);
+        // Same second, so the id breaks the tie: newest first either way.
+        assert_eq!(history[0].filename, "second.iso");
+        assert_eq!(history[0].origin, Origin::Aria2);
+        assert_eq!(history[0].state, JobState::Complete);
+        assert_eq!(history[0].size, 1024);
+        assert_eq!(history[0].folder(), Some(PathBuf::from("/tmp/dl")));
+    }
+
+    #[tokio::test]
+    async fn forgetting_removes_only_the_named_entries() {
+        let db = scratch("forget").await;
+        for index in 0..4 {
+            db.record_download(entry(&format!("g{index}"), &format!("f{index}.bin")))
+                .await
+                .expect("record");
+        }
+        let all = db.history(10).await.expect("reads");
+        let doomed: Vec<i64> = all.iter().take(2).map(|entry| entry.id).collect();
+
+        assert_eq!(db.forget_downloads(doomed).await.expect("forget"), 2);
+        assert_eq!(db.history(10).await.expect("reads").len(), 2);
+        // An empty list is a no-op, not an error or a full wipe.
+        assert_eq!(db.forget_downloads(Vec::new()).await.expect("forget"), 0);
+        assert_eq!(db.history(10).await.expect("reads").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn clearing_empties_the_history() {
+        let db = scratch("clear").await;
+        db.record_download(entry("g1", "a.bin"))
+            .await
+            .expect("record");
+        assert_eq!(db.clear_history().await.expect("clear"), 1);
+        assert!(db.history(10).await.expect("reads").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_is_reported_as_gone() {
+        let db = scratch("exists").await;
+        db.record_download(entry("g1", "never-written.bin"))
+            .await
+            .expect("record");
+        let history = db.history(1).await.expect("reads");
+        // The row survives even though the file does not, which is what lets
+        // the page grey it out instead of losing the record.
+        assert!(!history[0].exists());
     }
 }

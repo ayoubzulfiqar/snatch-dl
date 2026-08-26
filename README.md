@@ -19,7 +19,11 @@ Point it at a page and pick what you want:
 
 ![Media sniffer](docs/sniffer.png)
 
-Every engine option is configurable, IDM-style:
+Everything that finished, where it went, and what to do with it:
+
+![History](docs/history.png)
+
+Every engine option is configurable:
 
 ![Settings](docs/settings.png)
 
@@ -37,6 +41,7 @@ Every engine option is configurable, IDM-style:
 | Finding media on a page | built-in **sniffer** | Reads the DOM *and* asks yt-dlp, then lets you pick. |
 | A second HTTP engine | **Wget2** | Also multithreaded; some servers prefer its request pattern. |
 | Downloads behind a login | **cURL import** | Paste "Copy as cURL" and the cookies, referer and user agent come with it. |
+| Keeping track | **history** | What finished, where it went, and the file itself. |
 
 Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
 every socket and subprocess, and the two meet through a single event channel —
@@ -98,6 +103,19 @@ dialects all parse.
 Paste several URLs, tick *Treat multiple URLs as mirrors of one file*, and
 aria2 spreads its connections across all of them and fails over automatically.
 Untick it and each line becomes its own download instead.
+
+**Find something you downloaded last week.**
+The History page lists what finished, how big it was, when, and the folder it
+went into. Each row opens that folder, deletes the file, or downloads it again.
+Turn on selection mode to act on many at once — and *Remove* and *Delete Files*
+are deliberately separate buttons, because forgetting a record and erasing a
+file are not the same thing.
+
+**Stop rummaging through one enormous Downloads folder.**
+Files are sorted as they arrive into `Video`, `Music`, `Images`, `Documents`,
+`Compressed` and `Programs` beneath your download folder. Anything Snatch does
+not recognise is left in the root rather than filed under a guess. Turn it off
+in Settings if you would rather have one flat folder.
 
 **Trim a clip without re-encoding.**
 Right-click a finished video → **Trim…**, give a start and end. Streams are
@@ -195,6 +213,7 @@ are generated from `extension/manifest.base.json`.
 | `Ctrl+N` | Add a download, magnet or gallery (kind is auto-detected) |
 | `Ctrl+D` | Extract a video with yt-dlp |
 | `Ctrl+F` | Find all media on a page |
+| `Ctrl+H` | History |
 | `Ctrl+P` | Pause everything |
 | `Ctrl+,` | Settings |
 | `F9` | Show or hide the sidebar |
@@ -236,7 +255,7 @@ The reply is one line of JSON: `{"ok":true,"gid":"..."}` or
 ## Settings
 
 Snatch is navigated from a sidebar drawer: **Downloads**, **Torrents**,
-**Scraper** and **Settings**, each a real page rather than a dialog. Live
+**Scraper**, **History** and **Settings**, each a real page rather than a dialog. Live
 counts appear next to a destination, so activity on a page you are not looking
 at is still visible.
 
@@ -244,6 +263,9 @@ The drawer is toggled with the button in the header or **F9**, and it stays
 however you left it — it is never closed for you. On a narrow window it floats
 over the content instead of pushing it aside, and picking a destination there
 gets it out of the way. Snatch also reopens on whichever page you left it.
+
+The download folder is set here too, with a folder chooser; leave it blank to
+use your XDG Downloads directory.
 
 Settings covers what the underlying engines expose — segments per download,
 connections per server, minimum split size, simultaneous downloads, overall
@@ -257,7 +279,7 @@ Each row says **when** it takes effect, because the engines differ:
 |---|---|
 | Immediately | Simultaneous downloads, overall speed caps, torrent upload cap |
 | Next download | Segments, connections per server, per-download cap, engine choice |
-| After a restart | Disk allocation, retries, TLS verification, resume-data writing, DHT |
+| After a restart | Disk allocation, retries, TLS verification, resume-data writing, DHT, download folder |
 
 Apply names the specific settings waiting on a restart rather than showing a
 generic warning.
@@ -304,7 +326,7 @@ Two consequences worth knowing:
 ~/.local/bin/snatch-gui                     the application
 ~/.local/bin/snatch-nmh                     native messaging host
 ~/.local/share/snatch-dl/snatch.sock        IPC socket (0600)
-~/.local/share/snatch-dl/snatch.sqlite      job history
+~/.local/share/snatch-dl/snatch.sqlite      download and job history
 ~/.local/share/snatch-dl/aria2.session      resumable queue
 ~/.local/share/snatch-dl/torrents/          torrent resume data
 ~/.local/share/snatch-dl/proxies.json       proxy table
@@ -348,6 +370,7 @@ download of the page's HTML.
 | `wget.rs` | Wget2 engine, progress measured from the file on disk |
 | `settings.rs` | Persisted configuration and where each value applies |
 | `curl.rs` | Parsing a browser's "Copy as cURL" into a request |
+| `ui/history.rs` | Finished downloads, multi-select, folder and file actions |
 | `deps.rs` | Tool discovery and verified self-installation |
 | `gallery.rs` | gallery-dl subprocess, two-stream output merge |
 | `processor.rs` | ffmpeg jobs and the serial encode queue |
@@ -383,7 +406,7 @@ Three things in here are counter-intuitive and are all covered by tests:
 
 ```bash
 cargo build --release
-cargo test --workspace       # 97 tests
+cargo test --workspace       # 105 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
@@ -397,24 +420,6 @@ fixtures, because every one of those formats has a quirk that invented
 fixtures would miss.
 
 ---
-
-## Prior art
-
-[Surge](https://github.com/SurgeDM/Surge) is an excellent Go TUI download
-manager. It cannot be linked into a GTK4/Rust application — it is a separate
-language with its own daemon and a terminal interface — but three of its ideas
-were worth taking, and are credited in the code:
-
-- **Paste a cURL command.** Surge parses one from the clipboard in its TUI;
-  Snatch accepts one in the Add box. It is the fastest route to a download
-  that needs a session.
-- **Multiple mirrors for one file.** aria2 has supported this all along and
-  Snatch simply was not exposing it.
-- **Batch add.** Several URLs at once, one per line.
-
-Snatch already had the other things Surge highlights — a background daemon
-other processes queue into, sequential/streaming download, and segmented
-transfers.
 
 ## License
 

@@ -6,9 +6,6 @@
 //! which is precisely the set of things that make a download behind a login
 //! work. Pasting it beats re-deriving any of that by hand.
 //!
-//! The idea is borrowed from [Surge](https://github.com/SurgeDM/Surge), which
-//! offers the same paste-a-cURL shortcut in its TUI.
-//!
 //! Three quoting dialects have to be handled, because the browsers disagree:
 //!
 //! * Chrome and Firefox on Linux/macOS emit POSIX single quotes, escaping an

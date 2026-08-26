@@ -67,6 +67,8 @@ pub struct Aria2Client {
     /// Per-download options, re-read on every add so a settings change
     /// affects the next download without a restart.
     options: Arc<RwLock<Vec<(String, String)>>>,
+    /// Whether to file downloads into per-type subfolders.
+    categorise: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Aria2Client {
@@ -86,7 +88,14 @@ impl Aria2Client {
             token: format!("token:{RPC_SECRET}"),
             download_dir,
             options,
+            categorise: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
+    }
+
+    /// Turn per-type subfolders on or off for later downloads.
+    pub fn set_categorise(&self, on: bool) {
+        self.categorise
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Replace the per-download options used by later `addUri` calls.
@@ -173,9 +182,24 @@ impl Aria2Client {
         request.validate()?;
 
         let mut options = Map::new();
+        let chosen_name = request.sanitized_filename();
+
+        // Filing by type happens here rather than after the fact: aria2 writes
+        // straight into the destination, so moving the file afterwards would
+        // mean copying gigabytes for no reason.
+        let mut directory = self.download_dir.clone();
+        if self.categorise.load(std::sync::atomic::Ordering::Relaxed) {
+            let basis = chosen_name
+                .clone()
+                .or_else(|| crate::types::name_from_url(&request.url))
+                .unwrap_or_default();
+            if let Some(category) = crate::settings::category_for(&basis) {
+                directory = directory.join(category);
+            }
+        }
         options.insert(
             "dir".to_owned(),
-            json!(self.download_dir.to_string_lossy().into_owned()),
+            json!(directory.to_string_lossy().into_owned()),
         );
 
         // Segmenting and per-download limits come from settings.
@@ -188,7 +212,7 @@ impl Aria2Client {
             options.insert(key.clone(), json!(value));
         }
 
-        if let Some(name) = request.sanitized_filename() {
+        if let Some(name) = chosen_name {
             options.insert("out".to_owned(), json!(name));
         }
         if let Some(referer) = clean_header_value(request.referer.as_deref()) {
