@@ -31,6 +31,8 @@ pub struct Backend {
     pub media: Arc<MediaQueue>,
     pub db: Database,
     pub download_dir: PathBuf,
+    /// Where Snatch installs tools for itself.
+    pub managed_bin_dir: PathBuf,
     /// Handed to each new scrape so its progress reaches the UI.
     pub gallery_events: tokio::sync::mpsc::Sender<crate::gallery::GalleryEvent>,
     /// Handed to each new extraction so its progress reaches the UI.
@@ -49,6 +51,7 @@ impl Backend {
         media: Arc<MediaQueue>,
         db: Database,
         download_dir: PathBuf,
+        managed_bin_dir: PathBuf,
         gallery_events: tokio::sync::mpsc::Sender<crate::gallery::GalleryEvent>,
         video_events: tokio::sync::mpsc::Sender<crate::ytdlp::VideoEvent>,
         handle: tokio::runtime::Handle,
@@ -62,6 +65,7 @@ impl Backend {
             media,
             db,
             download_dir,
+            managed_bin_dir,
             gallery_events,
             video_events,
             handle,

@@ -44,6 +44,10 @@ librqbit = { version = "9.0", default-features = false, features = ["rust-tls"] 
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 url = "2.5"
+
+# html5ever-backed HTML parsing with CSS selectors, for the media sniffer.
+# A regex over markup would miss srcset, <base href> and relative URLs.
+scraper = "0.27"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "process", "sync", "fs", "signal"] }
 
 # --- Debian / Ubuntu -------------------------------------------------------

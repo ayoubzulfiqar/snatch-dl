@@ -41,6 +41,15 @@ pub fn torrent_state_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("torrents"))
 }
 
+/// Binaries Snatch installed for itself.
+///
+/// Deliberately not `~/.local/bin`: uninstalling Snatch must never remove a
+/// tool the user installed for their own use, and a distribution package
+/// should always take precedence over our copy.
+pub fn managed_bin_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("bin"))
+}
+
 /// Where finished files land: the XDG download directory, falling back to `$HOME`.
 pub fn download_dir() -> Result<PathBuf> {
     let dir = dirs::download_dir()

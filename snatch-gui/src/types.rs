@@ -28,6 +28,8 @@ pub enum JobKind {
     Scrape,
     /// A watch page to hand to yt-dlp.
     Video,
+    /// A page to scan for media, presenting a picker rather than downloading.
+    Sniff,
 }
 
 impl JobKind {
@@ -37,6 +39,7 @@ impl JobKind {
             JobKind::Magnet => "torrent",
             JobKind::Scrape => "scrape",
             JobKind::Video => "video",
+            JobKind::Sniff => "sniff",
         }
     }
 }
@@ -85,6 +88,14 @@ impl DownloadRequest {
     pub fn video(url: impl Into<String>) -> Self {
         Self {
             kind: JobKind::Video,
+            ..Self::from_url(url)
+        }
+    }
+
+    /// A page to scan for media.
+    pub fn sniff(url: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Sniff,
             ..Self::from_url(url)
         }
     }
@@ -285,6 +296,8 @@ pub enum UiEvent {
     /// A job was accepted by an engine (from the browser or the CLI socket).
     /// `kind` lets the window show the page that job landed on.
     Added { name: String, kind: JobKind },
+    /// A page arrived that the user should pick media from.
+    SniffRequested { url: String },
     /// A full picture of every download aria2 currently knows about.
     Snapshot(Vec<DownloadStatus>),
     /// The aria2 RPC endpoint is answering.

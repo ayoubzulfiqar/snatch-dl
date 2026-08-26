@@ -127,6 +127,18 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
     let name = request.display_name();
     let kind = request.inferred_kind();
 
+    // A sniff has nothing to queue: it opens the picker in the window.
+    if kind == JobKind::Sniff {
+        events
+            .send(UiEvent::SniffRequested {
+                url: request.url.clone(),
+            })
+            .await
+            .ok()
+            .context("the window is not available to show the picker")?;
+        return Ok("sniff".to_owned());
+    }
+
     let id = match kind {
         JobKind::Download => backend.aria2.add_uri(&request).await?,
         JobKind::Magnet => {
@@ -148,6 +160,10 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
                 .await?
                 .to_string()
         }
+        // The early return above handles this. Returning an error rather
+        // than `unreachable!` keeps the no-panic rule intact even if the
+        // guard above is ever refactored away.
+        JobKind::Sniff => bail!("a sniff has nothing to queue"),
         JobKind::Scrape => {
             let base = backend.download_dir.join("Snatch Galleries");
             let config = GalleryConfig::new(destination_for(&base, &request.url));

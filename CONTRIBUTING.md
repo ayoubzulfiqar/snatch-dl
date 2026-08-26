@@ -24,7 +24,8 @@ build.
 
 ## House rules
 
-**No `.unwrap()` or `.expect()` in a production path.** Return `Result` and add
+**No `.unwrap()`, `.expect()`, `panic!` or `unreachable!` in a production
+path.** Return `Result` and add
 context with `anyhow::Context`. `unwrap_or`, `unwrap_or_else` and
 `unwrap_or_default` are fine — they cannot panic. The test modules may use
 `expect` with a message that reads as a sentence.
@@ -42,6 +43,8 @@ invented fixtures would miss:
 - ffmpeg's `out_time_ms` is microseconds despite the name.
 - gallery-dl puts file paths on stdout and its `[n/m]` counter on stderr.
 - yt-dlp emits the literal string `NA` for any unavailable field.
+- A `HEAD` reply has no body, so `reqwest`'s `content_length()` returns 0
+  rather than the header value.
 
 **Subprocesses must drain both pipes concurrently.** Reading stdout to
 completion before touching stderr deadlocks as soon as the stderr pipe buffer

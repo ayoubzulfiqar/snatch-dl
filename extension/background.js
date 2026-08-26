@@ -29,6 +29,7 @@ const IS_FIREFOX =
 const MENU_DOWNLOAD = "snatch-download-with";
 const MENU_SCRAPE = "snatch-scrape-page";
 const MENU_VIDEO = "snatch-extract-video";
+const MENU_SNIFF = "snatch-sniff-page";
 const MENU_MAGNET = "snatch-open-magnet";
 const HINT_TTL_MS = 90000;
 const HINT_LIMIT = 256;
@@ -599,6 +600,20 @@ api.contextMenus.onClicked.addListener((info, tab) => {
         console.error("Snatch: page scrape failed", error)
       );
       return;
+    case MENU_SNIFF: {
+      const target = (tab && tab.url) || info.pageUrl;
+      if (!isHijackable(target)) {
+        flashBadge("!", "#e01b24");
+        return;
+      }
+      // The GUI does the sniffing and shows the picker; the extension only
+      // hands over the address, so cookies and login state stay in Snatch's
+      // own request rather than being copied around.
+      sendToSnatch({ url: target, kind: "sniff" }, "sniff").catch((error) =>
+        console.error("Snatch: sniff hand-off failed", error)
+      );
+      return;
+    }
     case MENU_VIDEO: {
       const target = info.linkUrl || (tab && tab.url);
       if (!isHijackable(target)) {
@@ -651,6 +666,11 @@ async function installContextMenu() {
       id: MENU_VIDEO,
       title: "Extract Video with Snatch",
       contexts: ["page", "link", "video"]
+    });
+    api.contextMenus.create({
+      id: MENU_SNIFF,
+      title: "Find All Media on This Page",
+      contexts: ["page", "frame", "image", "video", "audio"]
     });
     api.contextMenus.create({
       id: MENU_SCRAPE,

@@ -18,11 +18,13 @@
 mod aria2;
 mod backend;
 mod db;
+mod deps;
 mod gallery;
 mod ipc;
 mod network;
 mod paths;
 mod processor;
+mod sniff;
 mod torrent;
 mod types;
 mod ui;
@@ -92,6 +94,13 @@ fn run() -> Result<glib::ExitCode> {
         }
     }
 
+    // Put Snatch-managed tools on PATH before anything spawns a subprocess,
+    // so every engine finds a self-installed yt-dlp or gallery-dl without the
+    // user having to touch their shell configuration.
+    if let Ok(managed) = paths::managed_bin_dir() {
+        prepend_to_path(&managed);
+    }
+
     let download_dir = paths::download_dir()?;
     let socket_path = paths::socket_path()?;
     let aria2_config = aria2::Aria2Config {
@@ -149,6 +158,7 @@ fn run() -> Result<glib::ExitCode> {
         media_queue,
         database,
         download_dir,
+        paths::managed_bin_dir()?,
         gallery_tx,
         video_tx,
         runtime.handle().clone(),
@@ -247,4 +257,25 @@ async fn watch_for_shutdown(events: async_channel::Sender<UiEvent>) {
 
     log::info!("received {name}; shutting down");
     let _ = events.send(UiEvent::Quit).await;
+}
+
+/// Prepend a directory to this process's `PATH`.
+///
+/// Child processes inherit it, which is the whole point: the engines look up
+/// `yt-dlp` and `gallery-dl` by name.
+fn prepend_to_path(directory: &std::path::Path) {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries = vec![directory.to_path_buf()];
+    entries.extend(std::env::split_paths(&existing));
+    match std::env::join_paths(entries) {
+        Ok(joined) => {
+            // SAFETY: called from main before any thread that reads PATH is
+            // spawned; the tokio runtime and GTK have not started yet.
+            unsafe { std::env::set_var("PATH", joined) };
+        }
+        Err(error) => log::warn!(
+            "could not extend PATH with {}: {error}",
+            directory.display()
+        ),
+    }
 }

@@ -11,10 +11,12 @@
 //! keeps the ownership graph a tree and avoids an `Rc` cycle that would leak
 //! every row.
 
+mod deps;
 mod downloads;
 mod format;
 mod proxy;
 mod scraper;
+mod sniff;
 mod torrents;
 
 use std::cell::RefCell;
@@ -214,6 +216,8 @@ impl Ui {
         });
         self.add_action("proxies", proxy::present);
         self.add_action("extract-video", |ui| ui.present_video_dialog());
+        self.add_action("sniff", |ui| sniff::present(ui, None));
+        self.add_action("dependencies", deps::present);
         self.add_action("shortcuts", |ui| ui.present_shortcuts());
         self.add_action("about", |ui| ui.present_about());
 
@@ -221,6 +225,7 @@ impl Ui {
         app.set_accels_for_action("win.pause-all", &["<Primary>p"]);
         app.set_accels_for_action("win.proxies", &["<Primary>comma"]);
         app.set_accels_for_action("win.extract-video", &["<Primary>d"]);
+        app.set_accels_for_action("win.sniff", &["<Primary>f"]);
         app.set_accels_for_action("win.shortcuts", &["<Primary>question"]);
         app.set_accels_for_action("window.close", &["<Primary>w"]);
     }
@@ -272,7 +277,7 @@ impl Ui {
                     JobKind::Scrape => PAGE_SCRAPER,
                     // A yt-dlp extraction produces a file, so it belongs with
                     // the downloads rather than on a page of its own.
-                    JobKind::Download | JobKind::Video => PAGE_DOWNLOADS,
+                    JobKind::Download | JobKind::Video | JobKind::Sniff => PAGE_DOWNLOADS,
                 });
                 self.raise_if_hidden();
             }
@@ -305,6 +310,10 @@ impl Ui {
                 self.set_badge(PAGE_SCRAPER, self.backend.gallery.running_count());
             }
             UiEvent::Media(event) => self.downloads.handle_media(self, event),
+            UiEvent::SniffRequested { url } => {
+                self.raise_if_hidden();
+                sniff::present(self, Some(url));
+            }
             UiEvent::Video(event) => {
                 self.downloads.handle_video(self, event);
                 self.refresh_title();
@@ -387,8 +396,27 @@ impl Ui {
             JobKind::Magnet => self.add_magnet(request.url),
             JobKind::Scrape => self.scraper.start(self, request.url),
             JobKind::Video => self.add_video(request.url),
+            JobKind::Sniff => sniff::present(self, Some(request.url)),
             JobKind::Download => self.add_download(request),
         }
+    }
+
+    /// Queue a download without its own toast, for bulk adds.
+    pub fn enqueue_quiet(self: &Rc<Self>, request: DownloadRequest) {
+        if let Err(error) = request.validate() {
+            log::warn!("skipping {}: {error:#}", request.url);
+            return;
+        }
+        let backend = self.backend.clone();
+        glib::spawn_future_local(async move {
+            let client = backend.aria2.clone();
+            if let Err(error) = backend
+                .offload(async move { client.add_uri(&request).await })
+                .await
+            {
+                log::warn!("could not queue a sniffed file: {error:#}");
+            }
+        });
     }
 
     fn add_download(self: &Rc<Self>, request: DownloadRequest) {
@@ -486,6 +514,7 @@ impl Ui {
             "Torrent (magnet)",
             "Scrape gallery",
             "Extract video (yt-dlp)",
+            "Find all media on the page",
         ]);
         kinds.set_selected(0);
 
@@ -549,6 +578,7 @@ impl Ui {
                 2 => DownloadRequest::magnet(url),
                 3 => DownloadRequest::scrape(url),
                 4 => DownloadRequest::video(url),
+                5 => DownloadRequest::sniff(url),
                 // 0: let `inferred_kind` decide from the scheme.
                 _ => DownloadRequest::from_url(url),
             };
@@ -691,6 +721,7 @@ impl Ui {
         let text = [
             ("Ctrl+N", "Add a download, magnet or gallery"),
             ("Ctrl+D", "Extract a video with yt-dlp"),
+            ("Ctrl+F", "Sniff a page for media"),
             ("Ctrl+P", "Pause every download"),
             ("Ctrl+Comma", "Proxy settings"),
             ("Ctrl+W", "Close the window"),
@@ -789,6 +820,7 @@ impl Ui {
 fn main_menu() -> gio::Menu {
     let sources = gio::Menu::new();
     sources.append(Some("Add Torrent File…"), Some("win.add-torrent-file"));
+    sources.append(Some("Sniff a Page…"), Some("win.sniff"));
     sources.append(Some("Extract Video…"), Some("win.extract-video"));
     sources.append(Some("Scrape a Page…"), Some("win.scrape"));
 
@@ -798,6 +830,7 @@ fn main_menu() -> gio::Menu {
     transfers.append(Some("Clear Finished"), Some("win.clear-finished"));
 
     let settings = gio::Menu::new();
+    settings.append(Some("Dependencies…"), Some("win.dependencies"));
     settings.append(Some("Proxy Settings…"), Some("win.proxies"));
     settings.append(Some("Open Download Folder"), Some("win.open-folder"));
 

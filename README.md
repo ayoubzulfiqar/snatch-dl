@@ -20,6 +20,7 @@ the browser starts them, and four purpose-built engines behind one window.
 | Site video | **yt-dlp** | Resolves DASH/HLS manifests, picks formats, muxes audio and video. |
 | Image galleries | **gallery-dl** | Hundreds of site-specific extractors, organised output. |
 | Conversion / trimming | **ffmpeg** | Post-process without leaving the app. |
+| Finding media on a page | built-in **sniffer** | Reads the DOM *and* asks yt-dlp, then lets you pick. |
 
 Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
 every socket and subprocess, and the two meet through a single event channel —
@@ -60,6 +61,16 @@ as the default or pin it to a single job. Snatch knows which engines can use
 which kind and refuses an impossible pairing instead of silently connecting
 direct — see [Proxies](#proxies).
 
+**Point Snatch at a page and take what you want.**
+`Ctrl+F`, paste a URL — or right-click the page → **Find All Media on This
+Page**. Snatch fetches the document, walks it for images, video, audio,
+documents, archives and subtitles (including `srcset` candidates, lazy-loaded
+`data-src`, Open Graph metadata and CSS backgrounds), *and* asks yt-dlp in case
+the real media is behind a DASH/HLS manifest that appears nowhere in the HTML.
+Each link is probed with a `HEAD` for its true type and size, so a download
+link with no extension is still classified correctly. Results are grouped by
+kind with per-group select-all; tick what you want and it queues.
+
 **Trim a clip without re-encoding.**
 Right-click a finished video → **Trim…**, give a start and end. Streams are
 copied, so it is instant and lossless.
@@ -82,16 +93,31 @@ Torrents need nothing installed: librqbit is compiled in.
 Snatch needs **GTK 4.12+ and libadwaita 1.5+** — Fedora 39+, Ubuntu 24.04+,
 Debian 13+, or any rolling distribution. Older releases cannot build it.
 
-gallery-dl is not in most distribution repositories. It moved to
-[Codeberg](https://codeberg.org/mikf/gallery-dl) and publishes a standalone
-Linux binary, which the installer can fetch and verify for you:
+### Let Snatch install the dependencies
 
 ```bash
-./install.sh --fetch-gallery-dl
+./install.sh --with-deps
 ```
 
-That downloads `gallery-dl.bin` from the latest release, checks it against the
-published `SHA256SUMS`, and installs it to `~/.local/bin` — no `pip`, no root.
+That installs `aria2` and `ffmpeg` through your package manager (you will be
+prompted for sudo, by your package manager, not by Snatch), and fetches the
+standalone `yt-dlp` and `gallery-dl` binaries from their official releases —
+each verified against the project's published SHA-256 sums before it is made
+executable. No `pip`, and no root for the standalone pair.
+
+You can also do it later from inside the app: **Menu → Dependencies…** lists
+every tool, what breaks without it, and offers an **Install** button for the
+two that need no root. For `aria2` and `ffmpeg` it shows the exact command for
+your distribution with a copy button — Snatch never runs `sudo` itself, because
+a download manager that asks for your password is one you should not trust.
+
+Self-installed tools go to `~/.local/share/snatch-dl/bin`, not `~/.local/bin`,
+so uninstalling Snatch cannot remove a tool you rely on elsewhere. Snatch puts
+that directory first on its own `PATH` at startup.
+
+gallery-dl in particular is not in most distribution repositories — it moved to
+[Codeberg](https://codeberg.org/mikf/gallery-dl) and ships a standalone Linux
+binary, which is what `--with-deps` and `--fetch-gallery-dl` retrieve.
 
 ### Build and install
 
@@ -140,12 +166,14 @@ are generated from `extension/manifest.base.json`.
 |---|---|
 | `Ctrl+N` | Add a download, magnet or gallery (kind is auto-detected) |
 | `Ctrl+D` | Extract a video with yt-dlp |
+| `Ctrl+F` | Find all media on a page |
 | `Ctrl+P` | Pause everything |
 | `Ctrl+,` | Proxy settings |
 | `Ctrl+?` | Shortcuts |
 
 From the browser, right-click gives you **Download with Snatch**, **Send Magnet
-to Snatch**, **Extract Video with Snatch** and **Scrape This Page with Snatch**.
+to Snatch**, **Extract Video with Snatch**, **Find All Media on This Page** and
+**Scrape This Page with Snatch**.
 Clicking the toolbar button pauses and resumes capture.
 
 ### Command line
@@ -166,6 +194,9 @@ printf '{"kind":"video","url":"https://example.com/watch?v=..."}\n' | nc -U "$SO
 
 # A gallery
 printf '{"kind":"scrape","url":"https://example.com/user/gallery"}\n' | nc -U "$SOCK"
+
+# Open the media picker for a page
+printf '{"kind":"sniff","url":"https://example.com/article"}\n' | nc -U "$SOCK"
 ```
 
 The reply is one line of JSON: `{"ok":true,"gid":"..."}` or
@@ -245,6 +276,8 @@ download of the page's HTML.
 | `aria2.rs` | Spawns and supervises `aria2c`, JSON-RPC client |
 | `torrent.rs` | librqbit session, magnets, sequential streaming |
 | `ytdlp.rs` | yt-dlp subprocess, progress-template parsing |
+| `sniff.rs` | Page fetch, DOM walk, extractor pass, HEAD probing |
+| `deps.rs` | Tool discovery and verified self-installation |
 | `gallery.rs` | gallery-dl subprocess, two-stream output merge |
 | `processor.rs` | ffmpeg jobs and the serial encode queue |
 | `network.rs` | Proxy table, engine matrix, latency probes |
@@ -264,6 +297,9 @@ Three things in here are counter-intuitive and are all covered by tests:
 - **librqbit has no "sequential" switch.** An open `FileStream` prioritises a
   32 MiB window ahead of its read position, so sequential mode is a pump that
   keeps advancing that position.
+- **A `HEAD` response has no body**, so `reqwest::Response::content_length()`
+  reports 0. The sniffer reads the `Content-Length` header directly; using the
+  convenience method silently loses every size.
 
 ---
 
@@ -271,7 +307,7 @@ Three things in here are counter-intuitive and are all covered by tests:
 
 ```bash
 cargo build --release
-cargo test --workspace       # 54 tests
+cargo test --workspace       # 73 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

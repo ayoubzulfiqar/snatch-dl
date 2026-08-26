@@ -16,6 +16,8 @@ readonly HOST_NAME="com.snatch.dl.nmh"
 # the Linux route is the standalone binary from its releases page.
 readonly GALLERY_DL_REPO="https://codeberg.org/mikf/gallery-dl"
 readonly GALLERY_DL_API="https://codeberg.org/api/v1/repos/mikf/gallery-dl/releases/latest"
+readonly YT_DLP_REPO="https://github.com/yt-dlp/yt-dlp"
+readonly YT_DLP_API="https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 readonly FIREFOX_EXT_ID="snatch@snatch.dl"
 readonly DESKTOP_FILE_NAME="com.snatch.dl.desktop"
 
@@ -23,6 +25,9 @@ readonly BIN_DIR="${HOME}/.local/bin"
 readonly DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
 readonly CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
 readonly DATA_DIR="${DATA_HOME}/snatch-dl"
+# Tools Snatch installs for itself live here, not in ~/.local/bin, so
+# uninstalling Snatch cannot remove something installed for other uses.
+readonly MANAGED_BIN="${DATA_DIR}/bin"
 readonly APPS_DIR="${DATA_HOME}/applications"
 # The signing key stays in the data directory: it is a private key and has no
 # business sitting in a source tree that might get committed or pushed.
@@ -82,8 +87,12 @@ usage() {
 Usage: ./install.sh [OPTIONS]
 
   --skip-build         Reuse an existing target/release build.
-  --fetch-gallery-dl   Download the standalone gallery-dl binary from Codeberg
-                       into ~/.local/bin and verify its published SHA256.
+  --with-deps          Install every missing dependency: distribution packages
+                       via your package manager (you will be prompted for
+                       sudo), and the standalone yt-dlp and gallery-dl binaries
+                       verified against their published SHA256 sums.
+  --fetch-gallery-dl   Fetch only the gallery-dl standalone binary.
+  --fetch-yt-dlp       Fetch only the yt-dlp standalone binary.
   --uninstall          Remove everything this script installed.
   -h, --help           Show this message.
 
@@ -361,6 +370,10 @@ check_aria2() {
 
 # ffmpeg and yt-dlp are packaged everywhere; gallery-dl generally is not.
 check_optional_tools() {
+  # Snatch prepends its managed directory to PATH at runtime; do the same here
+  # so a self-installed tool is reported as present.
+  PATH="${MANAGED_BIN}:${PATH}"
+
   if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
     info "found $(ffmpeg -version 2>/dev/null | head -n1 | cut -d" " -f1-3)"
   else
@@ -373,6 +386,7 @@ check_optional_tools() {
   else
     warn "yt-dlp not found; site video extraction will be unavailable."
     info "  install it with: $(package_hint yt-dlp)"
+    info "  or fetch the standalone binary: ./install.sh --fetch-yt-dlp"
   fi
 
   if command -v gallery-dl >/dev/null 2>&1; then
@@ -380,7 +394,7 @@ check_optional_tools() {
   else
     warn "gallery-dl not found; the Media Scraper will be unavailable."
     info "  most distributions do not package it. Fetch the standalone binary:"
-    info "    ./install.sh --fetch-gallery-dl"
+    info "    ./install.sh --fetch-gallery-dl   (or --with-deps for everything)"
     info "  or download it by hand from ${GALLERY_DL_REPO}/releases"
   fi
 }
@@ -401,50 +415,129 @@ package_hint() {
   fi
 }
 
-# Download gallery-dl.bin and check it against the release's SHA256SUMS.
+# Download a standalone binary and check it against its published SHA256.
 #
-# Explicitly opt-in: it pulls a ~24 MiB binary over the network, which is not
-# something an installer should do behind the user's back.
-fetch_gallery_dl() {
+# Explicitly opt-in: it pulls tens of megabytes over the network, which is not
+# something an installer should do behind the user's back. Verified before it
+# is made executable, and renamed into place only after it verifies.
+fetch_standalone() {
+  local tool="$1" api="$2" asset="$3" sums="$4" repo="$5"
   require curl
   require python3
   require sha256sum
 
-  step "Fetching gallery-dl from Codeberg"
+  step "Fetching ${tool}"
 
   local metadata tag
-  metadata="$(curl -fsSL "${GALLERY_DL_API}")" \
-    || die "could not reach the Codeberg release API"
+  metadata="$(curl -fsSL "${api}")" || die "could not reach the ${tool} release API"
   tag="$(printf "%s" "${metadata}" | python3 -c \
     "import json,sys; print(json.load(sys.stdin).get('tag_name',''))")" \
-    || die "could not parse the Codeberg release metadata"
-  [ -n "${tag}" ] || die "the Codeberg release metadata carried no tag"
+    || die "could not parse the ${tool} release metadata"
+  [ -n "${tag}" ] || die "the ${tool} release metadata carried no tag"
   info "latest release: ${tag}"
 
-  local base="${GALLERY_DL_REPO}/releases/download/${tag}"
+  local base="${repo}/releases/download/${tag}"
   local scratch
   scratch="$(mktemp -d)" || die "could not create a temporary directory"
   # shellcheck disable=SC2064
   trap "rm -rf '${scratch}'" RETURN
 
-  curl -fsSL -o "${scratch}/gallery-dl.bin" "${base}/gallery-dl.bin" \
-    || die "could not download gallery-dl.bin"
-  curl -fsSL -o "${scratch}/SHA256SUMS" "${base}/SHA256SUMS" \
-    || die "could not download SHA256SUMS"
+  # Large assets over HTTP/2 intermittently fail with PROTOCOL_ERROR against
+  # GitHub's CDN, so retry and fall back to HTTP/1.1 before giving up.
+  download_asset "${base}/${asset}" "${scratch}/${asset}" \
+    || die "could not download ${asset}"
+  download_asset "${base}/${sums}" "${scratch}/sums" \
+    || die "could not download ${sums}"
 
-  # Verify before anything becomes executable.
   local expected actual
-  expected="$(awk "/[ *]gallery-dl.bin\$/ { print \$1; exit }" "${scratch}/SHA256SUMS")"
-  [ -n "${expected}" ] || die "SHA256SUMS has no entry for gallery-dl.bin"
-  actual="$(sha256sum "${scratch}/gallery-dl.bin" | awk "{ print \$1 }")"
+  # Match the asset name exactly: yt-dlp's manifest lists every platform, and
+  # gallery-dl marks binary mode with a leading asterisk.
+  expected="$(awk -v want="${asset}" \
+    '{ name = $2; sub(/^\*/, "", name); if (name == want) { print $1; exit } }' \
+    "${scratch}/sums")"
+  [ -n "${expected}" ] || die "${sums} has no entry for ${asset}"
+  actual="$(sha256sum "${scratch}/${asset}" | awk '{ print $1 }')"
   if [ "${expected}" != "${actual}" ]; then
-    die "checksum mismatch for gallery-dl.bin (expected ${expected}, got ${actual})"
+    die "checksum mismatch for ${asset} (expected ${expected}, got ${actual})"
   fi
   info "sha256 verified: ${actual}"
 
-  install -Dm755 "${scratch}/gallery-dl.bin" "${BIN_DIR}/gallery-dl"
-  info "installed ${BIN_DIR}/gallery-dl"
-  info "version: $("${BIN_DIR}/gallery-dl" --version 2>/dev/null || echo unknown)"
+  install -Dm755 "${scratch}/${asset}" "${MANAGED_BIN}/${tool}"
+  info "installed ${MANAGED_BIN}/${tool}"
+  info "version: $("${MANAGED_BIN}/${tool}" --version 2>/dev/null || echo unknown)"
+}
+
+# Fetch one URL, retrying and then downgrading to HTTP/1.1.
+download_asset() {
+  local url="$1" target="$2"
+  if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o "${target}" "${url}"; then
+    return 0
+  fi
+  note "retrying ${url##*/} over HTTP/1.1"
+  curl -fsSL --http1.1 --retry 3 --retry-delay 2 --retry-all-errors -o "${target}" "${url}"
+}
+
+fetch_gallery_dl() {
+  fetch_standalone gallery-dl "${GALLERY_DL_API}" gallery-dl.bin SHA256SUMS \
+    "${GALLERY_DL_REPO}"
+}
+
+fetch_yt_dlp() {
+  # Only these two architectures have published Linux builds.
+  local asset
+  case "$(uname -m)" in
+    x86_64)  asset="yt-dlp_linux" ;;
+    aarch64) asset="yt-dlp_linux_aarch64" ;;
+    *)       warn "yt-dlp publishes no Linux binary for $(uname -m); skipping"; return 0 ;;
+  esac
+  fetch_standalone yt-dlp "${YT_DLP_API}" "${asset}" SHA2-256SUMS "${YT_DLP_REPO}"
+}
+
+# Install everything missing: distribution packages first, then standalones.
+install_dependencies() {
+  local wanted=()
+  command -v aria2c >/dev/null 2>&1 || wanted+=("aria2")
+  command -v ffmpeg >/dev/null 2>&1 || wanted+=("ffmpeg")
+
+  if [ ${#wanted[@]} -gt 0 ]; then
+    step "Installing distribution packages: ${wanted[*]}"
+    if [ "$(id -u)" -eq 0 ]; then
+      warn "running as root; Snatch itself should be installed as your own user"
+    fi
+    # These need root, so the user runs the command and sees the prompt.
+    local command
+    command="$(package_command "${wanted[@]}")"
+    if [ -z "${command}" ]; then
+      warn "unknown package manager; install these yourself: ${wanted[*]}"
+    else
+      info "running: ${command}"
+      # shellcheck disable=SC2086
+      eval "${command}" || warn "package installation failed; install manually: ${wanted[*]}"
+    fi
+  else
+    step "Distribution packages already present"
+  fi
+
+  command -v yt-dlp >/dev/null 2>&1 || fetch_yt_dlp
+  command -v gallery-dl >/dev/null 2>&1 || fetch_gallery_dl
+}
+
+# The install command for the running distribution, or empty if unknown.
+package_command() {
+  if command -v dnf >/dev/null 2>&1; then
+    # Fedora keeps ffmpeg in RPM Fusion, so a bare install would not match it.
+    printf 'sudo dnf install -y %s' "$*"
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf 'sudo apt-get update && sudo apt-get install -y %s' "$*"
+  elif command -v pacman >/dev/null 2>&1; then
+    printf 'sudo pacman -S --needed --noconfirm %s' "$*"
+  elif command -v zypper >/dev/null 2>&1; then
+    printf 'sudo zypper install -y %s' "$*"
+  elif command -v apk >/dev/null 2>&1; then
+    printf 'sudo apk add %s' "$*"
+  else
+    printf ''
+  fi
 }
 
 check_path() {
@@ -461,11 +554,15 @@ check_path() {
 main() {
   local skip_build=0
   local want_gallery_dl=0
+  local want_yt_dlp=0
+  local want_deps=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --skip-build)       skip_build=1 ;;
+      --with-deps)        want_deps=1 ;;
       --fetch-gallery-dl) want_gallery_dl=1 ;;
+      --fetch-yt-dlp)     want_yt_dlp=1 ;;
       --uninstall)        uninstall; exit 0 ;;
       -h|--help)          usage; exit 0 ;;
       *)                  usage >&2; die "unknown option: $1" ;;
@@ -523,8 +620,14 @@ main() {
   step "Installing the desktop entry"
   write_desktop_entry
 
+  if [ "${want_deps}" -eq 1 ]; then
+    install_dependencies
+  fi
   if [ "${want_gallery_dl}" -eq 1 ]; then
     fetch_gallery_dl
+  fi
+  if [ "${want_yt_dlp}" -eq 1 ]; then
+    fetch_yt_dlp
   fi
 
   step "Checking dependencies"
