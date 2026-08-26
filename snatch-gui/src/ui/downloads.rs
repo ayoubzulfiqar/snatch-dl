@@ -17,7 +17,7 @@ use super::format::{
     human_duration, plain_row, row_body,
 };
 use super::{PageSummary, Ui};
-use crate::aria2::DownloadStatus;
+use crate::aria2::{DownloadStatus, QueueMove};
 use crate::db::{JobState, NewHistoryEntry, Origin};
 use crate::processor::{MediaAction, MediaEvent, MediaJob, format_duration};
 use crate::wget::WgetEvent;
@@ -43,6 +43,7 @@ fn is_media(path: &Path) -> bool {
 pub struct DownloadsPage {
     /// GIDs already written to history, so a repeated poll does not re-record.
     recorded: RefCell<HashSet<String>>,
+    graph: super::graph::Bandwidth,
     root: gtk::Box,
     stack: gtk::Stack,
     list: gtk::ListBox,
@@ -74,10 +75,13 @@ impl DownloadsPage {
         jobs_frame.append(&jobs_heading);
         jobs_frame.append(&jobs_list);
 
+        let graph = super::graph::Bandwidth::new();
+
         let column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(0)
             .build();
+        column.append(graph.widget());
         column.append(&jobs_frame);
         column.append(&list);
 
@@ -112,6 +116,7 @@ impl DownloadsPage {
             jobs_list,
             jobs_frame,
             recorded: RefCell::new(HashSet::new()),
+            graph,
             rows: RefCell::new(HashMap::new()),
             jobs: RefCell::new(HashMap::new()),
             summary: RefCell::new(PageSummary::default()),
@@ -162,6 +167,11 @@ impl DownloadsPage {
                 keep
             });
         }
+
+        // One sample per poll keeps the graph in step with the numbers above
+        // it. Upload is always zero here: this page is aria2's HTTP queue, and
+        // seeding lives on the Torrents page.
+        self.graph.push(summary.speed, 0);
 
         self.stack.set_visible_child_name(if downloads.is_empty() {
             PAGE_EMPTY
@@ -544,6 +554,8 @@ struct Row {
     progress: gtk::ProgressBar,
     detail: gtk::Label,
     toggle: gtk::Button,
+    up: gtk::Button,
+    down: gtk::Button,
     open: gtk::Button,
     process: gtk::MenuButton,
     state: Rc<RefCell<RowState>>,
@@ -561,16 +573,24 @@ impl Row {
         let detail = caption_label(false);
         detail.add_css_class("snatch-detail");
 
+        // Queue order only means anything for a download that is waiting, so
+        // these appear and disappear with that state.
+        let up = control_button("go-up-symbolic", "Move up the queue");
+        let down = control_button("go-down-symbolic", "Move down the queue");
+        up.set_visible(false);
+        down.set_visible(false);
+
         let toggle = control_button("media-playback-pause-symbolic", "Pause");
         // Shown from the start: knowing where a download is going is useful
         // while it runs, not only once it has finished.
         let open = control_button("folder-open-symbolic", "Open the destination folder");
         let remove = control_button("user-trash-symbolic", "Remove");
 
-        // The post-process menu appears only on a finished media file.
+        // Actions for one download: conversions once it is a media file, and
+        // proxy routing at any time.
         let process = gtk::MenuButton::builder()
-            .icon_name("applications-multimedia-symbolic")
-            .tooltip_text("Post-process this file")
+            .icon_name("view-more-symbolic")
+            .tooltip_text("More actions for this download")
             .valign(gtk::Align::Center)
             .css_classes(["flat", "circular"])
             .visible(false)
@@ -583,6 +603,8 @@ impl Row {
 
         let bottom = gtk::Box::builder().spacing(6).build();
         bottom.append(&detail);
+        bottom.append(&up);
+        bottom.append(&down);
         bottom.append(&toggle);
         bottom.append(&process);
         bottom.append(&open);
@@ -679,6 +701,30 @@ impl Row {
         // collide in the window's action map.
         install_row_actions(ui, gid, &state);
 
+        for (button, movement) in [(&up, QueueMove::Up), (&down, QueueMove::Down)] {
+            button.connect_clicked({
+                let backend = ui.backend().clone();
+                let weak = Rc::downgrade(ui);
+                let gid = gid.to_owned();
+                move |_| {
+                    let backend = backend.clone();
+                    let weak = weak.clone();
+                    let gid = gid.clone();
+                    glib::spawn_future_local(async move {
+                        let client = backend.aria2.clone();
+                        let result = backend
+                            .offload(async move { client.move_in_queue(&gid, movement).await })
+                            .await;
+                        if let Err(error) = result
+                            && let Some(ui) = weak.upgrade()
+                        {
+                            ui.toast(&format!("{error:#}"));
+                        }
+                    });
+                }
+            });
+        }
+
         Rc::new(Self {
             root,
             title,
@@ -686,6 +732,8 @@ impl Row {
             progress,
             detail,
             toggle,
+            up,
+            down,
             open,
             process,
             state,
@@ -728,6 +776,11 @@ impl Row {
         self.status.set_css_classes(pill);
         self.root.set_css_classes(&["snatch-row", row_state]);
         self.detail.set_text(&detail_line(download));
+
+        // Only a queued download has a position to change.
+        let queued = download.is_waiting();
+        self.up.set_visible(queued);
+        self.down.set_visible(queued);
 
         let running = !download.is_finished();
         self.toggle.set_visible(running);
@@ -819,6 +872,45 @@ fn install_row_actions(ui: &Rc<Ui>, _gid: &str, _state: &Rc<RefCell<RowState>>) 
     });
     window.add_action(&trim);
 
+    for (name, movement) in [
+        ("queue-top", QueueMove::Top),
+        ("queue-bottom", QueueMove::Bottom),
+    ] {
+        let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+        let weak = Rc::downgrade(ui);
+        action.connect_activate(move |_, parameter| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(gid) = parameter.and_then(|value| value.str().map(str::to_owned)) else {
+                return;
+            };
+            let backend = ui.backend().clone();
+            let inner = Rc::downgrade(&ui);
+            glib::spawn_future_local(async move {
+                let client = backend.aria2.clone();
+                let result = backend
+                    .offload(async move { client.move_in_queue(&gid, movement).await })
+                    .await;
+                if let Err(error) = result
+                    && let Some(ui) = inner.upgrade()
+                {
+                    ui.toast(&format!("{error:#}"));
+                }
+            });
+        });
+        window.add_action(&action);
+    }
+
+    let route = gio::SimpleAction::new("route", Some(glib::VariantTy::STRING));
+    let weak = Rc::downgrade(ui);
+    route.connect_activate(move |_, parameter| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(gid) = parameter.and_then(|value| value.str().map(str::to_owned)) else {
+            return;
+        };
+        present_proxy_picker(&ui, &gid);
+    });
+    window.add_action(&route);
+
     let mux = gio::SimpleAction::new("mux", Some(glib::VariantTy::STRING));
     let weak = Rc::downgrade(ui);
     mux.connect_activate(move |_, parameter| {
@@ -829,6 +921,80 @@ fn install_row_actions(ui: &Rc<Ui>, _gid: &str, _state: &Rc<RefCell<RowState>>) 
         choose_audio_and_mux(&ui, &gid);
     });
     window.add_action(&mux);
+}
+
+/// Pin one download to a proxy, or clear its assignment.
+///
+/// aria2 reads the proxy when a download is added, so an existing transfer
+/// keeps the route it started with; the dialog says so rather than implying
+/// the change is retroactive.
+fn present_proxy_picker(ui: &Rc<Ui>, gid: &str) {
+    let proxies = ui.backend().proxies.list();
+    if proxies.is_empty() {
+        ui.toast("No proxies configured — add one in Proxy Settings");
+        return;
+    }
+
+    let mut labels = vec!["Direct connection".to_owned()];
+    labels.extend(proxies.iter().map(|(proxy, _)| {
+        if proxy.supports(crate::network::Engine::Aria2) {
+            proxy.label.clone()
+        } else {
+            // aria2 has no SOCKS support, so naming the reason beats letting
+            // the user pick something that will be refused.
+            format!("{} (SOCKS — not usable for downloads)", proxy.label)
+        }
+    }));
+    let names: Vec<&str> = labels.iter().map(String::as_str).collect();
+
+    let current = ui.backend().proxies.resolve(gid);
+    let selected = current
+        .as_ref()
+        .and_then(|proxy| proxies.iter().position(|(p, _)| p.label == proxy.label))
+        .map(|index| index as u32 + 1)
+        .unwrap_or(0);
+
+    let chooser = gtk::DropDown::from_strings(&names);
+    chooser.set_selected(selected);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Route This Download")
+        .body(
+            "aria2 picks up a proxy when a download starts, so this applies from \
+             the next time it is queued or resumed.",
+        )
+        .extra_child(&chooser)
+        .build();
+    dialog.add_responses(&[("close", "Cancel"), ("save", "Apply")]);
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_close_response("close");
+
+    let weak = Rc::downgrade(ui);
+    let gid = gid.to_owned();
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+        let Some(ui) = weak.upgrade() else { return };
+        let index = chooser.selected() as usize;
+        let choice = if index == 0 {
+            None
+        } else {
+            proxies.get(index - 1).map(|(proxy, _)| proxy.label.clone())
+        };
+        match ui.backend().proxies.assign(&gid, choice.as_deref()) {
+            Ok(()) => {
+                let message = match &choice {
+                    Some(label) => format!("This download will use {label}"),
+                    None => "This download will connect directly".to_owned(),
+                };
+                ui.toast(&message);
+            }
+            Err(error) => ui.toast(&format!("{error:#}")),
+        }
+    });
+
+    dialog.present(Some(ui.window()));
 }
 
 /// Ask for an audio file, then queue a stream-copy mux with the video.

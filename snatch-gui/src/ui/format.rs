@@ -38,6 +38,15 @@ pub fn human_duration(seconds: u64) -> String {
     }
 }
 
+/// Shorten a string for a header or a toast, without splitting a character.
+pub fn elide(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_owned();
+    }
+    let kept: String = value.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 /// A flat circular icon button, the standard control in every row.
 pub fn control_button(icon: &str, tooltip: &str) -> gtk::Button {
     gtk::Button::builder()
@@ -125,6 +134,14 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.00 KiB");
         assert_eq!(human_bytes(104_857_600), "100 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 15), "15.0 MiB");
+    }
+
+    #[test]
+    fn elide_never_splits_a_character() {
+        assert_eq!(elide("short", 10), "short");
+        assert_eq!(elide("abcdefghij", 5), "abcd…");
+        // Multi-byte input must be cut on a character, not a byte.
+        assert_eq!(elide("ααααααα", 4), "ααα…");
     }
 
     #[test]

@@ -14,6 +14,7 @@
 mod deps;
 mod downloads;
 mod format;
+mod graph;
 mod history;
 mod proxy;
 mod scraper;
@@ -28,6 +29,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use anyhow::Result;
 
+use self::format::elide;
 use crate::backend::Backend;
 use crate::types::{DownloadRequest, JobKind, UiEvent};
 use crate::{adw, gtk};
@@ -100,6 +102,10 @@ pub struct Ui {
     torrent_error: RefCell<Option<String>>,
     /// True while the Settings page holds unapplied edits.
     settings_dirty: std::cell::Cell<bool>,
+    /// Last decision of the schedule, so it acts only on a change.
+    schedule_allowing: std::cell::Cell<Option<bool>>,
+    /// Whether anything has run since the last time the queue was empty.
+    queue_was_busy: std::cell::Cell<bool>,
 }
 
 impl Ui {
@@ -328,12 +334,16 @@ impl Ui {
             settings_page,
             torrent_error: RefCell::new(None),
             settings_dirty: std::cell::Cell::new(false),
+            schedule_allowing: std::cell::Cell::new(None),
+            queue_was_busy: std::cell::Cell::new(false),
         });
         ui.install_actions(app);
         ui.scraper.wire(&ui);
         ui.settings_page.build(&ui);
         ui.history.wire(&ui);
         ui.history.reload(&ui);
+        ui.watch_clipboard();
+        ui.start_housekeeping();
         ui.wire_sidebar();
         ui.wire_drawer();
 
@@ -351,6 +361,245 @@ impl Ui {
         .unwrap_or(PAGE_DOWNLOADS);
         ui.select_page(start);
         ui
+    }
+
+    /// Offer to download a link copied anywhere on the desktop.
+    ///
+    /// A toast with a button, not a dialog: a clipboard watcher that steals
+    /// focus every time you copy a URL is a clipboard watcher people turn off
+    /// within the hour.
+    fn watch_clipboard(self: &Rc<Self>) {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        let clipboard = display.clipboard();
+        let last: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+        clipboard.connect_changed({
+            let weak = Rc::downgrade(self);
+            move |clipboard| {
+                let Some(ui) = weak.upgrade() else { return };
+                if !ui.backend.settings().interface.watch_clipboard {
+                    return;
+                }
+
+                let weak = weak.clone();
+                let last = Rc::clone(&last);
+                let clipboard = clipboard.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(Some(text)) = clipboard.read_text_future().await else {
+                        return;
+                    };
+                    let text = text.trim().to_owned();
+                    let Some(ui) = weak.upgrade() else { return };
+
+                    if !is_offerable(&text) {
+                        return;
+                    }
+                    // Copying the same thing twice must not nag twice.
+                    if *last.borrow() == text {
+                        return;
+                    }
+                    *last.borrow_mut() = text.clone();
+
+                    ui.offer_clipboard_link(text);
+                });
+            }
+        });
+    }
+
+    fn offer_clipboard_link(self: &Rc<Self>, url: String) {
+        let name = DownloadRequest::from_url(url.clone()).display_name();
+        let toast = adw::Toast::builder()
+            .title(format!("Copied: {}", elide(&name, 40)))
+            .button_label("Download")
+            .timeout(8)
+            .build();
+
+        let weak = Rc::downgrade(self);
+        toast.connect_button_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.enqueue(DownloadRequest::from_url(url.clone()));
+            }
+        });
+        self.toasts.add_toast(toast);
+    }
+
+    /// One timer for the things that depend on the clock rather than an event:
+    /// the download window, and what to do once the queue drains.
+    fn start_housekeeping(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        // Half a minute is fine for both: a schedule has minute resolution and
+        // a finished queue is not urgent.
+        glib::timeout_add_seconds_local(30, move || {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            ui.enforce_schedule();
+            ui.check_queue_drained();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Pause or resume everything according to the daily window.
+    fn enforce_schedule(self: &Rc<Self>) {
+        let settings = self.backend.settings();
+        if !settings.schedule.enabled {
+            return;
+        }
+
+        let now = glib::DateTime::now_local()
+            .map(|now| (now.hour() * 60 + now.minute()) as u32)
+            .unwrap_or(0);
+        let allowed = settings.schedule.allows(now);
+
+        // Only act on a change, or every tick would re-issue pauseAll.
+        if self.schedule_allowing.replace(Some(allowed)) == Some(allowed) {
+            return;
+        }
+
+        let backend = self.backend.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let client = backend.aria2.clone();
+            let result = backend
+                .offload(async move {
+                    if allowed {
+                        client.unpause_all().await
+                    } else {
+                        client.pause_all().await
+                    }
+                })
+                .await;
+            let Some(ui) = weak.upgrade() else { return };
+            match result {
+                Ok(()) => ui.toast(if allowed {
+                    "Scheduled window opened — downloads resumed"
+                } else {
+                    "Outside the scheduled window — downloads paused"
+                }),
+                Err(error) => log::warn!("could not apply the schedule: {error:#}"),
+            }
+        });
+    }
+
+    /// Run the finish action once, when everything has stopped.
+    fn check_queue_drained(self: &Rc<Self>) {
+        let action = self.backend.settings().interface.when_finished;
+        if !action.is_action() {
+            self.queue_was_busy.set(false);
+            return;
+        }
+
+        let busy = self.downloads.summary().active > 0
+            || self.torrents.summary().active > 0
+            || self.backend.gallery.running_count() > 0
+            || self.backend.video.running_count() > 0
+            || self.backend.wget.running_count() > 0
+            || self.backend.media.outstanding() > 0;
+
+        if busy {
+            self.queue_was_busy.set(true);
+            return;
+        }
+        // Only fire after something was actually running, so launching Snatch
+        // with an empty queue does not immediately shut the machine down.
+        if !self.queue_was_busy.replace(false) {
+            return;
+        }
+
+        self.confirm_finish_action(action);
+    }
+
+    /// Give the user a chance to stop a shutdown before it happens.
+    fn confirm_finish_action(self: &Rc<Self>, action: crate::settings::WhenFinished) {
+        use crate::settings::WhenFinished;
+
+        if action == WhenFinished::Quit {
+            self.toast("Queue empty — closing");
+            if let Some(app) = self.window.application() {
+                app.quit();
+            }
+            return;
+        }
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("Downloads Finished")
+            .body(format!(
+                "{} in 60 seconds. Cancel if you would rather not.",
+                match action {
+                    WhenFinished::Suspend => "The computer will suspend",
+                    _ => "The computer will shut down",
+                }
+            ))
+            .build();
+        dialog.add_responses(&[("cancel", "Stay Awake"), ("now", "Do It Now")]);
+        dialog.set_response_appearance("now", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+
+        let cancelled = Rc::new(std::cell::Cell::new(false));
+        dialog.connect_response(None, {
+            let cancelled = Rc::clone(&cancelled);
+            let weak = Rc::downgrade(self);
+            move |_, response| {
+                if response == "cancel" {
+                    cancelled.set(true);
+                    return;
+                }
+                if response == "now"
+                    && let Some(ui) = weak.upgrade()
+                {
+                    cancelled.set(true);
+                    ui.run_power_action(action);
+                }
+            }
+        });
+        dialog.present(Some(&self.window));
+
+        let weak = Rc::downgrade(self);
+        let dialog = dialog.clone();
+        glib::timeout_add_seconds_local_once(60, move || {
+            if cancelled.get() {
+                return;
+            }
+            dialog.close();
+            if let Some(ui) = weak.upgrade() {
+                ui.run_power_action(action);
+            }
+        });
+    }
+
+    /// Ask logind to suspend or power off.
+    ///
+    /// Through D-Bus rather than a `systemctl` subprocess: polkit already
+    /// grants a logged-in local session this, so it needs no root and no
+    /// password on a normal desktop.
+    fn run_power_action(&self, action: crate::settings::WhenFinished) {
+        use crate::settings::WhenFinished;
+        let method = match action {
+            WhenFinished::Suspend => "Suspend",
+            WhenFinished::PowerOff => "PowerOff",
+            _ => return,
+        };
+
+        let Ok(connection) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) else {
+            log::warn!("no system bus; cannot {method}");
+            return;
+        };
+        let result = connection.call_sync(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            method,
+            Some(&(true,).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            5000,
+            gio::Cancellable::NONE,
+        );
+        if let Err(error) = result {
+            log::warn!("logind refused {method}: {error}");
+        }
     }
 
     /// Bind the drawer toggle to the split view, both ways.
@@ -418,6 +667,8 @@ impl Ui {
             ui.history.select_toggle().set_visible(name == PAGE_HISTORY);
             if name == PAGE_HISTORY {
                 ui.history.reload(&ui);
+                ui.watch_clipboard();
+                ui.start_housekeeping();
             }
             // While the drawer floats over the content, picking a destination
             // should reveal what was chosen. At full width it stays put.
@@ -547,6 +798,8 @@ impl Ui {
                         Ok(count) => {
                             ui.toast(&format!("Forgot {count} entries; files kept"));
                             ui.history.reload(&ui);
+                            ui.watch_clipboard();
+                            ui.start_housekeeping();
                         }
                         Err(error) => ui.toast(&format!("{error:#}")),
                     }
@@ -1299,6 +1552,39 @@ fn pretty_page_name(name: &str) -> String {
     .to_owned()
 }
 
+/// Is this clipboard text worth offering to download?
+///
+/// Deliberately narrow: a magnet or a URL that names a file. Offering to
+/// download every `https://` link anyone copies is noise, and noise is what
+/// makes people switch the feature off.
+fn is_offerable(text: &str) -> bool {
+    if text.is_empty() || text.len() > 4096 || text.contains(char::is_whitespace) {
+        return false;
+    }
+    if text.starts_with("magnet:") {
+        return true;
+    }
+    if !text.starts_with("http://") && !text.starts_with("https://") {
+        return false;
+    }
+    // A path ending in something that looks like a file extension.
+    let path = text
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(text)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let Some(last) = path.rsplit('/').next() else {
+        return false;
+    };
+    last.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && (2..=6).contains(&extension.len())
+            && extension.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 /// Read a text buffer's whole contents.
 fn buffer_text(buffer: &gtk::TextBuffer) -> String {
     buffer
@@ -1344,4 +1630,41 @@ pub struct PageSummary {
     pub total: usize,
     pub active: usize,
     pub speed: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_offers_only_things_worth_downloading() {
+        // A link that names a file, or a magnet.
+        assert!(is_offerable("https://example.com/ubuntu-24.04.iso"));
+        assert!(is_offerable("http://cdn.example.com/a/b/clip.mp4?token=x"));
+        assert!(is_offerable("magnet:?xt=urn:btih:abc"));
+    }
+
+    #[test]
+    fn clipboard_ignores_ordinary_copying() {
+        // Offering on every copied URL is what makes people switch the
+        // feature off, so a bare page link is not offered.
+        assert!(!is_offerable("https://example.com/articles/how-to-cook"));
+        assert!(!is_offerable("https://example.com/"));
+        // Prose, paths, and anything with whitespace.
+        assert!(!is_offerable("the quick brown fox"));
+        assert!(!is_offerable("https://example.com/a.iso and more"));
+        assert!(!is_offerable("/home/me/file.iso"));
+        assert!(!is_offerable(""));
+        // A hostname-looking tail is not a file extension.
+        assert!(!is_offerable(
+            "https://example.com/path/to.a-very-long-thing"
+        ));
+    }
+
+    #[test]
+    fn clipboard_ignores_absurd_input() {
+        // A copied document must not be treated as a URL.
+        let huge = format!("https://example.com/{}.iso", "a".repeat(5000));
+        assert!(!is_offerable(&huge));
+    }
 }

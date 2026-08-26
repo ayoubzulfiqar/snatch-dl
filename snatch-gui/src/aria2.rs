@@ -45,6 +45,15 @@ const DEFAULT_USER_AGENT: &str =
 const READY_ATTEMPTS: u32 = 80;
 const READY_INTERVAL: Duration = Duration::from_millis(250);
 
+/// A step in the waiting queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
 /// Where aria2 writes files and keeps its resumable session.
 #[derive(Debug, Clone)]
 pub struct Aria2Config {
@@ -272,6 +281,26 @@ impl Aria2Client {
         self.call::<Value>("aria2.unpause", vec![json!(gid)])
             .await
             .map(drop)
+    }
+
+    /// Move a waiting download within the queue.
+    ///
+    /// aria2 only orders *waiting* downloads: an active one is already
+    /// running and a finished one has no position, so the call is a no-op
+    /// there rather than an error worth surfacing.
+    pub async fn move_in_queue(&self, gid: &str, movement: QueueMove) -> Result<()> {
+        let (position, how) = match movement {
+            QueueMove::Up => (-1, "POS_CUR"),
+            QueueMove::Down => (1, "POS_CUR"),
+            QueueMove::Top => (0, "POS_SET"),
+            QueueMove::Bottom => (0, "POS_END"),
+        };
+        self.call::<Value>(
+            "aria2.changePosition",
+            vec![json!(gid), json!(position), json!(how)],
+        )
+        .await
+        .map(drop)
     }
 
     pub async fn pause_all(&self) -> Result<()> {

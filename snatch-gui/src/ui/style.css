@@ -133,3 +133,15 @@
   color: @accent_fg_color;
   background-color: @accent_bg_color;
 }
+
+/* --- bandwidth graph ---------------------------------------------------- */
+
+/* The drawing code reads the widget's `color`, so binding it to the accent
+   here is what makes the chart follow the theme. */
+.snatch-graph-area {
+  color: @accent_color;
+}
+
+.snatch-graph {
+  padding: 8px 4px 0 4px;
+}

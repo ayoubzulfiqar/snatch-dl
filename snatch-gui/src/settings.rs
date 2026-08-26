@@ -187,6 +187,10 @@ impl Default for MediaSettings {
 pub struct InterfaceSettings {
     /// Show a desktop notification when a download finishes.
     pub notify_on_finish: bool,
+    /// Watch the clipboard and offer to download links copied elsewhere.
+    pub watch_clipboard: bool,
+    /// What to do once the queue is empty.
+    pub when_finished: WhenFinished,
     /// Bring the window forward when the browser hands over a job.
     pub raise_on_capture: bool,
     /// Confirm before cancelling a running download.
@@ -204,6 +208,8 @@ impl Default for InterfaceSettings {
     fn default() -> Self {
         Self {
             notify_on_finish: true,
+            watch_clipboard: false,
+            when_finished: WhenFinished::default(),
             raise_on_capture: true,
             confirm_cancel: true,
             download_dir: String::new(),
@@ -213,11 +219,104 @@ impl Default for InterfaceSettings {
     }
 }
 
+/// What to do once nothing is left to download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WhenFinished {
+    #[default]
+    Nothing,
+    /// Close Snatch.
+    Quit,
+    /// Suspend the machine through logind.
+    Suspend,
+    /// Power the machine off through logind.
+    PowerOff,
+}
+
+impl WhenFinished {
+    pub const ALL: [WhenFinished; 4] = [
+        WhenFinished::Nothing,
+        WhenFinished::Quit,
+        WhenFinished::Suspend,
+        WhenFinished::PowerOff,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WhenFinished::Nothing => "Stay open",
+            WhenFinished::Quit => "Quit Snatch",
+            WhenFinished::Suspend => "Suspend the computer",
+            WhenFinished::PowerOff => "Shut the computer down",
+        }
+    }
+
+    pub fn is_action(self) -> bool {
+        self != WhenFinished::Nothing
+    }
+}
+
+/// A daily window during which downloading is allowed.
+///
+/// Stored as `HH:MM` strings because that is what the user typed and what a
+/// hand-edited file should contain. A window whose end is before its start
+/// wraps past midnight, which is the common case for overnight downloading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ScheduleSettings {
+    pub enabled: bool,
+    pub start: String,
+    pub stop: String,
+}
+
+impl Default for ScheduleSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start: "01:00".to_owned(),
+            stop: "08:00".to_owned(),
+        }
+    }
+}
+
+impl ScheduleSettings {
+    /// Is `minute_of_day` inside the window?
+    pub fn allows(&self, minute_of_day: u32) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let (Some(start), Some(stop)) = (parse_hhmm(&self.start), parse_hhmm(&self.stop)) else {
+            // An unparseable window must not silently block every download.
+            return true;
+        };
+        if start == stop {
+            return true;
+        }
+        if start < stop {
+            (start..stop).contains(&minute_of_day)
+        } else {
+            // Wraps past midnight: 22:00 to 06:00.
+            minute_of_day >= start || minute_of_day < stop
+        }
+    }
+}
+
+/// `HH:MM` to minutes since midnight.
+pub fn parse_hhmm(value: &str) -> Option<u32> {
+    let (hours, minutes) = value.trim().split_once(':')?;
+    let hours: u32 = hours.trim().parse().ok()?;
+    let minutes: u32 = minutes.trim().parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(hours * 60 + minutes)
+}
+
 /// Everything the user can configure.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Settings {
     pub download: DownloadSettings,
+    pub schedule: ScheduleSettings,
     pub torrent: TorrentSettings,
     pub media: MediaSettings,
     pub interface: InterfaceSettings,
@@ -285,6 +384,16 @@ impl Settings {
         }
 
         self.media.audio_bitrate_kbps = self.media.audio_bitrate_kbps.clamp(64, 320);
+
+        // A window Snatch cannot read would block downloading forever, so
+        // fall back rather than keep an unusable value.
+        let schedule = &mut self.schedule;
+        if parse_hhmm(&schedule.start).is_none() {
+            schedule.start = ScheduleSettings::default().start;
+        }
+        if parse_hhmm(&schedule.stop).is_none() {
+            schedule.stop = ScheduleSettings::default().stop;
+        }
         self
     }
 
@@ -566,5 +675,76 @@ mod category_tests {
         assert_eq!(category_for("data.qqq"), None);
         assert_eq!(category_for("no-extension"), None);
         assert_eq!(category_for(""), None);
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    fn window(start: &str, stop: &str) -> ScheduleSettings {
+        ScheduleSettings {
+            enabled: true,
+            start: start.to_owned(),
+            stop: stop.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_disabled_schedule_never_blocks() {
+        let mut schedule = window("01:00", "02:00");
+        schedule.enabled = false;
+        for minute in [0, 90, 720, 1439] {
+            assert!(schedule.allows(minute));
+        }
+    }
+
+    #[test]
+    fn a_daytime_window_is_inclusive_of_its_start() {
+        let schedule = window("09:00", "17:00");
+        assert!(!schedule.allows(8 * 60 + 59));
+        assert!(schedule.allows(9 * 60));
+        assert!(schedule.allows(16 * 60 + 59));
+        // The stop minute itself is outside: 17:00 means "stop at 17:00".
+        assert!(!schedule.allows(17 * 60));
+    }
+
+    #[test]
+    fn an_overnight_window_wraps_past_midnight() {
+        // The common case: download while everyone is asleep.
+        let schedule = window("22:00", "06:00");
+        assert!(schedule.allows(23 * 60));
+        assert!(schedule.allows(0));
+        assert!(schedule.allows(5 * 60 + 59));
+        assert!(!schedule.allows(6 * 60));
+        assert!(!schedule.allows(12 * 60));
+    }
+
+    #[test]
+    fn an_unreadable_window_allows_everything() {
+        // Better to download at the wrong time than to block forever with no
+        // way for the user to tell why.
+        let schedule = window("nonsense", "06:00");
+        assert!(schedule.allows(12 * 60));
+        // Equal bounds mean the whole day, not zero minutes.
+        assert!(window("03:00", "03:00").allows(15 * 60));
+    }
+
+    #[test]
+    fn times_parse_and_reject_sensibly() {
+        assert_eq!(parse_hhmm("00:00"), Some(0));
+        assert_eq!(parse_hhmm(" 23:59 "), Some(23 * 60 + 59));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("12:60"), None);
+        assert_eq!(parse_hhmm("12"), None);
+        assert_eq!(parse_hhmm(""), None);
+    }
+
+    #[test]
+    fn a_broken_schedule_is_repaired_on_load() {
+        let mut settings = Settings::default();
+        settings.schedule.start = "99:99".to_owned();
+        let settings = settings.clamped();
+        assert_eq!(settings.schedule.start, ScheduleSettings::default().start);
     }
 }

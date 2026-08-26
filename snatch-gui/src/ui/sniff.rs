@@ -11,7 +11,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use super::Ui;
-use super::format::human_bytes;
+use super::format::{elide, human_bytes};
 use crate::sniff::{Candidate, MediaKind, SniffOptions, SniffResult};
 use crate::types::DownloadRequest;
 use crate::{adw, gtk};
@@ -287,15 +287,6 @@ pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
     if autostart {
         sniff_button.emit_clicked();
     }
-}
-
-/// Keep a long page title from stretching the header bar.
-fn elide(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_owned();
-    }
-    let kept: String = value.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
 }
 
 fn host_of(url: &str) -> String {

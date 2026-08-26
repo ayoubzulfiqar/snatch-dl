@@ -42,6 +42,7 @@ Every engine option is configurable:
 | A second HTTP engine | **Wget2** | Also multithreaded; some servers prefer its request pattern. |
 | Downloads behind a login | **cURL import** | Paste "Copy as cURL" and the cookies, referer and user agent come with it. |
 | Keeping track | **history** | What finished, where it went, and the file itself. |
+| Downloading overnight | **scheduler** | A daily window, then suspend or shut down when done. |
 
 Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
 every socket and subprocess, and the two meet through a single event channel —
@@ -116,6 +117,26 @@ Files are sorted as they arrive into `Video`, `Music`, `Images`, `Documents`,
 `Compressed` and `Programs` beneath your download folder. Anything Snatch does
 not recognise is left in the root rather than filed under a guess. Turn it off
 in Settings if you would rather have one flat folder.
+
+**Download overnight and go to bed.**
+Set a window in Settings — say 01:00 to 08:00, which wraps past midnight —
+and Snatch pauses everything outside it. Pick *Suspend* or *Shut the computer
+down* for when the queue empties; you get a minute to cancel, and it goes
+through logind so it needs no root.
+
+**Reorder the queue.**
+Waiting downloads carry up and down buttons, and the row menu can send one
+straight to the top or bottom. Active downloads have no position to change, so
+the buttons are hidden rather than doing nothing.
+
+**Send one download through a different proxy.**
+The row menu has *Route Through a Proxy…*. A SOCKS entry is labelled as
+unusable for downloads, because aria2 cannot use one.
+
+**Let it catch links you copy.**
+Turn on clipboard watching and copying a file link anywhere offers it as a
+toast with a Download button — a toast, not a dialog, so it never steals focus.
+Only links that name a file are offered; an ordinary page link is not.
 
 **Trim a clip without re-encoding.**
 Right-click a finished video → **Trim…**, give a start and end. Streams are
@@ -277,7 +298,7 @@ Each row says **when** it takes effect, because the engines differ:
 
 | When | Settings |
 |---|---|
-| Immediately | Simultaneous downloads, overall speed caps, torrent upload cap |
+| Immediately | Simultaneous downloads, overall speed caps, torrent upload cap, schedule, clipboard watching |
 | Next download | Segments, connections per server, per-download cap, engine choice |
 | After a restart | Disk allocation, retries, TLS verification, resume-data writing, DHT, download folder |
 
@@ -371,6 +392,7 @@ download of the page's HTML.
 | `settings.rs` | Persisted configuration and where each value applies |
 | `curl.rs` | Parsing a browser's "Copy as cURL" into a request |
 | `ui/history.rs` | Finished downloads, multi-select, folder and file actions |
+| `ui/graph.rs` | The bandwidth sparkline, drawn with Cairo |
 | `deps.rs` | Tool discovery and verified self-installation |
 | `gallery.rs` | gallery-dl subprocess, two-stream output merge |
 | `processor.rs` | ffmpeg jobs and the serial encode queue |

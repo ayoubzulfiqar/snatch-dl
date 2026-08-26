@@ -17,7 +17,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use super::Ui;
-use crate::settings::{Allocation, HttpEngine, Settings};
+use crate::settings::{Allocation, HttpEngine, Settings, WhenFinished};
 use crate::{adw, gtk};
 use gtk::glib;
 
@@ -53,6 +53,7 @@ impl SettingsPage {
         self.add_download_group(&page, ui);
         self.add_torrent_group(&page, ui);
         self.add_media_group(&page, ui);
+        self.add_schedule_group(&page, ui);
         self.add_interface_group(&page, ui);
         self.add_actions_group(&page, ui);
 
@@ -413,6 +414,91 @@ impl SettingsPage {
         page.add(&group);
     }
 
+    fn add_schedule_group(&self, page: &adw::PreferencesPage, ui: &Rc<Ui>) {
+        let draft = self.draft.borrow().clone();
+        let group = adw::PreferencesGroup::builder()
+            .title("Schedule")
+            .description(
+                "Restrict downloading to a window each day. A window whose end is \
+                 before its start runs overnight.",
+            )
+            .build();
+
+        let enabled = adw::SwitchRow::builder()
+            .title("Only download during a set window")
+            .active(draft.schedule.enabled)
+            .build();
+        enabled.connect_active_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let on = row.is_active();
+                this.edit(&ui, |settings| settings.schedule.enabled = on);
+            }
+        });
+        group.add(&enabled);
+
+        for (title, initial, is_start) in [
+            ("Start at (HH:MM)", draft.schedule.start.clone(), true),
+            ("Stop at (HH:MM)", draft.schedule.stop.clone(), false),
+        ] {
+            let row = adw::EntryRow::builder().title(title).text(&initial).build();
+            row.connect_changed({
+                let this = self.clone_handles();
+                let ui = Rc::downgrade(ui);
+                move |row| {
+                    let Some(ui) = ui.upgrade() else { return };
+                    let value = row.text().to_string();
+                    // Mark a bad time as the user types rather than silently
+                    // repairing it on save.
+                    let valid = crate::settings::parse_hhmm(&value).is_some();
+                    if valid {
+                        row.remove_css_class("error");
+                    } else {
+                        row.add_css_class("error");
+                    }
+                    this.edit(&ui, |settings| {
+                        if is_start {
+                            settings.schedule.start = value.clone();
+                        } else {
+                            settings.schedule.stop = value.clone();
+                        }
+                    });
+                }
+            });
+            group.add(&row);
+        }
+
+        let finishes: Vec<&str> = WhenFinished::ALL.iter().map(|w| w.label()).collect();
+        let when_done = adw::ComboRow::builder()
+            .title("When everything finishes")
+            .subtitle("Suspend and shut down go through logind and can be cancelled.")
+            .model(&gtk::StringList::new(&finishes))
+            .selected(
+                WhenFinished::ALL
+                    .iter()
+                    .position(|w| *w == draft.interface.when_finished)
+                    .unwrap_or(0) as u32,
+            )
+            .build();
+        when_done.connect_selected_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let chosen = WhenFinished::ALL
+                    .get(row.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                this.edit(&ui, |settings| settings.interface.when_finished = chosen);
+            }
+        });
+        group.add(&when_done);
+
+        page.add(&group);
+    }
+
     fn add_interface_group(&self, page: &adw::PreferencesPage, ui: &Rc<Ui>) {
         let draft = self.draft.borrow().clone();
         let group = adw::PreferencesGroup::builder().title("Interface").build();
@@ -476,6 +562,12 @@ impl SettingsPage {
                 2usize,
             ),
             (
+                "Watch the clipboard for links",
+                "Offer to download a file link copied anywhere on the desktop.",
+                draft.interface.watch_clipboard,
+                3usize,
+            ),
+            (
                 "Confirm before cancelling",
                 "Ask before discarding a download in progress.",
                 draft.interface.confirm_cancel,
@@ -496,6 +588,7 @@ impl SettingsPage {
                     this.edit(&ui, |settings| match which {
                         0 => settings.interface.raise_on_capture = on,
                         2 => settings.interface.notify_on_finish = on,
+                        3 => settings.interface.watch_clipboard = on,
                         _ => settings.interface.confirm_cancel = on,
                     });
                 }
