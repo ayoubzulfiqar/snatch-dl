@@ -14,7 +14,9 @@ optdepends=(
   'gallery-dl: image gallery scraping'
 )
 makedepends=('cargo' 'pkgconf')
-options=('!lto')
+# The release profile already strips symbols, so makepkg's debug package
+# would be an empty 6 KB file on the release page.
+options=('!lto' '!debug')
 
 # Built from the checkout this PKGBUILD ships in.
 prepare() {

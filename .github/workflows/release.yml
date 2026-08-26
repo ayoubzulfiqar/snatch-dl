@@ -87,7 +87,6 @@ jobs:
           cp -r extension install.sh README.md LICENSE "dist/${STAGE}/"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           rm -rf "dist/${STAGE}"
-          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:
@@ -139,8 +138,21 @@ jobs:
         with:
           path: artifacts
 
+      # One checksum file covering every asset. Publishing a SHA256SUMS that
+      # only listed the tarball was worse than none: it implies the packages
+      # beside it were verified too.
+      - name: Collect and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f -exec cp -t release/ {} +
+          cd release
+          sha256sum -- * > SHA256SUMS
+          echo "Release contains:"
+          cat SHA256SUMS
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: release/*
           generate_release_notes: true
