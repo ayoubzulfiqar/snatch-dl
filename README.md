@@ -13,6 +13,10 @@ Point it at a page and pick what you want:
 
 ![Media sniffer](docs/sniffer.png)
 
+Every engine option is configurable, IDM-style:
+
+![Settings](docs/settings.png)
+
 ---
 
 ## What it does
@@ -25,6 +29,7 @@ Point it at a page and pick what you want:
 | Image galleries | **gallery-dl** | Hundreds of site-specific extractors, organised output. |
 | Conversion / trimming | **ffmpeg** | Post-process without leaving the app. |
 | Finding media on a page | built-in **sniffer** | Reads the DOM *and* asks yt-dlp, then lets you pick. |
+| A second HTTP engine | **Wget2** | Also multithreaded; some servers prefer its request pattern. |
 
 Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
 every socket and subprocess, and the two meet through a single event channel —
@@ -172,7 +177,7 @@ are generated from `extension/manifest.base.json`.
 | `Ctrl+D` | Extract a video with yt-dlp |
 | `Ctrl+F` | Find all media on a page |
 | `Ctrl+P` | Pause everything |
-| `Ctrl+,` | Proxy settings |
+| `Ctrl+,` | Settings |
 | `Ctrl+?` | Shortcuts |
 
 From the browser, right-click gives you **Download with Snatch**, **Send Magnet
@@ -207,6 +212,40 @@ The reply is one line of JSON: `{"ok":true,"gid":"..."}` or
 `{"ok":false,"error":"..."}`. Snatch starts automatically if it is not running.
 
 ---
+
+## Settings
+
+Snatch is navigated from a sidebar: **Downloads**, **Torrents**, **Scraper**
+and **Settings**, each a real page rather than a dialog. Live counts appear
+next to a destination, so activity on a page you are not looking at is still
+visible. It reopens on whichever page you left it.
+
+Settings covers what the underlying engines expose — segments per download,
+connections per server, minimum split size, simultaneous downloads, overall
+and per-download speed caps, retries, disk allocation, TLS verification, user
+agent, torrent upload cap and peer limit, DHT, audio bitrate, subtitles and
+gallery behaviour.
+
+Each row says **when** it takes effect, because the engines differ:
+
+| When | Settings |
+|---|---|
+| Immediately | Simultaneous downloads, overall speed caps, torrent upload cap |
+| Next download | Segments, connections per server, per-download cap, engine choice |
+| After a restart | Disk allocation, retries, TLS verification, resume-data writing, DHT |
+
+Apply names the specific settings waiting on a restart rather than showing a
+generic warning.
+
+### Those `.aria2` files
+
+While a download runs, aria2 writes a `something.aria2` control file beside
+it. That file is what lets a download resume after a crash, a network drop or
+a power cut, and aria2 deletes it the moment the download completes — if one
+is left behind after a finished download, that is a bug, not by design.
+
+If you would rather not see them at all, **Settings → Write resume data while
+downloading** turns them off. You lose crash resume in exchange.
 
 ## Proxies
 
@@ -281,6 +320,8 @@ download of the page's HTML.
 | `torrent.rs` | librqbit session, magnets, sequential streaming |
 | `ytdlp.rs` | yt-dlp subprocess, progress-template parsing |
 | `sniff.rs` | Page fetch, DOM walk, extractor pass, HEAD probing |
+| `wget.rs` | Wget2 engine, progress measured from the file on disk |
+| `settings.rs` | Persisted configuration and where each value applies |
 | `deps.rs` | Tool discovery and verified self-installation |
 | `gallery.rs` | gallery-dl subprocess, two-stream output merge |
 | `processor.rs` | ffmpeg jobs and the serial encode queue |
@@ -304,6 +345,11 @@ Three things in here are counter-intuitive and are all covered by tests:
 - **A `HEAD` response has no body**, so `reqwest::Response::content_length()`
   reports 0. The sniffer reads the `Content-Length` header directly; using the
   convenience method silently loses every size.
+- **Wget2's progress bar is unparseable** — ANSI cursor-save, cursor-up and
+  erase sequences interleaved mid-line. The wget engine measures progress by
+  `stat`-ing the output file instead, with the total from a `HEAD`.
+- **aria2 rejects the entire `changeGlobalOption` call** if any key in it is
+  not globally changeable, so that list stays deliberately short.
 
 ---
 
@@ -311,7 +357,7 @@ Three things in here are counter-intuitive and are all covered by tests:
 
 ```bash
 cargo build --release
-cargo test --workspace       # 73 tests
+cargo test --workspace       # 86 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

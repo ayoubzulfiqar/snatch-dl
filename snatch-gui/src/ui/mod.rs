@@ -16,6 +16,7 @@ mod downloads;
 mod format;
 mod proxy;
 mod scraper;
+mod settings;
 mod sniff;
 mod torrents;
 
@@ -37,6 +38,7 @@ const WINDOW_HEIGHT: i32 = 640;
 pub const PAGE_DOWNLOADS: &str = "downloads";
 pub const PAGE_TORRENTS: &str = "torrents";
 pub const PAGE_SCRAPER: &str = "scraper";
+pub const PAGE_SETTINGS: &str = "settings";
 
 /// Construct the window on first activation; raise it on every later one.
 pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Receiver<UiEvent>) {
@@ -81,12 +83,19 @@ pub struct Ui {
     banner: adw::Banner,
     toasts: adw::ToastOverlay,
     stack: adw::ViewStack,
+    split: adw::NavigationSplitView,
+    sidebar_list: gtk::ListBox,
+    /// Page name paired with its sidebar count badge.
+    sidebar_rows: Vec<(String, gtk::Label)>,
     backend: Backend,
     downloads: downloads::DownloadsPage,
     torrents: torrents::TorrentsPage,
     scraper: scraper::ScraperPage,
+    settings_page: settings::SettingsPage,
     /// Set once if the torrent session failed, so the page can explain itself.
     torrent_error: RefCell<Option<String>>,
+    /// True while the Settings page holds unapplied edits.
+    settings_dirty: std::cell::Cell<bool>,
 }
 
 impl Ui {
@@ -97,47 +106,138 @@ impl Ui {
         let torrents = torrents::TorrentsPage::new();
         let scraper = scraper::ScraperPage::new();
 
+        let settings_page = settings::SettingsPage::new();
+
         let stack = adw::ViewStack::new();
-        let downloads_page = stack.add_titled_with_icon(
+        stack.add_titled_with_icon(
             downloads.widget(),
             Some(PAGE_DOWNLOADS),
             "Downloads",
             "folder-download-symbolic",
         );
-        let torrents_page = stack.add_titled_with_icon(
+        stack.add_titled_with_icon(
             torrents.widget(),
             Some(PAGE_TORRENTS),
             "Torrents",
             "network-transmit-receive-symbolic",
         );
-        let scraper_page = stack.add_titled_with_icon(
+        stack.add_titled_with_icon(
             scraper.widget(),
             Some(PAGE_SCRAPER),
             "Scraper",
             "image-x-generic-symbolic",
         );
-        // Badges show activity on a page the user is not currently looking at.
-        for page in [&downloads_page, &torrents_page, &scraper_page] {
-            page.set_badge_number(0);
+        stack.add_titled_with_icon(
+            settings_page.widget(),
+            Some(PAGE_SETTINGS),
+            "Settings",
+            "preferences-system-symbolic",
+        );
+
+        // The sidebar. A list rather than a ViewSwitcher: it has room for a
+        // description per entry and for a live count, and it is where a
+        // desktop user looks for navigation once an app has more than three
+        // places to be.
+        let sidebar_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["navigation-sidebar"])
+            .build();
+
+        let mut sidebar_rows = Vec::new();
+        for (name, title, subtitle, icon) in [
+            (
+                PAGE_DOWNLOADS,
+                "Downloads",
+                "Files, videos and conversions",
+                "folder-download-symbolic",
+            ),
+            (
+                PAGE_TORRENTS,
+                "Torrents",
+                "Magnets, peers and seeding",
+                "network-transmit-receive-symbolic",
+            ),
+            (
+                PAGE_SCRAPER,
+                "Scraper",
+                "Whole galleries, filed by site",
+                "image-x-generic-symbolic",
+            ),
+            (
+                PAGE_SETTINGS,
+                "Settings",
+                "Speed, segmenting and engines",
+                "preferences-system-symbolic",
+            ),
+        ] {
+            let badge = gtk::Label::builder()
+                .css_classes(["snatch-badge"])
+                .visible(false)
+                .build();
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(icon));
+            row.add_suffix(&badge);
+            // The page name travels with the row so selection can find it.
+            row.set_widget_name(name);
+            sidebar_list.append(&row);
+            sidebar_rows.push((name.to_owned(), badge));
         }
+
+        let sidebar_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&sidebar_list)
+            .build();
+
+        // gtk::Button takes either a label or an icon, not both; ButtonContent
+        // is the widget that shows the pair.
+        let quick_add = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name("list-add-symbolic")
+                    .label("Add")
+                    .halign(gtk::Align::Center)
+                    .build(),
+            )
+            .css_classes(["suggested-action"])
+            .tooltip_text("Add a download, magnet, gallery or video (Ctrl+N)")
+            .action_name("win.add")
+            .build();
+        let sniff_button = gtk::Button::builder()
+            .icon_name("edit-find-symbolic")
+            .tooltip_text("Find all media on a page (Ctrl+F)")
+            .action_name("win.sniff")
+            .build();
+        let quick_bar = gtk::Box::builder()
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        quick_add.set_hexpand(true);
+        quick_bar.append(&quick_add);
+        quick_bar.append(&sniff_button);
+
+        let sidebar_toolbar = adw::ToolbarView::builder()
+            .content(&sidebar_scroller)
+            .build();
+        sidebar_toolbar.add_top_bar(
+            &adw::HeaderBar::builder()
+                .title_widget(&adw::WindowTitle::new("Snatch", ""))
+                .show_end_title_buttons(false)
+                .build(),
+        );
+        sidebar_toolbar.add_bottom_bar(&quick_bar);
 
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&stack));
         let banner = adw::Banner::builder().revealed(false).build();
 
-        let switcher = adw::ViewSwitcher::builder()
-            .stack(&stack)
-            .policy(adw::ViewSwitcherPolicy::Wide)
-            .build();
-
-        let header = adw::HeaderBar::builder().title_widget(&switcher).build();
-        header.pack_start(
-            &gtk::Button::builder()
-                .icon_name("list-add-symbolic")
-                .tooltip_text("Add a download, magnet or gallery (Ctrl+N)")
-                .action_name("win.add")
-                .build(),
-        );
+        let header = adw::HeaderBar::builder().title_widget(&title).build();
         header.pack_end(
             &gtk::MenuButton::builder()
                 .icon_name("open-menu-symbolic")
@@ -147,13 +247,26 @@ impl Ui {
                 .build(),
         );
 
-        // On a narrow window the switcher moves to a bottom bar.
-        let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).build();
+        let content_toolbar = adw::ToolbarView::builder().content(&toasts).build();
+        content_toolbar.add_top_bar(&header);
+        content_toolbar.add_top_bar(&banner);
 
-        let toolbar = adw::ToolbarView::builder().content(&toasts).build();
-        toolbar.add_top_bar(&header);
-        toolbar.add_top_bar(&banner);
-        toolbar.add_bottom_bar(&switcher_bar);
+        let split = adw::NavigationSplitView::builder()
+            .sidebar(
+                &adw::NavigationPage::builder()
+                    .title("Snatch")
+                    .child(&sidebar_toolbar)
+                    .build(),
+            )
+            .content(
+                &adw::NavigationPage::builder()
+                    .title("Downloads")
+                    .child(&content_toolbar)
+                    .build(),
+            )
+            .min_sidebar_width(240.0)
+            .max_sidebar_width(300.0)
+            .build();
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -161,18 +274,17 @@ impl Ui {
             .default_width(WINDOW_WIDTH)
             .default_height(WINDOW_HEIGHT)
             .width_request(360)
-            .height_request(360)
-            .content(&toolbar)
+            .height_request(400)
+            .content(&split)
             .build();
 
-        // The breakpoint swaps the wide switcher for the bottom bar.
+        // On a narrow window the split view shows one pane at a time.
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
-            600.0,
+            700.0,
             adw::LengthUnit::Sp,
         ));
-        breakpoint.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
-        breakpoint.add_setter(&header, "title-widget", Some(&title.to_value()));
+        breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         window.add_breakpoint(breakpoint);
 
         let ui = Rc::new(Self {
@@ -181,15 +293,120 @@ impl Ui {
             banner,
             toasts,
             stack,
+            split,
+            sidebar_list,
+            sidebar_rows,
             backend,
             downloads,
             torrents,
             scraper,
+            settings_page,
             torrent_error: RefCell::new(None),
+            settings_dirty: std::cell::Cell::new(false),
         });
         ui.install_actions(app);
         ui.scraper.wire(&ui);
+        ui.settings_page.build(&ui);
+        ui.wire_sidebar();
+
+        // Reopen where the user left off.
+        let last = ui.backend.settings().interface.last_page;
+        let start = [PAGE_DOWNLOADS, PAGE_TORRENTS, PAGE_SCRAPER, PAGE_SETTINGS]
+            .into_iter()
+            .find(|page| *page == last)
+            .unwrap_or(PAGE_DOWNLOADS);
+        ui.select_page(start);
         ui
+    }
+
+    /// Selecting a sidebar row shows its page.
+    fn wire_sidebar(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.sidebar_list.connect_row_selected(move |_, row| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(row) = row else { return };
+            let name = row.widget_name();
+            if name.is_empty() {
+                return;
+            }
+            ui.stack.set_visible_child_name(&name);
+            ui.remember_page(&name);
+            // Keep the content pane's own title in step, which is what the
+            // collapsed layout shows as a back-navigable page name.
+            if let Some(page) = ui.split.content() {
+                page.set_title(&pretty_page_name(&name));
+            }
+            // On a narrow window, choosing a destination should reveal it.
+            if ui.split.is_collapsed() {
+                ui.split.set_show_content(true);
+            }
+        });
+    }
+
+    /// Show a page and move the sidebar selection with it.
+    pub fn select_page(self: &Rc<Self>, name: &str) {
+        let mut index = 0;
+        while let Some(row) = self.sidebar_list.row_at_index(index) {
+            if row.widget_name() == name {
+                self.sidebar_list.select_row(Some(&row));
+                return;
+            }
+            index += 1;
+        }
+        // No matching row: still switch the stack rather than doing nothing.
+        self.stack.set_visible_child_name(name);
+    }
+
+    /// Put a count next to a sidebar entry, or hide it at zero.
+    fn set_badge(&self, page: &str, count: usize) {
+        for (name, badge) in &self.sidebar_rows {
+            if name == page {
+                badge.set_visible(count > 0);
+                badge.set_text(&count.to_string());
+            }
+        }
+        if let Some(child) = self.stack.child_by_name(page) {
+            let stack_page = self.stack.page(&child);
+            stack_page.set_badge_number(count as u32);
+            stack_page.set_needs_attention(count > 0);
+        }
+    }
+
+    /// Record the page for the next launch, without disturbing unapplied edits.
+    fn remember_page(&self, name: &str) {
+        let backend = self.backend.clone();
+        let name = name.to_owned();
+        backend.clone().spawn(async move {
+            let mut settings = backend.settings();
+            if settings.interface.last_page == name {
+                return;
+            }
+            settings.interface.last_page = name;
+            if let Err(error) = backend.persist_only(settings).await {
+                log::debug!("could not remember the page: {error:#}");
+            }
+        });
+    }
+
+    pub fn mark_settings_dirty(&self) {
+        if !self.settings_dirty.replace(true) {
+            for (name, badge) in &self.sidebar_rows {
+                if name == PAGE_SETTINGS {
+                    badge.set_visible(true);
+                    badge.set_text("•");
+                }
+            }
+        }
+    }
+
+    pub fn clear_settings_dirty(&self) {
+        if self.settings_dirty.replace(false) {
+            for (name, badge) in &self.sidebar_rows {
+                if name == PAGE_SETTINGS {
+                    badge.set_visible(false);
+                }
+            }
+        }
     }
 
     fn install_actions(self: &Rc<Self>, app: &adw::Application) {
@@ -218,14 +435,15 @@ impl Ui {
         self.add_action("extract-video", |ui| ui.present_video_dialog());
         self.add_action("sniff", |ui| sniff::present(ui, None));
         self.add_action("dependencies", deps::present);
+        self.add_action("show-settings", |ui| ui.select_page(PAGE_SETTINGS));
         self.add_action("shortcuts", |ui| ui.present_shortcuts());
         self.add_action("about", |ui| ui.present_about());
 
         app.set_accels_for_action("win.add", &["<Primary>n"]);
         app.set_accels_for_action("win.pause-all", &["<Primary>p"]);
-        app.set_accels_for_action("win.proxies", &["<Primary>comma"]);
         app.set_accels_for_action("win.extract-video", &["<Primary>d"]);
         app.set_accels_for_action("win.sniff", &["<Primary>f"]);
+        app.set_accels_for_action("win.show-settings", &["<Primary>comma"]);
         app.set_accels_for_action("win.shortcuts", &["<Primary>question"]);
         app.set_accels_for_action("window.close", &["<Primary>w"]);
     }
@@ -272,7 +490,7 @@ impl Ui {
                 self.toast(&format!("Added {name}"));
                 // Show the page the job actually landed on: a magnet caught in
                 // the browser is confusing if the window opens on Downloads.
-                self.stack.set_visible_child_name(match kind {
+                self.select_page(match kind {
                     JobKind::Magnet => PAGE_TORRENTS,
                     JobKind::Scrape => PAGE_SCRAPER,
                     // A yt-dlp extraction produces a file, so it belongs with
@@ -318,6 +536,10 @@ impl Ui {
                 self.downloads.handle_video(self, event);
                 self.refresh_title();
             }
+            UiEvent::Wget(event) => {
+                self.downloads.handle_wget(self, event);
+                self.refresh_title();
+            }
             UiEvent::Quit => {
                 if let Some(app) = self.window.application() {
                     app.quit();
@@ -325,15 +547,6 @@ impl Ui {
                     self.window.close();
                 }
             }
-        }
-    }
-
-    fn set_badge(&self, name: &str, count: usize) {
-        // ViewStack indexes pages by child widget, not by name.
-        if let Some(child) = self.stack.child_by_name(name) {
-            let page = self.stack.page(&child);
-            page.set_badge_number(count as u32);
-            page.set_needs_attention(count > 0);
         }
     }
 
@@ -366,6 +579,10 @@ impl Ui {
         let videos = self.backend.video.running_count();
         if videos > 0 {
             parts.push(format!("{videos} extracting"));
+        }
+        let wget_jobs = self.backend.wget.running_count();
+        if wget_jobs > 0 {
+            parts.push(format!("{wget_jobs} fetching"));
         }
         let encodes = self.backend.media.outstanding();
         if encodes > 0 {
@@ -420,6 +637,11 @@ impl Ui {
     }
 
     fn add_download(self: &Rc<Self>, request: DownloadRequest) {
+        // The configured engine decides who fetches it.
+        if self.backend.settings().download.engine == crate::settings::HttpEngine::Wget {
+            return self.add_wget_download(request);
+        }
+
         let name = request.display_name();
         let weak = Rc::downgrade(self);
         let backend = self.backend.clone();
@@ -434,7 +656,7 @@ impl Ui {
                 Ok(gid) => {
                     log::info!("queued '{name}' as gid {gid}");
                     ui.toast(&format!("Added {name}"));
-                    ui.stack.set_visible_child_name(PAGE_DOWNLOADS);
+                    ui.select_page(PAGE_DOWNLOADS);
                 }
                 Err(error) => ui.toast(&format!("Could not add {name}: {error:#}")),
             }
@@ -470,6 +692,26 @@ impl Ui {
         });
     }
 
+    /// Hand a plain download to Wget2 instead of aria2.
+    fn add_wget_download(self: &Rc<Self>, request: DownloadRequest) {
+        let name = request.display_name();
+        let backend = self.backend.clone();
+        let settings = backend.settings();
+        let outcome = backend.wget.clone().start(
+            request,
+            settings,
+            backend.proxies.clone(),
+            backend.wget_events.clone(),
+        );
+        match outcome {
+            Ok(_) => {
+                self.toast(&format!("Added {name}"));
+                self.select_page(PAGE_DOWNLOADS);
+            }
+            Err(error) => self.toast(&format!("Could not add {name}: {error:#}")),
+        }
+    }
+
     pub fn add_magnet(self: &Rc<Self>, magnet: String) {
         let weak = Rc::downgrade(self);
         let backend = self.backend.clone();
@@ -491,7 +733,7 @@ impl Ui {
             match result {
                 Ok(id) => {
                     ui.toast("Added torrent");
-                    ui.stack.set_visible_child_name(PAGE_TORRENTS);
+                    ui.select_page(PAGE_TORRENTS);
                     log::info!("added torrent {id}");
                 }
                 Err(error) => ui.toast(&format!("Could not add the torrent: {error:#}")),
@@ -636,7 +878,7 @@ impl Ui {
                 match result {
                     Ok(_) => {
                         ui.toast("Added torrent");
-                        ui.stack.set_visible_child_name(PAGE_TORRENTS);
+                        ui.select_page(PAGE_TORRENTS);
                     }
                     Err(error) => ui.toast(&format!("Could not add the torrent: {error:#}")),
                 }
@@ -723,7 +965,7 @@ impl Ui {
             ("Ctrl+D", "Extract a video with yt-dlp"),
             ("Ctrl+F", "Sniff a page for media"),
             ("Ctrl+P", "Pause every download"),
-            ("Ctrl+Comma", "Proxy settings"),
+            ("Ctrl+Comma", "Settings"),
             ("Ctrl+W", "Close the window"),
             ("Ctrl+?", "This list"),
         ];
@@ -817,6 +1059,18 @@ impl Ui {
     }
 }
 
+/// Human-readable name for a page id.
+fn pretty_page_name(name: &str) -> String {
+    match name {
+        PAGE_DOWNLOADS => "Downloads",
+        PAGE_TORRENTS => "Torrents",
+        PAGE_SCRAPER => "Scraper",
+        PAGE_SETTINGS => "Settings",
+        other => other,
+    }
+    .to_owned()
+}
+
 fn main_menu() -> gio::Menu {
     let sources = gio::Menu::new();
     sources.append(Some("Add Torrent File…"), Some("win.add-torrent-file"));
@@ -830,6 +1084,7 @@ fn main_menu() -> gio::Menu {
     transfers.append(Some("Clear Finished"), Some("win.clear-finished"));
 
     let settings = gio::Menu::new();
+    settings.append(Some("Settings"), Some("win.show-settings"));
     settings.append(Some("Dependencies…"), Some("win.dependencies"));
     settings.append(Some("Proxy Settings…"), Some("win.proxies"));
     settings.append(Some("Open Download Folder"), Some("win.open-folder"));

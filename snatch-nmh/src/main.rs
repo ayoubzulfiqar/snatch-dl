@@ -188,17 +188,33 @@ async fn connect(socket: &Path) -> Result<UnixStream> {
 }
 
 /// Spawn the GUI detached from this process so it survives the browser closing us.
+///
+/// The spawned child is reaped by a background task. Without that it becomes a
+/// zombie the moment the user quits the GUI: a browser holding a long-lived
+/// native-messaging Port keeps this host alive for the whole session, and an
+/// unreaped child would sit in the process table until the browser closed.
 fn launch_gui() -> Result<()> {
-    use std::os::unix::process::CommandExt as _;
-
     let binary = gui_binary();
-    std::process::Command::new(&binary)
+    let mut child = tokio::process::Command::new(&binary)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // A new process group so a terminal signal aimed at the browser does
+        // not take the download manager with it.
         .process_group(0)
+        // Explicitly not kill_on_drop: the GUI must outlive this host.
+        .kill_on_drop(false)
         .spawn()
         .with_context(|| format!("could not execute {}", binary.display()))?;
+
+    tokio::spawn(async move {
+        match child.wait().await {
+            // Nothing to do with the status; the wait itself is the point.
+            Ok(_) => {}
+            Err(error) => eprintln!("snatch-nmh: could not reap the GUI: {error}"),
+        }
+    });
+
     Ok(())
 }
 

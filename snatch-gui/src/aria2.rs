@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,6 +50,8 @@ const READY_INTERVAL: Duration = Duration::from_millis(250);
 pub struct Aria2Config {
     pub download_dir: PathBuf,
     pub session_file: PathBuf,
+    /// Tuning that can only be applied when aria2 starts.
+    pub spawn_args: Vec<String>,
 }
 
 /// A cloneable handle to the aria2 RPC endpoint.
@@ -61,10 +64,13 @@ pub struct Aria2Client {
     endpoint: String,
     token: String,
     download_dir: PathBuf,
+    /// Per-download options, re-read on every add so a settings change
+    /// affects the next download without a restart.
+    options: Arc<RwLock<Vec<(String, String)>>>,
 }
 
 impl Aria2Client {
-    pub fn new(download_dir: PathBuf) -> Result<Self> {
+    pub fn new(download_dir: PathBuf, options: Arc<RwLock<Vec<(String, String)>>>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(3))
@@ -79,7 +85,27 @@ impl Aria2Client {
             endpoint: format!("http://127.0.0.1:{RPC_PORT}/jsonrpc"),
             token: format!("token:{RPC_SECRET}"),
             download_dir,
+            options,
         })
+    }
+
+    /// Replace the per-download options used by later `addUri` calls.
+    pub fn set_download_options(&self, options: Vec<(String, String)>) {
+        *self
+            .options
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = options;
+    }
+
+    /// Apply the handful of options aria2 accepts while running.
+    pub async fn change_global_options(&self, options: Vec<(String, String)>) -> Result<()> {
+        let map: Map<String, Value> = options
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect();
+        self.call::<Value>("aria2.changeGlobalOption", vec![Value::Object(map)])
+            .await
+            .map(drop)
     }
 
     /// Issue one JSON-RPC call, injecting the secret token as the first param.
@@ -151,6 +177,16 @@ impl Aria2Client {
             "dir".to_owned(),
             json!(self.download_dir.to_string_lossy().into_owned()),
         );
+
+        // Segmenting and per-download limits come from settings.
+        for (key, value) in self
+            .options
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+        {
+            options.insert(key.clone(), json!(value));
+        }
 
         if let Some(name) = request.sanitized_filename() {
             options.insert("out".to_owned(), json!(name));
@@ -493,19 +529,12 @@ fn build_command(config: &Aria2Config) -> Command {
         .arg(format!("--rpc-secret={RPC_SECRET}"))
         .arg("--rpc-allow-origin-all=false")
         .arg(format!("--dir={}", config.download_dir.display()))
-        // Resume support and IDM-grade segmentation.
+        // Resume support. The segmenting and limits are appended below from
+        // settings, so they are configurable rather than baked in.
         .arg("--continue=true")
-        .arg("--max-concurrent-downloads=5")
-        .arg("--split=16")
-        .arg("--max-connection-per-server=16")
-        .arg("--min-split-size=1M")
-        .arg("--file-allocation=falloc")
         .arg("--auto-file-renaming=true")
         .arg("--allow-overwrite=false")
         .arg("--conditional-get=true")
-        .arg("--max-tries=5")
-        .arg("--retry-wait=3")
-        .arg("--check-certificate=true")
         // A .torrent file should be saved, not silently joined.
         .arg("--follow-torrent=false")
         .arg("--follow-metalink=false")
@@ -523,6 +552,8 @@ fn build_command(config: &Aria2Config) -> Command {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    command.args(&config.spawn_args);
 
     // aria2 refuses to start if --input-file points at a missing file.
     if config

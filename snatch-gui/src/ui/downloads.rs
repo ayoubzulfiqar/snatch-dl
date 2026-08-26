@@ -19,6 +19,7 @@ use super::format::{
 use super::{PageSummary, Ui};
 use crate::aria2::DownloadStatus;
 use crate::processor::{MediaAction, MediaEvent, MediaJob, format_duration};
+use crate::wget::WgetEvent;
 use crate::ytdlp::VideoEvent;
 use crate::{adw, gtk};
 use gtk::{gio, glib};
@@ -257,6 +258,59 @@ impl DownloadsPage {
         }
     }
 
+    /// Reflect one wget event. aria2 downloads are reconciled from snapshots,
+    /// but wget has no daemon to poll, so its rows are event-driven and live
+    /// in the task list alongside conversions.
+    pub fn handle_wget(&self, ui: &Rc<Ui>, event: WgetEvent) {
+        // ffmpeg job ids are database row ids and always positive, so wget
+        // rows are keyed negatively and the two can share one map.
+        let key = |job_id: i64| -(job_id.saturating_abs() + 1);
+
+        match event {
+            WgetEvent::Started {
+                job_id,
+                name,
+                total,
+            } => {
+                let mut jobs = self.jobs.borrow_mut();
+                let row = jobs.entry(key(job_id)).or_insert_with(|| {
+                    let row = JobRow::new(&format!("Downloading {name}"));
+                    row.on_cancel_wget(ui, job_id);
+                    self.jobs_list.append(&row.root);
+                    row
+                });
+                row.set_label(&format!("Downloading {name}"));
+                // Show the size before the first byte lands.
+                row.update_bytes(0, total, 0);
+                self.jobs_frame.set_visible(true);
+                self.stack.set_visible_child_name(PAGE_LIST);
+            }
+            WgetEvent::Progress {
+                job_id,
+                downloaded,
+                total,
+                bytes_per_second,
+            } => {
+                if let Some(row) = self.jobs.borrow().get(&key(job_id)) {
+                    row.update_bytes(downloaded, total, bytes_per_second);
+                }
+            }
+            WgetEvent::Finished { job_id, path } => {
+                self.drop_job(key(job_id));
+                ui.toast(&format!(
+                    "Saved {}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ));
+            }
+            WgetEvent::Failed { job_id, error } => {
+                self.drop_job(key(job_id));
+                ui.toast(&format!("Download failed: {error}"));
+            }
+        }
+    }
+
     fn drop_job(&self, job_id: i64) {
         let mut jobs = self.jobs.borrow_mut();
         if let Some(row) = jobs.remove(&job_id) {
@@ -306,6 +360,17 @@ impl JobRow {
         })
     }
 
+    /// Stop a wget download.
+    fn on_cancel_wget(&self, ui: &Rc<Ui>, job_id: i64) {
+        let weak = Rc::downgrade(ui);
+        self.cancel.connect_clicked(move |button| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.backend().wget.cancel(job_id);
+            button.set_sensitive(false);
+            ui.toast("Stopping the download");
+        });
+    }
+
     /// Wire the stop button to whichever engine owns this job.
     fn on_cancel(&self, ui: &Rc<Ui>, job_id: i64, video: bool) {
         let weak = Rc::downgrade(ui);
@@ -330,6 +395,32 @@ impl JobRow {
 
     fn set_subtitle(&self, text: &str) {
         self.detail.set_text(text);
+    }
+
+    /// Byte-counted progress, used by the wget engine.
+    fn update_bytes(&self, downloaded: u64, total: Option<u64>, bytes_per_second: u64) {
+        match total.filter(|total| *total > 0) {
+            Some(total) => self
+                .progress
+                .set_fraction((downloaded as f64 / total as f64).clamp(0.0, 1.0)),
+            // The server refused a HEAD or gave no length.
+            None => self.progress.pulse(),
+        }
+
+        let mut parts = vec![match total {
+            Some(total) => format!("{} of {}", human_bytes(downloaded), human_bytes(total)),
+            None => format!("{} downloaded", human_bytes(downloaded)),
+        }];
+        if bytes_per_second > 0 {
+            parts.push(format!("{}/s", human_bytes(bytes_per_second)));
+            if let Some(total) = total.filter(|total| *total > downloaded) {
+                parts.push(format!(
+                    "{} left",
+                    human_duration((total - downloaded) / bytes_per_second.max(1))
+                ));
+            }
+        }
+        self.detail.set_text(&parts.join(" · "));
     }
 
     fn update_video(&self, progress: &crate::ytdlp::VideoProgress) {

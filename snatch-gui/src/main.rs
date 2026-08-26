@@ -24,10 +24,12 @@ mod ipc;
 mod network;
 mod paths;
 mod processor;
+mod settings;
 mod sniff;
 mod torrent;
 mod types;
 mod ui;
+mod wget;
 mod ytdlp;
 
 pub use gtk4 as gtk;
@@ -101,11 +103,29 @@ fn run() -> Result<glib::ExitCode> {
         prepend_to_path(&managed);
     }
 
-    let download_dir = paths::download_dir()?;
+    // Settings are read before anything is configured by them.
+    let settings_path = paths::settings_file()?;
+    let settings = Arc::new(std::sync::RwLock::new(settings::Settings::load(
+        &settings_path,
+    )));
+    let current = settings
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+
+    let download_dir = match current.download_dir_override() {
+        Some(chosen) => {
+            std::fs::create_dir_all(&chosen)
+                .with_context(|| format!("could not create {}", chosen.display()))?;
+            chosen
+        }
+        None => paths::download_dir()?,
+    };
     let socket_path = paths::socket_path()?;
     let aria2_config = aria2::Aria2Config {
         download_dir: download_dir.clone(),
         session_file: paths::session_file()?,
+        spawn_args: current.aria2_spawn_args(),
     };
 
     let (events_tx, events_rx) = async_channel::unbounded::<UiEvent>();
@@ -123,7 +143,8 @@ fn run() -> Result<glib::ExitCode> {
         Err(error) => log::warn!("could not reconcile interrupted jobs: {error:#}"),
     }
 
-    let aria2_client = aria2::Aria2Client::new(download_dir.clone())?;
+    let aria2_options = Arc::new(std::sync::RwLock::new(current.aria2_download_options()));
+    let aria2_client = aria2::Aria2Client::new(download_dir.clone(), Arc::clone(&aria2_options))?;
 
     // The BitTorrent session binds sockets and reads resume data, so it is
     // started up front — but a failure only disables the Torrents page.
@@ -144,9 +165,11 @@ fn run() -> Result<glib::ExitCode> {
     let (media_tx, media_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
     let (torrent_tx, torrent_rx) = tokio::sync::mpsc::channel(64);
     let (video_tx, video_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
+    let (wget_tx, wget_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
 
     let gallery_engine = gallery::GalleryEngine::new(database.clone());
     let video_engine = ytdlp::VideoEngine::new(database.clone());
+    let wget_engine = wget::WgetEngine::new(download_dir.clone());
     let media_queue = processor::MediaQueue::new(database.clone(), media_tx);
 
     let backend = Backend::new(
@@ -154,13 +177,17 @@ fn run() -> Result<glib::ExitCode> {
         torrent_engine.clone(),
         gallery_engine,
         video_engine,
+        wget_engine,
         Arc::clone(&proxies),
         media_queue,
         database,
         download_dir,
         paths::managed_bin_dir()?,
+        Arc::clone(&settings),
+        settings_path,
         gallery_tx,
         video_tx,
+        wget_tx,
         runtime.handle().clone(),
     );
 
@@ -185,6 +212,7 @@ fn run() -> Result<glib::ExitCode> {
     runtime.spawn(forward(gallery_rx, events_tx.clone(), UiEvent::Gallery));
     runtime.spawn(forward(media_rx, events_tx.clone(), UiEvent::Media));
     runtime.spawn(forward(video_rx, events_tx.clone(), UiEvent::Video));
+    runtime.spawn(forward(wget_rx, events_tx.clone(), UiEvent::Wget));
     runtime.spawn(watch_for_shutdown(events_tx));
 
     app.connect_activate({

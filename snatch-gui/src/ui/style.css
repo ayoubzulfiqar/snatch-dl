@@ -119,3 +119,17 @@
   font-size: 0.9em;
   opacity: 0.6;
 }
+
+/* --- sidebar ------------------------------------------------------------ */
+
+/* A count next to a sidebar destination, so activity is visible from any
+   page rather than only the one you are looking at. */
+.snatch-badge {
+  font-size: 0.78em;
+  font-weight: 700;
+  min-width: 1.1em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: @accent_fg_color;
+  background-color: @accent_bg_color;
+}

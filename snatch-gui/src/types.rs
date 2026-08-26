@@ -316,6 +316,8 @@ pub enum UiEvent {
     Media(MediaEvent),
     /// Progress from a `yt-dlp` extraction.
     Video(crate::ytdlp::VideoEvent),
+    /// Progress from a wget download.
+    Wget(crate::wget::WgetEvent),
 }
 
 #[cfg(test)]

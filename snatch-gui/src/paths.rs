@@ -41,6 +41,11 @@ pub fn torrent_state_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("torrents"))
 }
 
+/// User settings.
+pub fn settings_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("settings.json"))
+}
+
 /// Binaries Snatch installed for itself.
 ///
 /// Deliberately not `~/.local/bin`: uninstalling Snatch must never remove a

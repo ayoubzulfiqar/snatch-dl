@@ -140,7 +140,22 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
     }
 
     let id = match kind {
-        JobKind::Download => backend.aria2.add_uri(&request).await?,
+        // Honour the configured engine here too: this is the path every
+        // browser hand-off takes, so routing only the UI through the setting
+        // would leave it looking broken.
+        JobKind::Download => match backend.settings().download.engine {
+            crate::settings::HttpEngine::Wget => backend
+                .wget
+                .clone()
+                .start(
+                    request.clone(),
+                    backend.settings(),
+                    backend.proxies.clone(),
+                    backend.wget_events.clone(),
+                )?
+                .to_string(),
+            crate::settings::HttpEngine::Aria2 => backend.aria2.add_uri(&request).await?,
+        },
         JobKind::Magnet => {
             let engine = backend.torrents()?;
             engine.add_magnet(&request.url).await?.to_string()
