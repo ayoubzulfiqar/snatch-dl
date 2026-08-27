@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security hole
+    url: https://github.com/ayoubzulfiqar/snatch-dl/security/advisories/new
+    about: Report it privately. Please do not open a public issue for this.
+
+  - name: A tool is missing
+    url: https://github.com/ayoubzulfiqar/snatch-dl/blob/main/README.md#what-you-need
+    about: Video, gallery or archive features not working? Open Menu → Dependencies… in Snatch first.

@@ -1,0 +1,120 @@
+name: Bug report
+description: Something is broken or does not work how you expected.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this.
+
+        **Found a security hole?** Do not use this form. Read
+        [SECURITY.md](https://github.com/ayoubzulfiqar/snatch-dl/blob/main/SECURITY.md)
+        instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Tell us what went wrong, in your own words.
+      placeholder: I clicked a download link and nothing happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: I expected the download to show up in Snatch.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How do we make it happen?
+      description: List the steps, one per line. We cannot fix what we cannot repeat.
+      placeholder: |
+        1. Open Snatch
+        2. Press Ctrl+N
+        3. Paste this link: https://example.com/file.iso
+        4. Click Add
+        5. Nothing appears
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Which version of Snatch?
+      description: "Find it with: rpm -q snatch-dl, dpkg -s snatch-dl, or pacman -Q snatch-dl"
+      placeholder: "2.6.9"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Which Linux?
+      placeholder: Fedora 44, Ubuntu 24.04, Arch…
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how-installed
+    attributes:
+      label: How did you install it?
+      options:
+        - The one-line installer (get.sh)
+        - A .deb package
+        - An .rpm package
+        - An Arch package
+        - The portable .tar.gz
+        - Built it myself
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part is broken?
+      options:
+        - Normal downloads
+        - Torrents
+        - Video (yt-dlp)
+        - Galleries (gallery-dl)
+        - Finding media on a page
+        - Grabbing a whole site
+        - Unpacking archives
+        - The browser extension
+        - Settings
+        - History
+        - Installing
+        - Something else
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: What did it print?
+      description: |
+        Run Snatch from a terminal and copy what it prints:
+
+            snatch-gui
+
+        This is put into a code block for you, so no backticks needed.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you send this
+      options:
+        - label: I am on the newest version of Snatch.
+          required: true
+        - label: I searched the open issues and mine is not there.
+          required: true
+        - label: This is not a security hole.
+          required: true

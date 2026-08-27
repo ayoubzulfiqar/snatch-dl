@@ -1,0 +1,65 @@
+name: Feature request
+description: Ask for something Snatch cannot do yet.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea.
+
+        Tell us the **problem** first, not the solution. It helps us find the
+        best fix, which is sometimes not the one you had in mind.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is the problem?
+      description: What are you trying to do that Snatch makes hard or impossible?
+      placeholder: I download files from a site that needs a login, and I have to paste cookies by hand every time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like Snatch to do?
+      placeholder: Remember the cookies for a site so I only paste them once.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: How do you cope now?
+      description: Leave this blank if there is no way around it.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part is this about?
+      options:
+        - Normal downloads
+        - Torrents
+        - Video (yt-dlp)
+        - Galleries (gallery-dl)
+        - Finding media on a page
+        - Grabbing a whole site
+        - Unpacking archives
+        - The browser extension
+        - Settings
+        - History
+        - Installing
+        - Something else
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you send this
+      options:
+        - label: I searched the open issues and nobody has asked for this.
+          required: true
+        - label: This is one idea, not several. (Send several issues if you have several ideas.)
+          required: true

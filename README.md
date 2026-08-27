@@ -4,523 +4,376 @@
 
 # Snatch
 
+**A download manager for Linux.**
+
 </div>
 
-A download manager for Linux, built out of engines that are already good at
-their jobs rather than a homegrown downloader.
+Snatch downloads files fast. It splits each file into 16 parts and grabs them
+at the same time. If your internet drops, it picks up where it left off.
 
-GTK4 / libadwaita front-end, a browser extension that captures downloads before
-the browser starts them, and four purpose-built engines behind one window.
+It also does torrents, videos, and whole image galleries. All in one window.
+
+A browser add-on catches your downloads. Click a link, and Snatch takes it
+instead of your browser.
 
 ![Downloads](docs/downloads.png)
 
-Point it at a page and pick what you want:
+Give it a page. It finds every file on it. You pick what you want:
 
 ![Media sniffer](docs/sniffer.png)
 
-Everything that finished, where it went, and what to do with it:
+See everything you have downloaded, and what to do with it:
 
 ![History](docs/history.png)
 
-Every engine option is configurable:
+Change how it works:
 
 ![Settings](docs/settings.png)
 
 ---
 
-## What it does
-
-| Job | Engine | Why not something else |
-|---|---|---|
-| HTTP / FTP downloads | **aria2** (JSON-RPC) | 16 segmented connections, resume, and a battle-tested retry policy. Writing another HTTP downloader would be strictly worse. |
-| Torrents and magnets | **librqbit** (in-process) | DHT, peer exchange, uTP and sequential streaming. aria2's BitTorrent support has none of that. |
-| Site video | **yt-dlp** | Resolves DASH/HLS manifests, picks formats, muxes audio and video. |
-| Image galleries | **gallery-dl** | Hundreds of site-specific extractors, organised output. |
-| Conversion / trimming | **ffmpeg** | Post-process without leaving the app. |
-| Finding media on a page | built-in **sniffer** | Reads the DOM *and* asks yt-dlp, then lets you pick. |
-| A second HTTP engine | **Wget2** | Also multithreaded; some servers prefer its request pattern. |
-| Downloads behind a login | **cURL import** | Paste "Copy as cURL" and the cookies, referer and user agent come with it. |
-| Keeping track | **history** | What finished, where it went, and the file itself. |
-| Downloading overnight | **scheduler** | A daily window, or a start time for one download, then suspend or shut down when everything is finished. |
-| Numbered files | **batch patterns** | `page[001-250].jpg` becomes 250 downloads, after you have seen the list. |
-| Knowing it arrived intact | **checksums** | Finds the digest published beside a file and verifies against it, with no work from you. |
-| Archives | **auto-unpack** | Zip, 7z, rar and tar, including split sets, unpacked when the last part lands. |
-| A whole documentation site | **site grabber** | Recursive fetch with depth and file-type filters — and a dry run that shows exactly what it would take. |
-| Files behind a password | **HTTP and FTP auth** | Credentials never reach `ps` or the disk. |
-
-Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
-every socket and subprocess, and the two meet through a single event channel —
-so the window keeps repainting while four engines are working.
-
----
-
-## Use cases
-
-**Grab a big file without babysitting it.**
-Click a download in Firefox or Chrome. The extension cancels the browser's
-transfer and hands the URL — with cookies, referer and user agent — to aria2,
-which fetches it in 16 parallel segments and resumes if the connection drops.
-Files behind a login work because the session cookies travel with the request.
-
-**Stream a torrent while it downloads.**
-Add a magnet, open the row and press the sequential button. Snatch drives an
-open read head through the file so pieces arrive in playback order, and you can
-open it in a player before it finishes. The peer line shows the real swarm —
-`7 peers (2 TCP, 5 uTP), 121 connecting, 571 known` — so you can tell a dead
-torrent from a slow one.
-
-**Pull a video, keep only the audio.**
-`Ctrl+D`, paste the watch page, choose *Audio only (MP3)*. yt-dlp resolves the
-formats and ffmpeg extracts the track. Or download the video first and
-right-click it → **Extract Audio**.
-
-**Archive an artist's gallery.**
-Right-click any page → **Scrape This Page with Snatch**. gallery-dl walks the
-site with its own extractor — following pagination and reaching originals
-behind thumbnails, which a DOM scrape cannot — and files everything under
-`Downloads/Snatch Galleries/<site>/<author>/`. The Scraper tab shows live
-counts and thumbnails.
-
-**Route one download through a proxy without proxying everything.**
-Add a SOCKS5 or HTTP proxy in **Proxy Settings**, test its latency, and set it
-as the default or pin it to a single job. Snatch knows which engines can use
-which kind and refuses an impossible pairing instead of silently connecting
-direct — see [Proxies](#proxies).
-
-**Point Snatch at a page and take what you want.**
-`Ctrl+F`, paste a URL — or right-click the page → **Find All Media on This
-Page**. Snatch fetches the document, walks it for images, video, audio,
-documents, archives and subtitles (including `srcset` candidates, lazy-loaded
-`data-src`, Open Graph metadata and CSS backgrounds), *and* asks yt-dlp in case
-the real media is behind a DASH/HLS manifest that appears nowhere in the HTML.
-Each link is probed with a `HEAD` for its true type and size, so a download
-link with no extension is still classified correctly. Results are grouped by
-kind with per-group select-all; tick what you want and it queues.
-
-**Download something that needs your login.**
-In the browser's network inspector, right-click the request → **Copy as cURL**,
-then paste the whole thing into Snatch's Add box. The URL, cookies, referer and
-user agent are read straight out of it, so a file behind a session works
-without you reconstructing any of that. Chrome, Firefox and the Windows `cmd`
-dialects all parse.
-
-**Pull one file from several mirrors.**
-Paste several URLs, tick *Treat multiple URLs as mirrors of one file*, and
-aria2 spreads its connections across all of them and fails over automatically.
-Untick it and each line becomes its own download instead.
-
-**Find something you downloaded last week.**
-The History page lists what finished, how big it was, when, and the folder it
-went into. Each row opens that folder, deletes the file, or downloads it again.
-Turn on selection mode to act on many at once — and *Remove* and *Delete Files*
-are deliberately separate buttons, because forgetting a record and erasing a
-file are not the same thing.
-
-**Stop rummaging through one enormous Downloads folder.**
-Files are sorted as they arrive into `Video`, `Music`, `Images`, `Documents`,
-`Compressed` and `Programs` beneath your download folder. Anything Snatch does
-not recognise is left in the root rather than filed under a guess. Turn it off
-in Settings if you would rather have one flat folder.
-
-**Download overnight and go to bed.**
-Set a window in Settings — say 01:00 to 08:00, which wraps past midnight —
-and Snatch pauses everything outside it. Pick *Suspend* or *Shut the computer
-down* for when the queue empties; you get a minute to cancel, and it goes
-through logind so it needs no root.
-
-**Reorder the queue.**
-Waiting downloads carry up and down buttons, and the row menu can send one
-straight to the top or bottom. Active downloads have no position to change, so
-the buttons are hidden rather than doing nothing.
-
-**Send one download through a different proxy.**
-The row menu has *Route Through a Proxy…*. A SOCKS entry is labelled as
-unusable for downloads, because aria2 cannot use one.
-
-**Let it catch links you copy.**
-Turn on clipboard watching and copying a file link anywhere offers it as a
-toast with a Download button — a toast, not a dialog, so it never steals focus.
-Only links that name a file are offered; an ordinary page link is not.
-
-**Trim a clip without re-encoding.**
-Right-click a finished video → **Trim…**, give a start and end. Streams are
-copied, so it is instant and lossless.
-
----
-
 ## Install
 
-### One line
+Copy this. Paste it in a terminal. Press Enter.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/snatch-dl/main/get.sh | sh
 ```
 
-That is the whole thing. It works out which distribution you are on, downloads
-the matching package from the newest release, checks it against the published
-SHA-256 sums, and installs it with your own package manager — which is what
-pulls in aria2, GTK and everything else. It then installs the optional tools
-(`ffmpeg`, `yt-dlp`, `gallery-dl`, `wget2`, 7-Zip) so every feature works
-straight away.
+That is it. It works out which Linux you use. It picks the right package. It
+checks the file is not broken. Then it installs Snatch and the tools it needs.
 
-You will be asked for your password once, by `sudo`, because it installs
-system-wide. Nothing is built from source and no Rust toolchain is needed.
+It will ask for your password once. That is `sudo`, because it installs for the
+whole computer.
 
-| | |
+Want to change something?
+
+| What | Command |
 |---|---|
-| Skip the optional tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Install a specific release | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.6.9</code> |
-| Remove it again | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
+| Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.6.9</code> |
+| Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
-Piping a script into a shell deserves suspicion. [Read it first](get.sh) — it
-is 250 lines of POSIX `sh` and does nothing clever.
+Do not trust a script you have not read? Good. [Read it first](get.sh). It is
+short and does nothing clever.
 
-### Or download a package
+### Or grab a package
 
-Every release publishes one for each family, with dependencies declared so
-your package manager resolves them:
+Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.6.9-1_amd64.deb      # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.6.9-1.x86_64.rpm     # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.6.9-1-x86_64.pkg.tar.zst   # Arch, Manjaro
+sudo apt install ./snatch-dl_2.6.9-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.6.9-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.6.9-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
-A portable `.tar.gz` is there for anything else.
+There is a `.tar.gz` for anything else.
 
-### Requirements
+### What you need
 
-Snatch needs **GTK 4.12+ and libadwaita 1.5+** — Fedora 39+, Ubuntu 24.04+,
-Debian 13+, or any rolling distribution. Older releases cannot run it.
+Snatch needs **GTK 4.12 or newer**. That means Fedora 39+, Ubuntu 24.04+,
+Debian 13+, or any rolling release. Older ones cannot run it.
 
-Only **aria2** is genuinely required, and the packages depend on it. Everything
-else gates one feature and nothing more:
+Only **aria2** is required. The packages install it for you.
 
-| Tool | What stops working without it |
+Everything else is optional. Each one adds a feature:
+
+| Tool | What you lose without it |
 |---|---|
-| `ffmpeg` | Converting, trimming and muxing after a download |
-| `yt-dlp` | Site video extraction |
-| `gallery-dl` | Image gallery scraping |
-| `wget2` | Grabbing a whole site, and the alternative HTTP engine |
-| `7z` / `p7zip` | Unpacking downloaded archives |
+| `ffmpeg` | Converting and trimming files |
+| `yt-dlp` | Downloading videos from sites |
+| `gallery-dl` | Downloading image galleries |
+| `wget2` | Grabbing a whole site |
+| `7z` | Unpacking archives |
 
-Torrents need nothing installed: librqbit is compiled in.
+Torrents need nothing extra. That part is built in.
 
-If you skipped the extras, **Menu → Dependencies…** lists every tool, what
-breaks without it, and installs `yt-dlp` and `gallery-dl` for you — verified
-against their published SHA-256 sums, no `pip` and no root. For the ones that
-need a package manager it shows the exact command for your distribution with a
-copy button. Snatch never runs `sudo` itself: a download manager that asks for
-your password is one you should not trust.
+Missed some? Open **Menu → Dependencies…**. It shows every tool and what it
+does. It installs `yt-dlp` and `gallery-dl` for you. For the rest it shows the
+exact command to copy.
 
-gallery-dl is not in most distribution repositories — it moved to
-[Codeberg](https://codeberg.org/mikf/gallery-dl) and ships a standalone Linux
-binary, which is what Snatch fetches.
-
-### Add the browser extension
-
-Snatch works on its own, but the extension is what makes a click in your
-browser land in Snatch instead of the browser's own download list.
-
-**Native messaging is already registered system-wide by the package**, so
-there is no pairing step and nothing to configure. Load the extension and it
-finds Snatch.
-
-The extension is installed with Snatch, at `/usr/share/snatch-dl/extension`.
-If you would rather have it as a file, every release also publishes
-`snatch-extension-chromium-*.zip` and `snatch-extension-firefox-*.zip`.
-Unzip either one and load the folder — it is the same build for everyone,
-because the manifest pins a public key and every install therefore derives
-the same extension ID.
-
-#### Chrome, Chromium, Brave, Edge, Opera, Vivaldi
-
-1. Open `chrome://extensions`
-2. Turn on **Developer mode** (top right)
-3. Click **Load unpacked**
-4. Choose the folder **`/usr/share/snatch-dl/extension`**
-   *(or `extension/` in the repository if you built from source)*
-
-Pick the **folder itself**, not a file inside it.
-
-The extension ID is always `nlajonamjkdakodfojdlhbhlbcamjkik` — the same ID
-the native messaging manifest allows — so it keeps working across reloads and
-reinstalls.
-
-> Developer mode is currently the only way to install this in Chrome. Chrome
-> only accepts packaged extensions from the Web Store, and has been tightening
-> what it does with sideloaded ones, so a hosted `.crx` would not help. Getting
-> rid of the developer-mode step means publishing to the Chrome Web Store.
-
-#### Firefox
-
-1. Open `about:debugging#/runtime/this-firefox`
-2. Click **Load Temporary Add-on…**
-3. Choose **`/usr/share/snatch-dl/extension-firefox/manifest.json`**
-
-> **Firefox clears temporary add-ons when it restarts.** Firefox only installs
-> signed extensions, and signing goes through addons.mozilla.org even for an
-> extension you host yourself. Until this one is signed, the choices are to
-> reload it each session, or to use Developer Edition or Nightly with
-> `xpinstall.signatures.required=false`.
-
-Firefox needs its own copy because the two browsers genuinely disagree:
-Manifest V3 in Chromium accepts only `background.service_worker` and rejects
-`background.scripts`, while Firefox has no service-worker background at all.
-Everything except that member and the extension ID is identical, and CI fails
-if the two ever drift apart.
-
-#### What it adds
-
-Right-click anything and you get **Download with Snatch**, plus **Send magnet**,
-**Extract video**, **Find all media on this page** and **Scrape this page**.
-Ordinary downloads are intercepted before the browser starts them, and the
-cookies, referer and user agent travel with the request — which is why files
-behind a login work.
-
-### Build from source instead
-
-```bash
-git clone https://github.com/ayoubzulfiqar/snatch-dl.git
-cd snatch-dl
-./install.sh
-```
-
-This installs for the current user only: nothing outside `$HOME`, and no step
-needs `sudo` except installing distribution packages, which your package
-manager prompts for itself. Dependencies are installed by default; pass
-`--no-deps` to skip them. `./install.sh --uninstall` reverses all of it.
-
-Self-installed tools go to `~/.local/share/snatch-dl/bin`, not `~/.local/bin`,
-so removing Snatch cannot take a tool you rely on elsewhere with it.
+Snatch never runs `sudo` itself. A download manager that asks for your password
+is one you should not trust.
 
 ---
 
-## Using it
+## Add the browser extension
 
-| Shortcut | Action |
+Snatch works on its own. But the extension is what makes a click in your
+browser go to Snatch.
+
+**There is nothing to set up.** The package already told your browser where
+Snatch is. Just load the extension.
+
+The extension comes with Snatch. It sits in `/usr/share/snatch-dl/extension`.
+You can also download it from any release as a zip.
+
+### Chrome, Chromium, Brave, Edge, Opera, Vivaldi
+
+1. Open `chrome://extensions`
+2. Turn on **Developer mode**. It is in the top right.
+3. Click **Load unpacked**
+4. Pick the folder `/usr/share/snatch-dl/extension`
+
+Pick the **folder**. Not a file inside it.
+
+> You have to use Developer mode. Chrome only takes packed extensions from its
+> own store. There is no way around that unless Snatch goes on the store.
+
+### Firefox
+
+1. Open `about:debugging#/runtime/this-firefox`
+2. Click **Load Temporary Add-on…**
+3. Pick `/usr/share/snatch-dl/extension-firefox/manifest.json`
+
+> **Firefox forgets it when you restart.** Firefox only keeps signed
+> extensions, and only Mozilla can sign one. Until Snatch is signed, you load
+> it again each time. Or use Firefox Developer Edition and set
+> `xpinstall.signatures.required` to `false`.
+
+### What it gives you
+
+Right-click anything in your browser:
+
+- **Download with Snatch**
+- **Send magnet to Snatch**
+- **Extract video with Snatch**
+- **Find all media on this page**
+- **Scrape this page with Snatch**
+
+Normal downloads get caught before your browser starts them. Your cookies go
+with them. That is why files behind a login work.
+
+---
+
+## What it can do
+
+**Download a big file and walk away.**
+Click a link in your browser. Snatch takes it. It pulls the file in 16 pieces
+at once. If your internet drops, it carries on later.
+
+**Watch a torrent while it downloads.**
+Add a magnet link. Press the sequential button. The pieces arrive in order, so
+you can open the file in a player before it is done.
+
+**Get just the sound from a video.**
+Press `Ctrl+D`. Paste the page. Choose **Audio only (MP3)**.
+
+**Save a whole gallery.**
+Right-click a page → **Scrape This Page**. Snatch follows the pages and finds
+the full-size images behind the small ones.
+
+**Take every file off a page.**
+Press `Ctrl+F` and paste a link. Snatch reads the page and lists the images,
+video, sound, documents and archives on it. Tick what you want.
+
+**Download something behind a login.**
+In your browser, right-click the request → **Copy as cURL**. Paste the whole
+thing into Snatch. Your cookies come with it.
+
+**Grab a numbered set of files.**
+Type `photo[001-250].jpg`. That becomes 250 downloads. Snatch shows you the
+list first, so you can check it.
+
+**Know the file is not broken.**
+Most sites publish a checksum next to a file. Snatch finds it and checks the
+download against it. You do not have to do anything.
+
+**Unpack archives on their own.**
+Zip, 7z, rar and tar files unpack when they finish. Split sets wait for the
+last part. Locked ones ask for the password.
+
+**Start a download at 2am.**
+Set a time when you add it. It waits in the queue until then.
+
+**Or download all night.**
+Set hours in Settings, like 01:00 to 08:00. Snatch pauses outside them. It can
+suspend or shut down the computer when the queue empties. You get a minute to
+stop it.
+
+**Save a whole documentation site.**
+Menu → **Grab a Site…**. Set how deep to go and which file types to keep.
+Press **Check first** and Snatch shows you exactly what it would take, without
+downloading any of it.
+
+**Use one file from many mirrors.**
+Paste several links. Tick **Treat multiple URLs as mirrors of one file**.
+Snatch spreads the connections across all of them.
+
+**Find last week's download.**
+The History page lists everything. Each row opens the folder, deletes the file,
+or downloads it again.
+
+**Stop hunting through one huge folder.**
+Files go into `Video`, `Music`, `Images`, `Documents`, `Compressed` and
+`Programs` on their own. Turn it off if you want one flat folder.
+
+**Send one download through a proxy.**
+Add a proxy in **Proxy Settings**. Use it for everything, or pin it to one job.
+
+**Catch links you copy.**
+Turn on clipboard watching. Copy a file link and Snatch offers it. It is a
+small pop-up, so it never steals your focus.
+
+---
+
+## Shortcuts
+
+| Key | What it does |
 |---|---|
-| `Ctrl+N` | Add a download, magnet or gallery (kind is auto-detected) |
-| `Ctrl+D` | Extract a video with yt-dlp |
-| `Ctrl+F` | Find all media on a page |
+| `Ctrl+N` | Add a download, magnet or gallery |
+| `Ctrl+D` | Get a video |
+| `Ctrl+F` | Find media on a page |
+| `Ctrl+G` | Grab a whole site |
 | `Ctrl+H` | History |
 | `Ctrl+P` | Pause everything |
 | `Ctrl+,` | Settings |
 | `F9` | Show or hide the sidebar |
-| `Ctrl+?` | Shortcuts |
-
-From the browser, right-click gives you **Download with Snatch**, **Send Magnet
-to Snatch**, **Extract Video with Snatch**, **Find All Media on This Page** and
-**Scrape This Page with Snatch**.
-Clicking the toolbar button pauses and resumes capture.
-
-### Command line
-
-The GUI listens on a Unix socket, so anything can queue a job:
-
-```bash
-SOCK=~/.local/share/snatch-dl/snatch.sock
-
-# A direct download
-printf '{"url":"https://example.com/file.iso"}\n' | nc -U "$SOCK"
-
-# A magnet (kind is inferred from the scheme)
-printf '{"url":"magnet:?xt=urn:btih:..."}\n' | nc -U "$SOCK"
-
-# A video, explicitly
-printf '{"kind":"video","url":"https://example.com/watch?v=..."}\n' | nc -U "$SOCK"
-
-# A gallery
-printf '{"kind":"scrape","url":"https://example.com/user/gallery"}\n' | nc -U "$SOCK"
-
-# Open the media picker for a page
-printf '{"kind":"sniff","url":"https://example.com/article"}\n' | nc -U "$SOCK"
-```
-
-The reply is one line of JSON: `{"ok":true,"gid":"..."}` or
-`{"ok":false,"error":"..."}`. Snatch starts automatically if it is not running.
+| `Ctrl+?` | This list |
 
 ---
 
 ## Settings
 
-Snatch is navigated from a sidebar drawer: **Downloads**, **Torrents**,
-**Scraper**, **History** and **Settings**, each a real page rather than a dialog. Live
-counts appear next to a destination, so activity on a page you are not looking
-at is still visible.
+Snatch has five pages: **Downloads**, **Torrents**, **Scraper**, **History**
+and **Settings**. Move between them in the sidebar. Press **F9** to show or
+hide it. It stays how you leave it.
 
-The drawer is toggled with the button in the header or **F9**, and it stays
-however you left it — it is never closed for you. On a narrow window it floats
-over the content instead of pushing it aside, and picking a destination there
-gets it out of the way. Snatch also reopens on whichever page you left it.
+You can set your download folder here. Leave it blank to use your normal
+Downloads folder.
 
-The download folder is set here too, with a folder chooser; leave it blank to
-use your XDG Downloads directory.
+Settings changes happen at different times. Each row tells you which:
 
-Settings covers what the underlying engines expose — segments per download,
-connections per server, minimum split size, simultaneous downloads, overall
-and per-download speed caps, retries, disk allocation, TLS verification, user
-agent, torrent upload cap and peer limit, DHT, audio bitrate, subtitles and
-gallery behaviour.
-
-Each row says **when** it takes effect, because the engines differ:
-
-| When | Settings |
+| When | What |
 |---|---|
-| Immediately | Simultaneous downloads, overall speed caps, torrent upload cap, schedule, clipboard watching |
-| Next download | Segments, connections per server, per-download cap, engine choice |
-| After a restart | Disk allocation, retries, TLS verification, resume-data writing, DHT, download folder |
-
-Apply names the specific settings waiting on a restart rather than showing a
-generic warning.
+| Right away | Downloads at once, speed limits, torrent upload limit, schedule, clipboard |
+| Next download | Pieces per file, connections per server, per-file speed limit, engine |
+| After restart | Disk space, retries, TLS checks, resume data, DHT, download folder |
 
 ### Those `.aria2` files
 
-While a download runs, aria2 writes a `something.aria2` control file beside
-it. That file is what lets a download resume after a crash, a network drop or
-a power cut, and aria2 deletes it the moment the download completes — if one
-is left behind after a finished download, that is a bug, not by design.
+While a file downloads, you may see a `something.aria2` file next to it. That
+file is how Snatch resumes after a crash. It goes away when the download ends.
 
-If you would rather not see them at all, **Settings → Write resume data while
-downloading** turns them off. You lose crash resume in exchange.
+Do not want them? Turn off **Write resume data while downloading** in Settings.
+You lose crash resume.
+
+---
 
 ## Proxies
 
-The four engines do **not** agree on what a proxy is, and Snatch does not
-pretend otherwise:
+The engines do not agree on proxies. Snatch tells you the truth instead of
+guessing:
 
 | Engine | HTTP proxy | SOCKS5 |
 |---|---|---|
-| aria2 (downloads) | yes | **no** — aria2 has no SOCKS support at all |
-| librqbit (torrents) | **no** | yes |
-| yt-dlp / gallery-dl | yes | yes |
-| Snatch's own requests | yes | yes |
+| aria2 (downloads) | yes | **no** |
+| Torrents | **no** | yes |
+| yt-dlp and gallery-dl | yes | yes |
+| Snatch itself | yes | yes |
 
-Assigning a SOCKS5 proxy to an aria2 download is refused with an explanation
-rather than silently falling back to a direct connection — a leaked direct
-connection is the one failure a proxy user cannot tolerate.
+Give an aria2 download a SOCKS5 proxy and Snatch refuses. It says why. It will
+not connect straight out behind your back. That is the one mistake a proxy user
+cannot live with.
 
-Two consequences worth knowing:
+Two things to know:
 
-- The torrent session fixes its proxy when it starts, so changing it takes
-  effect on the next launch.
-- When a SOCKS5 proxy is configured, the inbound peer listener is **disabled**,
-  because a public listener would advertise your real address past the proxy.
-  You will connect out but not receive incoming peers.
+- Torrents pick their proxy when Snatch starts. Change it and restart.
+- With a SOCKS5 proxy, torrents stop taking incoming peers. An open port would
+  show your real address.
 
 ---
 
-## Where things live
+## Where things go
 
 ```
-~/.local/bin/snatch-gui                     the application
-~/.local/bin/snatch-nmh                     native messaging host
-~/.local/share/snatch-dl/snatch.sock        IPC socket (0600)
-~/.local/share/snatch-dl/snatch.sqlite      download and job history
-~/.local/share/snatch-dl/aria2.session      resumable queue
-~/.local/share/snatch-dl/torrents/          torrent resume data
-~/.local/share/snatch-dl/proxies.json       proxy table
-~/.local/share/snatch-dl/chromium-extension-key.pem   pins the extension ID
+/usr/bin/snatch-gui                     the app
+/usr/bin/snatch-nmh                     the browser bridge
+~/.local/share/snatch-dl/snatch.sock    the socket other programs use
+~/.local/share/snatch-dl/snatch.sqlite  your download history
+~/.local/share/snatch-dl/aria2.session  the queue, so it survives a restart
+~/.local/share/snatch-dl/torrents/      torrent resume data
+~/.local/share/snatch-dl/proxies.json   your proxies
 ```
 
-Downloads go to your XDG download directory; galleries to
-`Snatch Galleries/<site>/` and videos to `Snatch Video/` beneath it.
+Files go to your Downloads folder. Galleries go to `Snatch Galleries/`. Videos
+go to `Snatch Video/`. Whole sites go to `Sites/`.
 
 ---
 
-## Architecture
+## Use it from the terminal
 
-```
-  browser extension  ──native messaging──▶  snatch-nmh
-                                                 │  JSON line over a Unix socket
-                                                 ▼
-                     ┌──────────────────  snatch-gui  ──────────────────┐
-                     │                                                   │
-   GLib main loop ───┤  UI: ViewStack of Downloads / Torrents / Scraper  │
-   (widgets only)    │                        ▲                          │
-                     │                 UiEvent channel                   │
-   Tokio runtime ────┤                        │                          │
-   (all I/O)         │  aria2 RPC · librqbit · yt-dlp · gallery-dl ·      │
-                     │  ffmpeg · SQLite · proxy router                    │
-                     └───────────────────────────────────────────────────┘
-```
-
-`snatch-nmh` forwards the browser's payload **losslessly** — it parses to a
-generic JSON value rather than a typed struct, so a field the host does not
-know about still reaches the GUI. An earlier version round-tripped through a
-struct and silently ate the `kind` field, turning every scrape into a plain
-download of the page's HTML.
-
-| Module | Responsibility |
-|---|---|
-| `aria2.rs` | Spawns and supervises `aria2c`, JSON-RPC client |
-| `torrent.rs` | librqbit session, magnets, sequential streaming |
-| `ytdlp.rs` | yt-dlp subprocess, progress-template parsing |
-| `sniff.rs` | Page fetch, DOM walk, extractor pass, HEAD probing |
-| `wget.rs` | Wget2 engine, progress measured from the file on disk |
-| `settings.rs` | Persisted configuration and where each value applies |
-| `curl.rs` | Parsing a browser's "Copy as cURL" into a request |
-| `ui/history.rs` | Finished downloads, multi-select, folder and file actions |
-| `ui/graph.rs` | The bandwidth sparkline, drawn with Cairo |
-| `deps.rs` | Tool discovery and verified self-installation |
-| `gallery.rs` | gallery-dl subprocess, two-stream output merge |
-| `processor.rs` | ffmpeg jobs and the serial encode queue |
-| `network.rs` | Proxy table, engine matrix, latency probes |
-| `db.rs` | SQLite history (WAL), crash reconciliation |
-| `ipc.rs` | Unix socket server, job routing |
-| `ui/` | One module per page |
-
-### Notes for anyone touching the parsers
-
-Three things in here are counter-intuitive and are all covered by tests:
-
-- **ffmpeg's `out_time_ms` is microseconds, not milliseconds.** Reading it as
-  milliseconds puts every progress bar at 100% instantly.
-- **gallery-dl splits its output across both streams.** stdout carries file
-  paths (`# ` prefix means "already had it"); only stderr carries the `[3/12]`
-  counter that gives you a batch total.
-- **librqbit has no "sequential" switch.** An open `FileStream` prioritises a
-  32 MiB window ahead of its read position, so sequential mode is a pump that
-  keeps advancing that position.
-- **A `HEAD` response has no body**, so `reqwest::Response::content_length()`
-  reports 0. The sniffer reads the `Content-Length` header directly; using the
-  convenience method silently loses every size.
-- **Wget2's progress bar is unparseable** — ANSI cursor-save, cursor-up and
-  erase sequences interleaved mid-line. The wget engine measures progress by
-  `stat`-ing the output file instead, with the total from a `HEAD`.
-- **aria2 rejects the entire `changeGlobalOption` call** if any key in it is
-  not globally changeable, so that list stays deliberately short.
-
----
-
-## Development
+Snatch listens on a socket. Any program can send it a job.
 
 ```bash
-cargo build --release
-cargo test --workspace       # 177 tests
-cargo clippy --workspace --all-targets
-cargo fmt --all --check
+SOCK=~/.local/share/snatch-dl/snatch.sock
+
+# A normal download
+printf '{"url":"https://example.com/file.iso"}\n' | nc -U "$SOCK"
+
+# A magnet link
+printf '{"url":"magnet:?xt=urn:btih:..."}\n' | nc -U "$SOCK"
+
+# A video
+printf '{"kind":"video","url":"https://example.com/watch?v=..."}\n' | nc -U "$SOCK"
+
+# A gallery
+printf '{"kind":"scrape","url":"https://example.com/user/gallery"}\n' | nc -U "$SOCK"
 ```
 
-The test suite runs without a display and without a network — the tests that
-need a server stand one up on a loopback port. Tests that need a real binary
-(the ffmpeg encode, the 7-Zip round trip, the Wget2 crawl) skip themselves
-when it is absent, and CI installs all of them so they actually run.
+You get one line back: `{"ok":true,"gid":"..."}` or
+`{"ok":false,"error":"..."}`. Snatch starts itself if it is not running.
 
-Parser tests use literal output captured from the real tools — aria2 1.37.0,
-ffmpeg 8.1.2, gallery-dl 1.32.9, yt-dlp 2026.08.19 — rather than invented
-fixtures, because every one of those formats has a quirk that invented
-fixtures would miss.
+---
+
+## How it is built
+
+Snatch does not download anything itself. It drives tools that are already
+good at it.
+
+| Job | Tool | Why |
+|---|---|---|
+| Files | **aria2** | 16 pieces at once, resume, good retries |
+| Torrents | **librqbit** | DHT, peer exchange, play while downloading |
+| Site video | **yt-dlp** | Knows thousands of sites |
+| Galleries | **gallery-dl** | Knows hundreds of gallery sites |
+| Converting | **ffmpeg** | The standard tool for it |
+| Whole sites | **Wget2** | Follows links and filters what it keeps |
+| Unpacking | **7-Zip** | Handles zip, 7z, rar and tar |
+
+```
+  browser add-on  ──▶  snatch-nmh  ──▶  snatch-gui
+                                            │
+                            ┌───────────────┴────────────────┐
+                            │  window (GTK)   engines (Tokio) │
+                            └────────────────────────────────┘
+```
+
+The window and the engines run apart. That is why the window never freezes
+while four downloads are going.
+
+Want to work on it? Read [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## Help and bugs
+
+Found a bug? [Open an issue](https://github.com/ayoubzulfiqar/snatch-dl/issues/new/choose).
+
+Found a security hole? Read [SECURITY.md](SECURITY.md) first. Please do not
+open a public issue for that one.
+
+Want to help? Read [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Be kind to people here: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ---
 
 ## Author
 
-Built by **[Ayoub Zulfiqar](https://ayoubzulfiqar.com/)** —
-[ayoubzulfiqar.com/projects](https://ayoubzulfiqar.com/projects).
+Made by **[Ayoub Zulfiqar](https://ayoubzulfiqar.com/)**.
 
-Issues and pull requests are welcome at
-[github.com/ayoubzulfiqar/snatch-dl](https://github.com/ayoubzulfiqar/snatch-dl).
+More of my work: [ayoubzulfiqar.com/projects](https://ayoubzulfiqar.com/projects)
 
 ---
 
@@ -528,5 +381,5 @@ Issues and pull requests are welcome at
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-Snatch drives aria2, ffmpeg, yt-dlp and gallery-dl as separate programs and
-links librqbit as a library; each carries its own license.
+Snatch runs aria2, ffmpeg, yt-dlp and gallery-dl as separate programs. It does
+not include their code. Each keeps its own license.
