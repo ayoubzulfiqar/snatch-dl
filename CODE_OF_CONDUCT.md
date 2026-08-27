@@ -35,7 +35,7 @@ discussions. It also applies when you speak for the project somewhere else.
 
 ## If something goes wrong
 
-Email **ayoubzulfiqar3@gmail.com**.
+Email **contact@ayoubzulfiqar.com**.
 
 Say what happened, where, and when. Add links if you have them.
 

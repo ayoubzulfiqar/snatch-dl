@@ -35,7 +35,7 @@ Ask first. Snatch is source-available, not open source. You may read it,
 build it, run it and change your own copy freely. Publishing a fork needs
 written permission.
 
-Email [ayoubzulfiqar3@gmail.com](mailto:ayoubzulfiqar3@gmail.com) and say what
+Email [contact@ayoubzulfiqar.com](mailto:contact@ayoubzulfiqar.com) and say what
 you want to do. The answer is usually yes. Asking costs you one email.
 
 If you get permission, you must credit the author where people will see it,

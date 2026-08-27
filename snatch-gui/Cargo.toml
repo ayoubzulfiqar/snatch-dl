@@ -55,7 +55,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", 
 # `cargo deb -p snatch-gui`
 [package.metadata.deb]
 name = "snatch-dl"
-maintainer = "Ayoub Zulfiqar <ayoubzulfiqar3@gmail.com>"
+maintainer = "Ayoub Zulfiqar <contact@ayoubzulfiqar.com>"
 copyright = "2026, Ayoub Zulfiqar"
 license-file = ["../LICENSE", "0"]
 extended-description = """\

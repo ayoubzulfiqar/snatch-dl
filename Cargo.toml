@@ -3,11 +3,11 @@ resolver = "3"
 members = ["snatch-gui", "snatch-nmh"]
 
 [workspace.package]
-version = "2.7.0"
+version = "2.7.1"
 edition = "2024"
 rust-version = "1.92"
 license-file = "LICENSE"
-authors = ["Ayoub Zulfiqar <ayoubzulfiqar3@gmail.com>"]
+authors = ["Ayoub Zulfiqar <contact@ayoubzulfiqar.com>"]
 repository = "https://github.com/ayoubzulfiqar/snatch-dl"
 homepage = "https://ayoubzulfiqar.com/projects"
 

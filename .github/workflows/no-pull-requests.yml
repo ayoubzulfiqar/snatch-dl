@@ -41,7 +41,7 @@ jobs:
           and you will be credited.
 
           You can read, build, run and change your own copy freely. Publishing
-          a fork needs permission first -- email ayoubzulfiqar3@gmail.com and
+          a fork needs permission first -- email contact@ayoubzulfiqar.com and
           say what you want to do. The answer is usually yes."
 
           gh pr close "$PR" --repo "$REPO"

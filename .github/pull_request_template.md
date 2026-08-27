@@ -22,5 +22,5 @@ Read it, build it, run it, and change your own copy. All of that is fine and
 needs no permission.
 
 Publishing a fork does need permission. Email
-[ayoubzulfiqar3@gmail.com](mailto:ayoubzulfiqar3@gmail.com) and say what you
+[contact@ayoubzulfiqar.com](mailto:contact@ayoubzulfiqar.com) and say what you
 want to do. The answer is usually yes. See [LICENSE](../LICENSE).

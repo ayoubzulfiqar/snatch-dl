@@ -9,7 +9,7 @@ Report it one of these two ways:
 
 1. **Best:** use GitHub's private form.
    [Report a vulnerability](https://github.com/ayoubzulfiqar/snatch-dl/security/advisories/new)
-2. **Or:** email **ayoubzulfiqar3@gmail.com** with `SECURITY` in the subject.
+2. **Or:** email **contact@ayoubzulfiqar.com** with `SECURITY` in the subject.
 
 ## What to tell us
 
