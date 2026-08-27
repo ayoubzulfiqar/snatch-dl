@@ -76,7 +76,7 @@ impl Allocation {
     }
 }
 
-/// Download tuning. The defaults are what IDM-style segmenting looks like.
+/// Download tuning. The defaults are what aggressive segmenting looks like.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct DownloadSettings {
@@ -577,7 +577,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_idm_style_segmented() {
+    fn defaults_are_aggressively_segmented() {
         let settings = Settings::default();
         assert_eq!(settings.download.split, 16);
         assert_eq!(settings.download.connections_per_server, 16);

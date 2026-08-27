@@ -84,7 +84,14 @@ jobs:
           STAGE="snatch-${VERSION}-x86_64-linux"
           mkdir -p "dist/${STAGE}"
           cp target/release/snatch-gui target/release/snatch-nmh "dist/${STAGE}/"
-          cp -r extension install.sh README.md LICENSE "dist/${STAGE}/"
+          cp -r extension install.sh get.sh README.md LICENSE "dist/${STAGE}/"
+          # get.sh installs the portable build by hand on distributions with
+          # no package of their own, and needs these to register the
+          # extension for the whole machine.
+          mkdir -p "dist/${STAGE}/packaging"
+          cp -r packaging/native-messaging packaging/extension-firefox \
+            "dist/${STAGE}/packaging/"
+          cp extension/background.js "dist/${STAGE}/packaging/extension-firefox/"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           rm -rf "dist/${STAGE}"
 

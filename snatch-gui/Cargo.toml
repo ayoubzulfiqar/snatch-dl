@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "snatch-gui"
@@ -68,7 +69,10 @@ priority = "optional"
 # gtk4/libadwaita are resolved by shlibs from the linked binary; aria2 is a
 # runtime subprocess so it has to be named explicitly.
 depends = "$auto, aria2"
-recommends = "ffmpeg, yt-dlp"
+# apt installs Recommends by default, so a plain `apt install snatch-dl`
+# brings the whole feature set. They are not hard dependencies because each
+# one only gates its own feature: Snatch runs without any of them.
+recommends = "ffmpeg, yt-dlp, gallery-dl, wget2, p7zip-full"
 assets = [
   ["../target/release/snatch-gui", "usr/bin/", "755"],
   ["../target/release/snatch-nmh", "usr/bin/", "755"],
@@ -85,6 +89,16 @@ assets = [
   ["../assets/icons/com.snatch.dl-512.png", "usr/share/icons/hicolor/512x512/apps/com.snatch.dl.png", "644"],
   ["../extension/manifest.json", "usr/share/snatch-dl/extension/", "644"],
   ["../extension/background.js", "usr/share/snatch-dl/extension/", "644"],
+  # Registered for every user on the machine. The extension id is pinned by
+  # the committed key, so these are static files rather than something an
+  # install script has to generate.
+  ["../packaging/native-messaging/chromium.json", "etc/opt/chrome/native-messaging-hosts/com.snatch.dl.nmh.json", "644"],
+  ["../packaging/native-messaging/chromium.json", "etc/chromium/native-messaging-hosts/com.snatch.dl.nmh.json", "644"],
+  ["../packaging/native-messaging/firefox.json", "usr/lib/mozilla/native-messaging-hosts/com.snatch.dl.nmh.json", "644"],
+  # Firefox needs its own manifest -- Manifest V3 there has no service worker
+  # -- but the same background script, installed from the one source copy.
+  ["../packaging/extension-firefox/manifest.json", "usr/share/snatch-dl/extension-firefox/", "644"],
+  ["../extension/background.js", "usr/share/snatch-dl/extension-firefox/", "644"],
 ]
 
 # --- Fedora / RHEL / openSUSE ---------------------------------------------
@@ -110,9 +124,23 @@ assets = [
   { source = "../assets/icons/com.snatch.dl-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/com.snatch.dl.png", mode = "644" },
   { source = "../extension/manifest.json", dest = "/usr/share/snatch-dl/extension/manifest.json", mode = "644" },
   { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension/background.js", mode = "644" },
+  { source = "../packaging/native-messaging/chromium.json", dest = "/etc/opt/chrome/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
+  { source = "../packaging/native-messaging/chromium.json", dest = "/etc/chromium/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
+  { source = "../packaging/native-messaging/firefox.json", dest = "/usr/lib/mozilla/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
+  { source = "../packaging/extension-firefox/manifest.json", dest = "/usr/share/snatch-dl/extension-firefox/manifest.json", mode = "644" },
+  { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension-firefox/background.js", mode = "644" },
 ]
 
 [package.metadata.generate-rpm.requires]
 aria2 = "*"
 gtk4 = "*"
 libadwaita = "*"
+
+# Weak dependencies, installed by default by dnf but removable, and never
+# able to make the package itself uninstallable. ffmpeg in particular is not
+# in Fedora's own repositories, so a hard requirement would lock the package
+# out of a stock install entirely.
+[package.metadata.generate-rpm.recommends]
+yt-dlp = "*"
+p7zip = "*"
+wget2 = "*"

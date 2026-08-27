@@ -7,6 +7,6 @@ Exec=snatch-gui
 Icon=com.snatch.dl
 Terminal=false
 Categories=Network;FileTransfer;
-Keywords=download;manager;aria2;torrent;magnet;video;gallery;idm;
+Keywords=download;manager;aria2;torrent;magnet;video;gallery;accelerator;
 StartupNotify=true
 StartupWMClass=com.snatch.dl

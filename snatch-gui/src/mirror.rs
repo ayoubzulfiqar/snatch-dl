@@ -18,6 +18,13 @@
 //! are always fetched, because they are how the crawler finds anything, and
 //! then discarded if the filter excludes them. The preview says so rather than
 //! pretending a filtered crawl touches fewer pages.
+//!
+//! **This needs Wget2, not classic wget 1.x.** They are different programs
+//! wearing the same name: classic wget rejects `--progress=none` and
+//! `--span-hosts=off` outright, and narrates in a different format. Rather
+//! than maintain two parsers for two argument dialects, a crawl refuses up
+//! front and names the package to install. Plain downloads still work on
+//! either, which is what the flavour detection in [`crate::wget`] is for.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -180,6 +187,18 @@ pub struct Preview {
     pub truncated: bool,
 }
 
+/// Refuse early if the installed wget cannot do this.
+async fn require_wget2() -> Result<()> {
+    match crate::wget::detect().await {
+        Some(crate::wget::Flavour::Wget2) => Ok(()),
+        Some(crate::wget::Flavour::Legacy) => bail!(
+            "grabbing a site needs Wget2, and this machine has classic wget. \
+             Install the 'wget2' package and try again."
+        ),
+        None => bail!("wget was not found in PATH; install the 'wget2' package"),
+    }
+}
+
 /// Crawl without writing anything, to show what a real run would fetch.
 pub async fn preview(
     config: &MirrorConfig,
@@ -187,6 +206,7 @@ pub async fn preview(
     proxies: &ProxyManager,
 ) -> Result<Preview> {
     config.validate()?;
+    require_wget2().await?;
 
     let mut command = Command::new(crate::wget::wget_binary());
     command
@@ -447,6 +467,8 @@ impl MirrorEngine {
         proxies: &ProxyManager,
         events: &mpsc::Sender<MirrorEvent>,
     ) -> Result<(PathBuf, u64)> {
+        require_wget2().await?;
+
         let host = config.host().unwrap_or_else(|| "site".to_owned());
         // wget writes `<prefix>/<host>/...` itself, so the prefix stops one
         // level short of where the files land.
@@ -718,8 +740,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_preview_lists_what_the_filter_would_keep() {
-        if crate::wget::detect().await.is_none() {
-            eprintln!("no wget installed; skipping");
+        if crate::wget::detect().await != Some(crate::wget::Flavour::Wget2) {
+            eprintln!("Wget2 is not installed; skipping the crawl test");
             return;
         }
         let (base, server) = serve_site().await;
@@ -777,8 +799,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_filtered_crawl_writes_only_what_was_asked_for() {
-        if crate::wget::detect().await.is_none() {
-            eprintln!("no wget installed; skipping");
+        if crate::wget::detect().await != Some(crate::wget::Flavour::Wget2) {
+            eprintln!("Wget2 is not installed; skipping the crawl test");
             return;
         }
         let (base, server) = serve_site().await;

@@ -1,0 +1,9 @@
+{
+  "name": "com.snatch.dl.nmh",
+  "description": "Snatch download manager native messaging host",
+  "path": "/usr/bin/snatch-nmh",
+  "type": "stdio",
+  "allowed_extensions": [
+    "snatch@snatch.dl"
+  ]
+}

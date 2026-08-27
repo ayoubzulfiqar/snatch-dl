@@ -92,11 +92,18 @@ usage() {
   cat <<USAGE
 Usage: ./install.sh [OPTIONS]
 
+This builds Snatch from source and installs it for the current user only.
+Most people want the one-liner instead, which installs a released package
+system-wide with its dependencies:
+
+  curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/snatch-dl/main/get.sh | sh
+
   --skip-build         Reuse an existing target/release build.
-  --with-deps          Install every missing dependency: distribution packages
-                       via your package manager (you will be prompted for
-                       sudo), and the standalone yt-dlp and gallery-dl binaries
-                       verified against their published SHA256 sums.
+  --no-deps            Do not install any dependency. By default every missing
+                       one is installed: distribution packages via your
+                       package manager (you will be prompted for sudo), and
+                       the standalone yt-dlp and gallery-dl binaries, verified
+                       against their published SHA256 sums.
   --fetch-gallery-dl   Fetch only the gallery-dl standalone binary.
   --fetch-yt-dlp       Fetch only the yt-dlp standalone binary.
   --uninstall          Remove everything this script installed.
@@ -252,7 +259,7 @@ Exec=${BIN_DIR}/snatch-gui
 Icon=com.snatch.dl
 Terminal=false
 Categories=Network;FileTransfer;
-Keywords=download;manager;aria2;idm;
+Keywords=download;manager;aria2;torrent;magnet;video;gallery;accelerator;
 StartupNotify=true
 StartupWMClass=com.snatch.dl
 DESKTOP
@@ -431,7 +438,7 @@ check_optional_tools() {
   else
     warn "gallery-dl not found; the Media Scraper will be unavailable."
     info "  most distributions do not package it. Fetch the standalone binary:"
-    info "    ./install.sh --fetch-gallery-dl   (or --with-deps for everything)"
+    info "    ./install.sh --fetch-gallery-dl"
     info "  or download it by hand from ${GALLERY_DL_REPO}/releases"
   fi
 }
@@ -592,11 +599,14 @@ main() {
   local skip_build=0
   local want_gallery_dl=0
   local want_yt_dlp=0
-  local want_deps=0
+  # Dependencies come as standard; --no-deps opts out.
+  local want_deps=1
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --skip-build)       skip_build=1 ;;
+      --no-deps)          want_deps=0 ;;
+      # Accepted for anyone with the old flag in a script.
       --with-deps)        want_deps=1 ;;
       --fetch-gallery-dl) want_gallery_dl=1 ;;
       --fetch-yt-dlp)     want_yt_dlp=1 ;;

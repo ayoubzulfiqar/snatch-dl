@@ -1,7 +1,14 @@
 {
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAodjNPmnWORhF4IwVezNrdcqpocdPTtwyg+/pi9OKZBwHCiqw7KsK60W0h84VKbeDFHbNKW9yKULE8nbLdF1Q6rpmKnX7KMPaBnODVhzaGC2dnyaTA42eoKM0MiJKdcvNtLVUk4u1CuZfpSmMwdFDCCq8EsxD87ZDlQt1fQ+ItU35pX1uMBCR4TMxNNCVvOVN6el3dmR/TAKJnQqiY9DW1QUBNz3M3/j9eUvEJQalJJvhZaHk3snxGWOEyqhbUVrh1DJ08g/0P1rkcKEy8uhigVzfx3A9j4IjJYx+KT8AazSvryUPQSDaD3RR9Y9jbx2vLkzfwsUgesB/wYhyitmEGQIDAQAB",
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "snatch@snatch.dl",
+      "strict_min_version": "115.0"
+    }
   },
   "manifest_version": 3,
   "name": "Snatch Download Manager",

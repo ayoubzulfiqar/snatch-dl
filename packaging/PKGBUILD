@@ -1,10 +1,10 @@
 # Maintainer: Ayoub Zulfiqar <ayoubzulfiqar3@gmail.com>
 pkgname=snatch-dl
-pkgver=1.7.9
+pkgver=2.6.9
 pkgrel=1
 pkgdesc="Download manager for Linux: aria2, BitTorrent, yt-dlp and gallery-dl behind one GTK4 window"
 arch=('x86_64')
-url="https://github.com/ayoubzulfiqar/snatch-dl"
+url="https://ayoubzulfiqar.com/projects"
 license=('GPL-3.0-or-later')
 depends=('gtk4' 'libadwaita' 'aria2')
 # Torrents are built in; the rest are only needed for their own features.
@@ -12,6 +12,8 @@ optdepends=(
   'ffmpeg: post-processing, conversion and trimming'
   'yt-dlp: site video extraction'
   'gallery-dl: image gallery scraping'
+  'wget2: grabbing a whole site recursively'
+  'p7zip: unpacking downloaded archives'
 )
 makedepends=('cargo' 'pkgconf')
 # The release profile already strips symbols, so makepkg's debug package
@@ -59,4 +61,19 @@ package() {
     "${pkgdir}/usr/share/${pkgname}/extension/manifest.json"
   install -Dm644 "extension/background.js" \
     "${pkgdir}/usr/share/${pkgname}/extension/background.js"
+
+  # Native messaging, registered for every user on the machine. The extension
+  # id is pinned by the committed key, so these are static files.
+  install -Dm644 "packaging/native-messaging/chromium.json" \
+    "${pkgdir}/etc/opt/chrome/native-messaging-hosts/com.snatch.dl.nmh.json"
+  install -Dm644 "packaging/native-messaging/chromium.json" \
+    "${pkgdir}/etc/chromium/native-messaging-hosts/com.snatch.dl.nmh.json"
+  install -Dm644 "packaging/native-messaging/firefox.json" \
+    "${pkgdir}/usr/lib/mozilla/native-messaging-hosts/com.snatch.dl.nmh.json"
+
+  # Firefox needs its own manifest but the same background script.
+  install -Dm644 "packaging/extension-firefox/manifest.json" \
+    "${pkgdir}/usr/share/${pkgname}/extension-firefox/manifest.json"
+  install -Dm644 "extension/background.js" \
+    "${pkgdir}/usr/share/${pkgname}/extension-firefox/background.js"
 }

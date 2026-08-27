@@ -6,9 +6,8 @@
 
 </div>
 
-A download manager for Linux that behaves the way IDM users expect, built out
-of engines that are already good at their jobs rather than a homegrown
-downloader.
+A download manager for Linux, built out of engines that are already good at
+their jobs rather than a homegrown downloader.
 
 GTK4 / libadwaita front-end, a browser extension that captures downloads before
 the browser starts them, and four purpose-built engines behind one window.
@@ -42,7 +41,12 @@ Every engine option is configurable:
 | A second HTTP engine | **Wget2** | Also multithreaded; some servers prefer its request pattern. |
 | Downloads behind a login | **cURL import** | Paste "Copy as cURL" and the cookies, referer and user agent come with it. |
 | Keeping track | **history** | What finished, where it went, and the file itself. |
-| Downloading overnight | **scheduler** | A daily window, then suspend or shut down when done. |
+| Downloading overnight | **scheduler** | A daily window, or a start time for one download, then suspend or shut down when everything is finished. |
+| Numbered files | **batch patterns** | `page[001-250].jpg` becomes 250 downloads, after you have seen the list. |
+| Knowing it arrived intact | **checksums** | Finds the digest published beside a file and verifies against it, with no work from you. |
+| Archives | **auto-unpack** | Zip, 7z, rar and tar, including split sets, unpacked when the last part lands. |
+| A whole documentation site | **site grabber** | Recursive fetch with depth and file-type filters — and a dry run that shows exactly what it would take. |
+| Files behind a password | **HTTP and FTP auth** | Credentials never reach `ps` or the disk. |
 
 Everything runs off the UI thread. GTK owns the widgets, a Tokio runtime owns
 every socket and subprocess, and the two meet through a single event channel —
@@ -146,47 +150,121 @@ copied, so it is instant and lossless.
 
 ## Install
 
-### Dependencies
+### One line
 
-| Tool | Required | Fedora | Debian / Ubuntu | Arch |
-|---|---|---|---|---|
-| `aria2` | **yes** | `sudo dnf install aria2` | `sudo apt install aria2` | `sudo pacman -S aria2` |
-| `ffmpeg` | for post-processing | `sudo dnf install ffmpeg` | `sudo apt install ffmpeg` | `sudo pacman -S ffmpeg` |
-| `yt-dlp` | for video extraction | `sudo dnf install yt-dlp` | `sudo apt install yt-dlp` | `sudo pacman -S yt-dlp` |
-| `gallery-dl` | for the scraper | *not packaged* — see below | *not packaged* | `sudo pacman -S gallery-dl` |
+```bash
+curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/snatch-dl/main/get.sh | sh
+```
+
+That is the whole thing. It works out which distribution you are on, downloads
+the matching package from the newest release, checks it against the published
+SHA-256 sums, and installs it with your own package manager — which is what
+pulls in aria2, GTK and everything else. It then installs the optional tools
+(`ffmpeg`, `yt-dlp`, `gallery-dl`, `wget2`, 7-Zip) so every feature works
+straight away.
+
+You will be asked for your password once, by `sudo`, because it installs
+system-wide. Nothing is built from source and no Rust toolchain is needed.
+
+| | |
+|---|---|
+| Skip the optional tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
+| Install a specific release | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.6.9</code> |
+| Remove it again | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
+
+Piping a script into a shell deserves suspicion. [Read it first](get.sh) — it
+is 250 lines of POSIX `sh` and does nothing clever.
+
+### Or download a package
+
+Every release publishes one for each family, with dependencies declared so
+your package manager resolves them:
+
+```bash
+sudo apt install ./snatch-dl_2.6.9-1_amd64.deb      # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.6.9-1.x86_64.rpm     # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.6.9-1-x86_64.pkg.tar.zst   # Arch, Manjaro
+```
+
+A portable `.tar.gz` is there for anything else.
+
+### Requirements
+
+Snatch needs **GTK 4.12+ and libadwaita 1.5+** — Fedora 39+, Ubuntu 24.04+,
+Debian 13+, or any rolling distribution. Older releases cannot run it.
+
+Only **aria2** is genuinely required, and the packages depend on it. Everything
+else gates one feature and nothing more:
+
+| Tool | What stops working without it |
+|---|---|
+| `ffmpeg` | Converting, trimming and muxing after a download |
+| `yt-dlp` | Site video extraction |
+| `gallery-dl` | Image gallery scraping |
+| `wget2` | Grabbing a whole site, and the alternative HTTP engine |
+| `7z` / `p7zip` | Unpacking downloaded archives |
 
 Torrents need nothing installed: librqbit is compiled in.
 
-Snatch needs **GTK 4.12+ and libadwaita 1.5+** — Fedora 39+, Ubuntu 24.04+,
-Debian 13+, or any rolling distribution. Older releases cannot build it.
+If you skipped the extras, **Menu → Dependencies…** lists every tool, what
+breaks without it, and installs `yt-dlp` and `gallery-dl` for you — verified
+against their published SHA-256 sums, no `pip` and no root. For the ones that
+need a package manager it shows the exact command for your distribution with a
+copy button. Snatch never runs `sudo` itself: a download manager that asks for
+your password is one you should not trust.
 
-### Let Snatch install the dependencies
-
-```bash
-./install.sh --with-deps
-```
-
-That installs `aria2` and `ffmpeg` through your package manager (you will be
-prompted for sudo, by your package manager, not by Snatch), and fetches the
-standalone `yt-dlp` and `gallery-dl` binaries from their official releases —
-each verified against the project's published SHA-256 sums before it is made
-executable. No `pip`, and no root for the standalone pair.
-
-You can also do it later from inside the app: **Menu → Dependencies…** lists
-every tool, what breaks without it, and offers an **Install** button for the
-two that need no root. For `aria2` and `ffmpeg` it shows the exact command for
-your distribution with a copy button — Snatch never runs `sudo` itself, because
-a download manager that asks for your password is one you should not trust.
-
-Self-installed tools go to `~/.local/share/snatch-dl/bin`, not `~/.local/bin`,
-so uninstalling Snatch cannot remove a tool you rely on elsewhere. Snatch puts
-that directory first on its own `PATH` at startup.
-
-gallery-dl in particular is not in most distribution repositories — it moved to
+gallery-dl is not in most distribution repositories — it moved to
 [Codeberg](https://codeberg.org/mikf/gallery-dl) and ships a standalone Linux
-binary, which is what `--with-deps` and `--fetch-gallery-dl` retrieve.
+binary, which is what Snatch fetches.
 
-### Build and install
+### Add the browser extension
+
+Snatch works on its own, but the extension is what makes a click in your
+browser land in Snatch instead of the browser's own download list.
+
+**Native messaging is already registered system-wide by the package**, so
+there is no pairing step and nothing to configure. Load the extension and it
+finds Snatch.
+
+#### Chrome, Chromium, Brave, Edge, Opera, Vivaldi
+
+1. Open `chrome://extensions`
+2. Turn on **Developer mode** (top right)
+3. Click **Load unpacked**
+4. Choose the folder **`/usr/share/snatch-dl/extension`**
+   *(or `extension/` in the repository if you built from source)*
+
+Pick the **folder itself**, not a file inside it.
+
+The manifest pins a public key, so the extension ID is always
+`nlajonamjkdakodfojdlhbhlbcamjkik` — the same ID the native messaging manifest
+allows. That is why it keeps working across reloads and reinstalls.
+
+#### Firefox
+
+1. Open `about:debugging#/runtime/this-firefox`
+2. Click **Load Temporary Add-on…**
+3. Choose **`/usr/share/snatch-dl/extension-firefox/manifest.json`**
+
+> Firefox clears temporary add-ons when it restarts. To keep it permanently,
+> sign the extension yourself, or use Developer Edition with
+> `xpinstall.signatures.required=false`.
+
+Firefox needs its own copy because the two browsers genuinely disagree:
+Manifest V3 in Chromium accepts only `background.service_worker` and rejects
+`background.scripts`, while Firefox has no service-worker background at all.
+Everything except that member and the extension ID is identical, and CI fails
+if the two ever drift apart.
+
+#### What it adds
+
+Right-click anything and you get **Download with Snatch**, plus **Send magnet**,
+**Extract video**, **Find all media on this page** and **Scrape this page**.
+Ordinary downloads are intercepted before the browser starts them, and the
+cookies, referer and user agent travel with the request — which is why files
+behind a login work.
+
+### Build from source instead
 
 ```bash
 git clone https://github.com/ayoubzulfiqar/snatch-dl.git
@@ -194,40 +272,13 @@ cd snatch-dl
 ./install.sh
 ```
 
-Everything is per-user; nothing is written outside `$HOME` and no step needs
-`sudo`. The installer:
+This installs for the current user only: nothing outside `$HOME`, and no step
+needs `sudo` except installing distribution packages, which your package
+manager prompts for itself. Dependencies are installed by default; pass
+`--no-deps` to skip them. `./install.sh --uninstall` reverses all of it.
 
-- builds the workspace in release mode,
-- installs `snatch-gui` and `snatch-nmh` to `~/.local/bin`,
-- generates the Firefox build of the extension into `extension-firefox/`,
-- registers the native messaging host for every browser it finds,
-- installs a desktop entry.
-
-`./install.sh --uninstall` reverses all of it.
-
-### Load the extension
-
-**Chromium / Chrome** — `chrome://extensions` → enable *Developer mode* →
-*Load unpacked* → select the **`extension/` folder itself** (the folder, not a
-file inside it).
-
-`extension/` is the Chromium extension as committed, so this works from a bare
-clone with no build step. Its manifest pins a public key, which fixes the ID at
-`nlajonamjkdakodfojdlhbhlbcamjkik` — the same ID the installer writes into the
-native messaging manifest, so the two keep matching across reloads.
-
-**Firefox** — `about:debugging#/runtime/this-firefox` → *Load Temporary Add-on*
-→ select **`extension-firefox/manifest.json`**, which `./install.sh` generates.
-
-> Firefox clears temporary add-ons on restart. To keep it, sign the extension
-> or use Developer Edition with `xpinstall.signatures.required=false`.
-
-The two are **not interchangeable**, which is why Firefox needs a generated
-copy at all: Manifest V3 in Chromium accepts only `background.service_worker`
-and rejects `background.scripts`, while Firefox has no service-worker
-background and needs `background.scripts`. The installer builds
-`extension-firefox/` by swapping those members and dropping the Chromium key,
-keeping everything else byte-identical to `extension/manifest.json`.
+Self-installed tools go to `~/.local/share/snatch-dl/bin`, not `~/.local/bin`,
+so removing Snatch cannot take a tool you rely on elsewhere with it.
 
 ---
 
@@ -432,18 +483,30 @@ Three things in here are counter-intuitive and are all covered by tests:
 
 ```bash
 cargo build --release
-cargo test --workspace       # 105 tests
+cargo test --workspace       # 177 tests
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
 
-The test suite runs without a display and without a network. Tests that need a
-real binary (the ffmpeg end-to-end encode) skip themselves when it is absent.
+The test suite runs without a display and without a network — the tests that
+need a server stand one up on a loopback port. Tests that need a real binary
+(the ffmpeg encode, the 7-Zip round trip, the Wget2 crawl) skip themselves
+when it is absent, and CI installs all of them so they actually run.
 
 Parser tests use literal output captured from the real tools — aria2 1.37.0,
 ffmpeg 8.1.2, gallery-dl 1.32.9, yt-dlp 2026.08.19 — rather than invented
 fixtures, because every one of those formats has a quirk that invented
 fixtures would miss.
+
+---
+
+## Author
+
+Built by **[Ayoub Zulfiqar](https://ayoubzulfiqar.com/)** —
+[ayoubzulfiqar.com/projects](https://ayoubzulfiqar.com/projects).
+
+Issues and pull requests are welcome at
+[github.com/ayoubzulfiqar/snatch-dl](https://github.com/ayoubzulfiqar/snatch-dl).
 
 ---
 

@@ -30,7 +30,7 @@ jobs:
       # real binaries end to end; without these they skip themselves, which is
       # worse than it looks — the arguments they build would go unchecked.
       - name: Install test dependencies
-        run: sudo apt-get install --no-install-recommends -y ffmpeg p7zip-full
+        run: sudo apt-get install --no-install-recommends -y ffmpeg p7zip-full wget2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -87,7 +87,24 @@ jobs:
 
           if problems:
               sys.exit("extension/manifest.json: " + "; ".join(problems))
-          print("extension/manifest.json is loadable in Chromium")
+
+          # The Firefox copy the packages ship must not drift from it. Only
+          # the background member and the gecko id may differ; everything
+          # else is the same extension.
+          firefox = json.loads(pathlib.Path("packaging/extension-firefox/manifest.json").read_text())
+          shared = {k: v for k, v in manifest.items() if k not in ("key", "background")}
+          theirs = {k: v for k, v in firefox.items()
+                    if k not in ("background", "browser_specific_settings")}
+          if shared != theirs:
+              differing = sorted(set(shared) ^ set(theirs)) or [
+                  k for k in shared if shared.get(k) != theirs.get(k)]
+              sys.exit("packaging/extension-firefox/manifest.json has drifted: " + ", ".join(differing))
+          if "scripts" not in firefox.get("background", {}):
+              sys.exit("the Firefox manifest needs background.scripts")
+          if "key" in firefox:
+              sys.exit("the Firefox manifest must not carry the Chromium key")
+
+          print("extension manifests agree and are loadable")
           CHECK
 
       - name: Installer syntax
