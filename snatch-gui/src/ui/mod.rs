@@ -1020,11 +1020,32 @@ impl Ui {
     }
 
     /// Queue a download without its own toast, for bulk adds.
+    ///
+    /// Honours the configured engine like any other download, but skips the
+    /// checksum lookup: a bulk add is typically a directory's worth of files
+    /// from one host, and probing for each of them separately would mean
+    /// hundreds of requests for the same handful of sums files.
     pub fn enqueue_quiet(self: &Rc<Self>, request: DownloadRequest) {
         if let Err(error) = request.validate() {
             log::warn!("skipping {}: {error:#}", request.url);
             return;
         }
+
+        if self.backend.settings().download.engine == crate::settings::HttpEngine::Wget {
+            let backend = self.backend.clone();
+            let settings = backend.settings();
+            let url = request.url.clone();
+            if let Err(error) = backend.wget.clone().start(
+                request,
+                settings,
+                backend.proxies.clone(),
+                backend.wget_events.clone(),
+            ) {
+                log::warn!("could not queue {url}: {error:#}");
+            }
+            return;
+        }
+
         let backend = self.backend.clone();
         glib::spawn_future_local(async move {
             let client = backend.aria2.clone();
@@ -1032,7 +1053,7 @@ impl Ui {
                 .offload(async move { client.add_uri(&request).await })
                 .await
             {
-                log::warn!("could not queue a sniffed file: {error:#}");
+                log::warn!("could not queue a bulk-added file: {error:#}");
             }
         });
     }
@@ -1225,7 +1246,11 @@ impl Ui {
             .wrap(true)
             .css_classes(["snatch-hint"])
             .label(
-                "One URL, several on separate lines, or a whole “Copy as cURL”                  command pasted from your browser's network inspector — cookies,                  referer and user agent are taken from it.",
+                "One URL, several on separate lines, or a whole “Copy as cURL” \
+                 command pasted from your browser's network inspector — cookies, \
+                 referer and user agent are taken from it.\n\n\
+                 Numbered files can be written once: page[001-250].jpg, disc[1-3].iso, \
+                 img.{jpg,png}. You get to check the list before anything is queued.",
             )
             .build();
 
@@ -1346,10 +1371,21 @@ impl Ui {
             move |buffer| {
                 let text = buffer_text(buffer);
                 dialog.set_response_enabled("add", !text.trim().is_empty());
-                // Mirrors only mean something with more than one URL, and
-                // never for a pasted cURL command.
-                let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
-                as_mirrors.set_sensitive(lines > 1 && !crate::curl::looks_like_curl(&text));
+                // Mirrors only mean something with more than one URL, never
+                // for a pasted cURL command, and never alongside a pattern:
+                // an expanded range is a list of different files, not several
+                // routes to the same one.
+                let lines: Vec<&str> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                let templated = lines
+                    .iter()
+                    .any(|line| crate::batch::looks_like_pattern(line));
+                as_mirrors.set_sensitive(
+                    lines.len() > 1 && !templated && !crate::curl::looks_like_curl(&text),
+                );
             }
         });
         as_mirrors.set_sensitive(false);
@@ -1431,6 +1467,30 @@ impl Ui {
             return;
         };
 
+        // `page[001-250].jpg` stands for 250 downloads. Expanding is cheap;
+        // queueing 250 things without showing them first is not, so the
+        // preview asks before anything reaches an engine.
+        if !as_mirrors && urls.iter().any(|url| crate::batch::looks_like_pattern(url)) {
+            let mut expanded = Vec::new();
+            for url in &urls {
+                match crate::batch::expand(url) {
+                    Ok(mut urls) => expanded.append(&mut urls),
+                    Err(error) => {
+                        self.toast(&format!("{error:#}"));
+                        return;
+                    }
+                }
+            }
+            // One digest cannot be right for several different files, and
+            // applying it to all of them would fail every download but one.
+            let mut extras = extras;
+            if expanded.len() > 1 && extras.checksum.take().is_some() {
+                self.toast("Ignoring the checksum: it cannot apply to more than one file");
+            }
+            self.present_batch_preview(expanded, kind_choice, extras);
+            return;
+        }
+
         let build = |url: String| -> DownloadRequest {
             let mut request = match kind_choice {
                 1 => DownloadRequest::from_url(url),
@@ -1460,6 +1520,79 @@ impl Ui {
         if urls.len() > 1 {
             self.toast(&format!("Added {} items", urls.len()));
         }
+    }
+
+    /// Show what a pattern expanded to before any of it is queued.
+    ///
+    /// The whole list is shown rather than a count: an off-by-one in the
+    /// range or a padding width that does not match the server is obvious at
+    /// a glance here, and invisible once 250 downloads are already failing.
+    fn present_batch_preview(
+        self: &Rc<Self>,
+        urls: Vec<String>,
+        kind_choice: u32,
+        extras: AddExtras,
+    ) {
+        if urls.is_empty() {
+            self.toast("That pattern makes no URLs");
+            return;
+        }
+
+        let listing = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::Char)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
+            .build();
+        listing.buffer().set_text(&urls.join("\n"));
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(200)
+            .max_content_height(320)
+            .child(&listing)
+            .css_classes(["card"])
+            .build();
+
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("Add {} downloads?", urls.len()))
+            .body("Check the numbering before queueing these.")
+            .extra_child(&scroller)
+            .build();
+        dialog.add_responses(&[("close", "Cancel"), ("add", "Add all")]);
+        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("add"));
+        dialog.set_close_response("close");
+
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "add" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            let total = urls.len();
+            for url in &urls {
+                let mut request = match kind_choice {
+                    2 => DownloadRequest::magnet(url.clone()),
+                    3 => DownloadRequest::scrape(url.clone()),
+                    4 => DownloadRequest::video(url.clone()),
+                    5 => DownloadRequest::sniff(url.clone()),
+                    _ => DownloadRequest::from_url(url.clone()),
+                };
+                extras.apply(&mut request);
+                // Quietly: a toast per download would bury the window under
+                // 250 of them.
+                ui.enqueue_quiet(request);
+            }
+            ui.toast(&format!("Added {total} downloads"));
+            ui.select_page(PAGE_DOWNLOADS);
+        });
+
+        dialog.present(Some(&self.window));
     }
 
     /// Pick a `.torrent` from disk and hand it to the engine.

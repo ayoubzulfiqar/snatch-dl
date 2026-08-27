@@ -17,6 +17,7 @@
 
 mod aria2;
 mod backend;
+mod batch;
 mod checksum;
 mod curl;
 mod db;
