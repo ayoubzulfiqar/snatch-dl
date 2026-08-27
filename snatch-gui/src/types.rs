@@ -374,6 +374,8 @@ pub enum UiEvent {
     Wget(crate::wget::WgetEvent),
     /// An archive being unpacked after its download finished.
     Archive(crate::archive::ArchiveEvent),
+    /// A recursive crawl of a site.
+    Mirror(crate::mirror::MirrorEvent),
 }
 
 #[cfg(test)]

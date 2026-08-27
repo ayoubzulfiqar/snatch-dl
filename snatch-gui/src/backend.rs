@@ -32,6 +32,7 @@ pub struct Backend {
     pub proxies: Arc<ProxyManager>,
     pub media: Arc<MediaQueue>,
     pub archives: Arc<crate::archive::ArchiveQueue>,
+    pub mirrors: Arc<crate::mirror::MirrorEngine>,
     pub db: Database,
     pub download_dir: PathBuf,
     /// Where Snatch installs tools for itself.
@@ -45,6 +46,8 @@ pub struct Backend {
     pub video_events: tokio::sync::mpsc::Sender<crate::ytdlp::VideoEvent>,
     /// Handed to each wget download so its progress reaches the UI.
     pub wget_events: tokio::sync::mpsc::Sender<crate::wget::WgetEvent>,
+    /// Handed to each crawl so its progress reaches the UI.
+    pub mirror_events: tokio::sync::mpsc::Sender<crate::mirror::MirrorEvent>,
     handle: tokio::runtime::Handle,
 }
 
@@ -59,6 +62,7 @@ impl Backend {
         proxies: Arc<ProxyManager>,
         media: Arc<MediaQueue>,
         archives: Arc<crate::archive::ArchiveQueue>,
+        mirrors: Arc<crate::mirror::MirrorEngine>,
         db: Database,
         download_dir: PathBuf,
         managed_bin_dir: PathBuf,
@@ -67,6 +71,7 @@ impl Backend {
         gallery_events: tokio::sync::mpsc::Sender<crate::gallery::GalleryEvent>,
         video_events: tokio::sync::mpsc::Sender<crate::ytdlp::VideoEvent>,
         wget_events: tokio::sync::mpsc::Sender<crate::wget::WgetEvent>,
+        mirror_events: tokio::sync::mpsc::Sender<crate::mirror::MirrorEvent>,
         handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
@@ -78,6 +83,7 @@ impl Backend {
             proxies,
             media,
             archives,
+            mirrors,
             db,
             download_dir,
             managed_bin_dir,
@@ -86,6 +92,7 @@ impl Backend {
             gallery_events,
             video_events,
             wget_events,
+            mirror_events,
             handle,
         }
     }

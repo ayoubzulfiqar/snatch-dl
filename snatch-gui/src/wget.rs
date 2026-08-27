@@ -35,18 +35,31 @@ use crate::types::DownloadRequest;
 /// How often the on-disk size is sampled.
 const POLL: Duration = Duration::from_millis(500);
 
+/// Keep what wget prints on one stream, for a failure message.
+async fn collect_output<R>(stream: R, into: Arc<Mutex<Vec<String>>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim().to_owned();
+        if line.is_empty() {
+            continue;
+        }
+        log::debug!(target: "wget", "{line}");
+        let mut held = into.lock().unwrap_or_else(|poison| poison.into_inner());
+        if held.len() < 20 {
+            held.push(line);
+        }
+    }
+}
+
 /// The host a `.netrc` entry keys on: no userinfo, no port.
 fn host_from_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url.trim()).ok()?;
     parsed.host_str().map(str::to_ascii_lowercase)
 }
 
-/// A short-lived `.netrc` holding one machine's credentials.
-///
-/// wget takes `--user` and `--password` on the command line, where any user on
-/// the machine can read them out of `ps`. A netrc file readable only by its
-/// owner does not have that problem, so the password goes there instead and
-/// the file is removed as soon as the download ends.
 /// Check the finished file against the digest the request carried, if any.
 ///
 /// An unreadable digest is reported rather than ignored. Unlike the aria2
@@ -66,6 +79,12 @@ async fn verify_if_requested(request: &DownloadRequest, path: &Path) -> Result<(
     crate::checksum::verify_file(path, &expected).await
 }
 
+/// A short-lived `.netrc` holding one machine's credentials.
+///
+/// wget takes `--user` and `--password` on the command line, where any user on
+/// the machine can read them out of `ps`. A netrc file readable only by its
+/// owner does not have that problem, so the password goes there instead and
+/// the file is removed as soon as the download ends.
 #[derive(Debug)]
 struct NetrcFile(PathBuf);
 
@@ -135,7 +154,7 @@ impl Drop for NetrcFile {
     }
 }
 
-fn wget_binary() -> String {
+pub fn wget_binary() -> String {
     std::env::var("SNATCH_WGET")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -421,7 +440,7 @@ impl WgetEngine {
             .arg("--")
             .arg(request.url.trim())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
@@ -433,26 +452,20 @@ impl WgetEngine {
             Err(error) => return Err(error).context("could not start wget"),
         };
 
-        // Collect stderr so a failure can say why, without parsing it for progress.
+        // Collect what wget says so a failure can explain itself, without
+        // parsing any of it for progress.
+        //
+        // Both streams: Wget2 writes everything to stdout and leaves stderr
+        // empty, while classic wget does the opposite. Reading only stderr
+        // meant every Wget2 failure was reported with no reason attached.
+        let stdout = child.stdout.take().context("wget produced no stdout")?;
         let stderr = child.stderr.take().context("wget produced no stderr")?;
         let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
         tokio::spawn({
-            let diagnostics = Arc::clone(&diagnostics);
+            let out = Arc::clone(&diagnostics);
+            let err = Arc::clone(&diagnostics);
             async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = line.trim().to_owned();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    log::debug!(target: "wget", "{line}");
-                    let mut held = diagnostics
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    if held.len() < 20 {
-                        held.push(line);
-                    }
-                }
+                tokio::join!(collect_output(stdout, out), collect_output(stderr, err));
             }
         });
 

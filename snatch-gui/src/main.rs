@@ -25,6 +25,7 @@ mod db;
 mod deps;
 mod gallery;
 mod ipc;
+mod mirror;
 mod network;
 mod paths;
 mod processor;
@@ -172,12 +173,14 @@ fn run() -> Result<glib::ExitCode> {
     let (video_tx, video_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
     let (wget_tx, wget_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
     let (archive_tx, archive_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
+    let (mirror_tx, mirror_rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
 
     let gallery_engine = gallery::GalleryEngine::new(database.clone());
     let video_engine = ytdlp::VideoEngine::new(database.clone());
     let wget_engine = wget::WgetEngine::new(download_dir.clone());
     let media_queue = processor::MediaQueue::new(database.clone(), media_tx);
     let archive_queue = archive::ArchiveQueue::new(archive_tx);
+    let mirror_engine = mirror::MirrorEngine::new(download_dir.clone());
 
     let backend = Backend::new(
         aria2_client.clone(),
@@ -188,6 +191,7 @@ fn run() -> Result<glib::ExitCode> {
         Arc::clone(&proxies),
         media_queue,
         archive_queue,
+        mirror_engine,
         database,
         download_dir,
         paths::managed_bin_dir()?,
@@ -196,6 +200,7 @@ fn run() -> Result<glib::ExitCode> {
         gallery_tx,
         video_tx,
         wget_tx,
+        mirror_tx,
         runtime.handle().clone(),
     );
 
@@ -222,6 +227,7 @@ fn run() -> Result<glib::ExitCode> {
     runtime.spawn(forward(video_rx, events_tx.clone(), UiEvent::Video));
     runtime.spawn(forward(wget_rx, events_tx.clone(), UiEvent::Wget));
     runtime.spawn(forward(archive_rx, events_tx.clone(), UiEvent::Archive));
+    runtime.spawn(forward(mirror_rx, events_tx.clone(), UiEvent::Mirror));
     runtime.spawn(watch_for_shutdown(events_tx));
 
     app.connect_activate({

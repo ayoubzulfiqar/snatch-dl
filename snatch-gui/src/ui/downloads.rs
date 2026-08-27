@@ -55,6 +55,8 @@ pub struct DownloadsPage {
     /// queue's own counter and would collide with the database ids the
     /// media and video jobs use.
     archive_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
+    /// Crawls, keyed separately for the same reason.
+    mirror_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
     summary: RefCell<PageSummary>,
 }
 
@@ -124,6 +126,7 @@ impl DownloadsPage {
             rows: RefCell::new(HashMap::new()),
             jobs: RefCell::new(HashMap::new()),
             archive_jobs: RefCell::new(HashMap::new()),
+            mirror_jobs: RefCell::new(HashMap::new()),
             summary: RefCell::new(PageSummary::default()),
         }
     }
@@ -319,6 +322,48 @@ impl DownloadsPage {
         }
     }
 
+    /// Reflect one crawl in the task list.
+    pub fn handle_mirror(&self, ui: &Rc<Ui>, event: &crate::mirror::MirrorEvent) {
+        use crate::mirror::MirrorEvent;
+        match event {
+            MirrorEvent::Started { job_id, host } => {
+                let mut jobs = self.mirror_jobs.borrow_mut();
+                let row = jobs.entry(*job_id).or_insert_with(|| {
+                    let row = JobRow::new("Grabbing site");
+                    row.on_cancel_mirror(ui, *job_id);
+                    self.jobs_list.append(&row.root);
+                    row
+                });
+                row.set_subtitle(host);
+                self.jobs_frame.set_visible(true);
+            }
+            MirrorEvent::Progress {
+                job_id,
+                saved,
+                discovered,
+                current,
+            } => {
+                if let Some(row) = self.mirror_jobs.borrow().get(job_id) {
+                    // A crawl never knows its total until it ends, so the bar
+                    // pulses and the count carries the real information.
+                    row.pulse();
+                    row.set_subtitle(&format!("{saved} of {discovered} found — {current}"));
+                }
+            }
+            MirrorEvent::Finished { job_id, .. } | MirrorEvent::Failed { job_id, .. } => {
+                if let Some(row) = self.mirror_jobs.borrow_mut().remove(job_id) {
+                    self.jobs_list.remove(&row.root);
+                }
+                if self.jobs.borrow().is_empty()
+                    && self.archive_jobs.borrow().is_empty()
+                    && self.mirror_jobs.borrow().is_empty()
+                {
+                    self.jobs_frame.set_visible(false);
+                }
+            }
+        }
+    }
+
     /// Reflect one yt-dlp event in the task list. Video jobs share the row
     /// widget with conversions: both are "a subprocess producing a file".
     pub fn handle_video(&self, ui: &Rc<Ui>, event: VideoEvent) {
@@ -501,6 +546,19 @@ impl JobRow {
 
     fn set_subtitle(&self, text: &str) {
         self.detail.set_text(text);
+    }
+
+    /// A crawl has no total until it finishes, so the bar pulses.
+    fn pulse(&self) {
+        self.progress.pulse();
+    }
+
+    /// Stop a crawl. Unlike extraction, a partial crawl is just fewer files.
+    fn on_cancel_mirror(&self, ui: &Rc<Ui>, job_id: i64) {
+        let backend = ui.backend().clone();
+        self.cancel.connect_clicked(move |_| {
+            backend.mirrors.cancel(job_id);
+        });
     }
 
     /// Extraction has no safe midpoint to stop at, so it offers no cancel.

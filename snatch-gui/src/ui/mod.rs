@@ -71,6 +71,14 @@ pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Re
 ///
 /// glib owns the timezone lookup; the scheduling arithmetic in `settings` is
 /// kept pure by taking this as an argument.
+/// Split a comma or space separated list of extensions.
+fn split_extensions(text: &str) -> Vec<String> {
+    text.split([',', ' ', ';'])
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn current_minute_of_day() -> u32 {
     glib::DateTime::now_local()
         .map(|now| (now.hour() * 60 + now.minute()) as u32)
@@ -562,7 +570,8 @@ impl Ui {
             || self.backend.media.outstanding() > 0
             // Suspending the machine part-way through an extraction leaves a
             // directory of half-written files that looks like a finished one.
-            || self.backend.archives.outstanding() > 0;
+            || self.backend.archives.outstanding() > 0
+            || self.backend.mirrors.running_count() > 0;
 
         if busy {
             self.queue_was_busy.set(true);
@@ -835,6 +844,7 @@ impl Ui {
         self.add_action("proxies", proxy::present);
         self.add_action("extract-video", |ui| ui.present_video_dialog());
         self.add_action("sniff", |ui| sniff::present(ui, None));
+        self.add_action("grab-site", |ui| ui.present_site_grabber());
         self.add_action("dependencies", deps::present);
         self.add_action("show-history", |ui| ui.select_page(PAGE_HISTORY));
         self.add_action("clear-history", |ui| {
@@ -885,6 +895,7 @@ impl Ui {
         app.set_accels_for_action("win.pause-all", &["<Primary>p"]);
         app.set_accels_for_action("win.extract-video", &["<Primary>d"]);
         app.set_accels_for_action("win.sniff", &["<Primary>f"]);
+        app.set_accels_for_action("win.grab-site", &["<Primary>g"]);
         app.set_accels_for_action("win.show-settings", &["<Primary>comma"]);
         app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
         app.set_accels_for_action("win.show-history", &["<Primary>h"]);
@@ -981,6 +992,7 @@ impl Ui {
                 self.refresh_title();
             }
             UiEvent::Archive(event) => self.handle_archive(event),
+            UiEvent::Mirror(event) => self.handle_mirror(event),
             UiEvent::Wget(event) => {
                 self.downloads.handle_wget(self, event);
                 self.refresh_title();
@@ -1880,6 +1892,269 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
 
+    /// Set up a recursive crawl of a site.
+    fn present_site_grabber(self: &Rc<Self>) {
+        let url = gtk::Entry::builder()
+            .placeholder_text("https://example.com/docs/")
+            .activates_default(true)
+            .build();
+
+        let depth = adw::SpinRow::with_range(0.0, 20.0, 1.0);
+        depth.set_title("Link depth");
+        depth.set_subtitle("How many links to follow from the starting page. 0 means no limit.");
+        depth.set_value(2.0);
+
+        let accept = gtk::Entry::builder()
+            .placeholder_text("pdf, epub — leave empty for everything")
+            .build();
+        let reject = gtk::Entry::builder()
+            .placeholder_text("exe, zip — never keep these")
+            .build();
+
+        let same_host = gtk::CheckButton::builder()
+            .label("Stay on this site")
+            .active(true)
+            .build();
+        let no_parent = gtk::CheckButton::builder()
+            .label("Never go above the starting folder")
+            .active(true)
+            .build();
+        let requisites = gtk::CheckButton::builder()
+            .label("Also fetch images and stylesheets")
+            .build();
+        let convert = gtk::CheckButton::builder()
+            .label("Rewrite links so it browses offline")
+            .build();
+
+        let summary = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["snatch-hint"])
+            .label(
+                "Check first shows exactly what would be fetched, without downloading any of it.",
+            )
+            .build();
+
+        let fields = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(10)
+            .build();
+        fields.append(&url);
+        let depth_group = adw::PreferencesGroup::new();
+        depth_group.add(&depth);
+        fields.append(&depth_group);
+        fields.append(
+            &gtk::Label::builder()
+                .xalign(0.0)
+                .label("Keep only these file types")
+                .css_classes(["snatch-hint"])
+                .build(),
+        );
+        fields.append(&accept);
+        fields.append(
+            &gtk::Label::builder()
+                .xalign(0.0)
+                .label("Never keep these file types")
+                .css_classes(["snatch-hint"])
+                .build(),
+        );
+        fields.append(&reject);
+        fields.append(&same_host);
+        fields.append(&no_parent);
+        fields.append(&requisites);
+        fields.append(&convert);
+        fields.append(&summary);
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(420)
+            .child(&fields)
+            .build();
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("Grab a site")
+            .body("Fetch a whole section of a site rather than one file from it.")
+            .extra_child(&scroller)
+            .build();
+        dialog.add_responses(&[
+            ("close", "Cancel"),
+            ("check", "Check first"),
+            ("fetch", "Fetch"),
+        ]);
+        dialog.set_response_appearance("fetch", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("check"));
+        dialog.set_close_response("close");
+
+        let read_config = {
+            let url = url.clone();
+            let depth = depth.clone();
+            let accept = accept.clone();
+            let reject = reject.clone();
+            let same_host = same_host.clone();
+            let no_parent = no_parent.clone();
+            let requisites = requisites.clone();
+            let convert = convert.clone();
+            move || crate::mirror::MirrorConfig {
+                url: url.text().trim().to_owned(),
+                depth: depth.value() as u32,
+                accept: split_extensions(&accept.text()),
+                reject: split_extensions(&reject.text()),
+                same_host: same_host.is_active(),
+                no_parent: no_parent.is_active(),
+                page_requisites: requisites.is_active(),
+                convert_links: convert.is_active(),
+            }
+        };
+
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |dialog, response| {
+            let Some(ui) = weak.upgrade() else { return };
+            let config = read_config();
+            if let Err(error) = config.validate() {
+                ui.toast(&format!("{error:#}"));
+                return;
+            }
+            match response {
+                "fetch" => ui.start_crawl(config),
+                "check" => {
+                    // Keep the dialog open behind the preview, so the settings
+                    // are still there to adjust if the list looks wrong.
+                    dialog.set_can_close(true);
+                    ui.present_crawl_preview(config);
+                }
+                _ => {}
+            }
+        });
+
+        dialog.present(Some(&self.window));
+    }
+
+    /// Run the spider and show what a real crawl would keep.
+    fn present_crawl_preview(self: &Rc<Self>, config: crate::mirror::MirrorConfig) {
+        self.toast("Checking what is there…");
+        let weak = Rc::downgrade(self);
+        let backend = self.backend.clone();
+        glib::spawn_future_local(async move {
+            let settings = backend.settings();
+            let proxies = std::sync::Arc::clone(&backend.proxies);
+            let probe = config.clone();
+            let found = backend
+                .offload(async move { crate::mirror::preview(&probe, &settings, &proxies).await })
+                .await;
+            let Some(ui) = weak.upgrade() else { return };
+            match found {
+                Ok(preview) => ui.show_crawl_preview(config, preview),
+                Err(error) => ui.toast(&format!("Could not check that site: {error:#}")),
+            }
+        });
+    }
+
+    fn show_crawl_preview(
+        self: &Rc<Self>,
+        config: crate::mirror::MirrorConfig,
+        preview: crate::mirror::Preview,
+    ) {
+        if preview.kept.is_empty() {
+            self.toast("Nothing there matches those filters");
+            return;
+        }
+
+        let listing = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::Char)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
+            .build();
+        listing.buffer().set_text(&preview.kept.join("\n"));
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(220)
+            .max_content_height(340)
+            .child(&listing)
+            .css_classes(["card"])
+            .build();
+
+        // The pages walked to find these are worth stating: a filtered crawl
+        // still visits every page, and the request count is what a server
+        // operator notices.
+        let mut body = format!("{} file(s) would be kept.", preview.kept.len());
+        if preview.traversed_only > 0 {
+            body.push_str(&format!(
+                " {} more page(s) would be visited to find them, and then discarded.",
+                preview.traversed_only
+            ));
+        }
+        if preview.truncated {
+            body.push_str(" The check stopped early, so a real crawl may find more.");
+        }
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("This is what would be fetched")
+            .body(body)
+            .extra_child(&scroller)
+            .build();
+        dialog.add_responses(&[("close", "Back"), ("fetch", "Fetch these")]);
+        dialog.set_response_appearance("fetch", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("fetch"));
+        dialog.set_close_response("close");
+
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "fetch" {
+                return;
+            }
+            if let Some(ui) = weak.upgrade() {
+                ui.start_crawl(config.clone());
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn start_crawl(self: &Rc<Self>, config: crate::mirror::MirrorConfig) {
+        let backend = self.backend.clone();
+        let outcome = backend.mirrors.clone().start(
+            config,
+            backend.settings(),
+            backend.proxies.clone(),
+            backend.mirror_events.clone(),
+        );
+        match outcome {
+            Ok(_) => {
+                self.toast("Crawling…");
+                self.select_page(PAGE_DOWNLOADS);
+            }
+            Err(error) => self.toast(&format!("Could not start the crawl: {error:#}")),
+        }
+    }
+
+    /// Reflect one crawl event in the interface.
+    fn handle_mirror(self: &Rc<Self>, event: crate::mirror::MirrorEvent) {
+        use crate::mirror::MirrorEvent;
+        self.downloads.handle_mirror(self, &event);
+        match event {
+            MirrorEvent::Finished {
+                destination, saved, ..
+            } => {
+                let folder = destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| destination.display().to_string());
+                let detail = format!("Fetched {saved} file(s) from {folder}");
+                self.toast(&detail);
+                self.notify("Site grabbed", &detail);
+            }
+            MirrorEvent::Failed { error, .. } => {
+                self.toast(&format!("The crawl failed: {error}"));
+            }
+            MirrorEvent::Started { .. } | MirrorEvent::Progress { .. } => {}
+        }
+    }
+
     /// Show what a pattern expanded to before any of it is queued.
     ///
     /// The whole list is shown rather than a count: an off-by-one in the
@@ -2087,6 +2362,7 @@ impl Ui {
             ("Ctrl+N", "Add a download, magnet or gallery"),
             ("Ctrl+D", "Extract a video with yt-dlp"),
             ("Ctrl+F", "Sniff a page for media"),
+            ("Ctrl+G", "Grab a whole site"),
             ("Ctrl+P", "Pause every download"),
             ("Ctrl+Comma", "Settings"),
             ("Ctrl+W", "Close the window"),
@@ -2259,6 +2535,7 @@ fn main_menu() -> gio::Menu {
     sources.append(Some("Sniff a Page…"), Some("win.sniff"));
     sources.append(Some("Extract Video…"), Some("win.extract-video"));
     sources.append(Some("Scrape a Page…"), Some("win.scrape"));
+    sources.append(Some("Grab a Site…"), Some("win.grab-site"));
 
     let transfers = gio::Menu::new();
     transfers.append(Some("Pause All"), Some("win.pause-all"));
