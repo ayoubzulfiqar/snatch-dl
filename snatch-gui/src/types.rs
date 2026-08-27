@@ -367,6 +367,8 @@ pub enum UiEvent {
     Video(crate::ytdlp::VideoEvent),
     /// Progress from a wget download.
     Wget(crate::wget::WgetEvent),
+    /// An archive being unpacked after its download finished.
+    Archive(crate::archive::ArchiveEvent),
 }
 
 #[cfg(test)]

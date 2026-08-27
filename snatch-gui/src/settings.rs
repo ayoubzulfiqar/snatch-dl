@@ -111,6 +111,13 @@ pub struct DownloadSettings {
     /// download, which is why it can be turned off.
     #[serde(default = "yes")]
     pub verify_downloads: bool,
+    /// Unpack a downloaded archive into a folder beside it.
+    #[serde(default = "yes")]
+    pub extract_archives: bool,
+    /// Delete the archive once its contents are safely out. Off by default:
+    /// deleting something the user downloaded should be asked for.
+    #[serde(default)]
+    pub delete_archives_after: bool,
 }
 
 /// serde default for a flag that should be on unless a settings file written
@@ -138,6 +145,8 @@ impl Default for DownloadSettings {
                 .to_owned(),
             categorise: true,
             verify_downloads: true,
+            extract_archives: true,
+            delete_archives_after: false,
         }
     }
 }

@@ -51,6 +51,10 @@ pub struct DownloadsPage {
     jobs_frame: gtk::Box,
     rows: RefCell<HashMap<String, Rc<Row>>>,
     jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
+    /// Extractions, keyed separately: their ids come from the archive
+    /// queue's own counter and would collide with the database ids the
+    /// media and video jobs use.
+    archive_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
     summary: RefCell<PageSummary>,
 }
 
@@ -119,6 +123,7 @@ impl DownloadsPage {
             graph,
             rows: RefCell::new(HashMap::new()),
             jobs: RefCell::new(HashMap::new()),
+            archive_jobs: RefCell::new(HashMap::new()),
             summary: RefCell::new(PageSummary::default()),
         }
     }
@@ -200,6 +205,9 @@ impl DownloadsPage {
                 "Download finished",
                 &format!("{} is ready", download.display_name()),
             );
+            if let Some(path) = download.path() {
+                ui.extract_if_archive(PathBuf::from(path));
+            }
         }
 
         let entry = NewHistoryEntry {
@@ -271,6 +279,44 @@ impl DownloadsPage {
             } else {
                 PAGE_LIST
             });
+    }
+
+    /// Reflect one extraction in the task list.
+    ///
+    /// Unpacking is the same shape as a conversion — a subprocess turning one
+    /// file into others — so it reuses the row, but not the cancel button:
+    /// stopping an extraction half way leaves a directory of partial files
+    /// that looks like a successful one.
+    pub fn handle_archive(&self, event: &crate::archive::ArchiveEvent) {
+        use crate::archive::ArchiveEvent;
+        match event {
+            ArchiveEvent::Started { job_id, name, .. } => {
+                let mut jobs = self.archive_jobs.borrow_mut();
+                let row = jobs.entry(*job_id).or_insert_with(|| {
+                    let row = JobRow::new("Unpacking");
+                    row.hide_cancel();
+                    self.jobs_list.append(&row.root);
+                    row
+                });
+                row.set_subtitle(name);
+                self.jobs_frame.set_visible(true);
+            }
+            ArchiveEvent::Progress { job_id, percent } => {
+                if let Some(row) = self.archive_jobs.borrow().get(job_id) {
+                    row.set_percent(*percent);
+                }
+            }
+            ArchiveEvent::NeedsPassword { job_id, .. }
+            | ArchiveEvent::Finished { job_id, .. }
+            | ArchiveEvent::Failed { job_id, .. } => {
+                if let Some(row) = self.archive_jobs.borrow_mut().remove(job_id) {
+                    self.jobs_list.remove(&row.root);
+                }
+                if self.jobs.borrow().is_empty() && self.archive_jobs.borrow().is_empty() {
+                    self.jobs_frame.set_visible(false);
+                }
+            }
+        }
     }
 
     /// Reflect one yt-dlp event in the task list. Video jobs share the row
@@ -455,6 +501,17 @@ impl JobRow {
 
     fn set_subtitle(&self, text: &str) {
         self.detail.set_text(text);
+    }
+
+    /// Extraction has no safe midpoint to stop at, so it offers no cancel.
+    fn hide_cancel(&self) {
+        self.cancel.set_visible(false);
+    }
+
+    /// Whole-percent progress, which is all an extractor reports.
+    fn set_percent(&self, percent: u8) {
+        self.progress
+            .set_fraction(f64::from(percent.min(100)) / 100.0);
     }
 
     /// Byte-counted progress, used by the wget engine.

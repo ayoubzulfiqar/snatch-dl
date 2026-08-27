@@ -238,6 +238,47 @@ impl SettingsPage {
         });
         group.add(&verify);
 
+        let extract = adw::SwitchRow::builder()
+            .title("Unpack archives when they finish")
+            .subtitle(
+                "Zip, 7z, rar and tar downloads are unpacked into a folder of their own. \
+                 Split sets wait until every part has arrived.",
+            )
+            .active(draft.download.extract_archives)
+            .build();
+        extract.connect_active_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let on = row.is_active();
+                this.edit(&ui, |settings| settings.download.extract_archives = on);
+            }
+        });
+        group.add(&extract);
+
+        let delete_archives = adw::SwitchRow::builder()
+            .title("Delete the archive after unpacking it")
+            .subtitle("Only once the contents are safely out. Off by default.")
+            .active(draft.download.delete_archives_after)
+            .build();
+        delete_archives.connect_active_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let on = row.is_active();
+                this.edit(&ui, |settings| settings.download.delete_archives_after = on);
+            }
+        });
+        // Meaningless on its own, so it follows the switch above it.
+        delete_archives.set_sensitive(draft.download.extract_archives);
+        extract.connect_active_notify({
+            let delete_archives = delete_archives.clone();
+            move |row| delete_archives.set_sensitive(row.is_active())
+        });
+        group.add(&delete_archives);
+
         // This is the ".aria2 file" question, phrased as what it actually costs.
         let resume = adw::SwitchRow::builder()
             .title("Write resume data while downloading")

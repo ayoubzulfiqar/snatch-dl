@@ -31,6 +31,7 @@ pub struct Backend {
     pub wget: Arc<WgetEngine>,
     pub proxies: Arc<ProxyManager>,
     pub media: Arc<MediaQueue>,
+    pub archives: Arc<crate::archive::ArchiveQueue>,
     pub db: Database,
     pub download_dir: PathBuf,
     /// Where Snatch installs tools for itself.
@@ -57,6 +58,7 @@ impl Backend {
         wget: Arc<WgetEngine>,
         proxies: Arc<ProxyManager>,
         media: Arc<MediaQueue>,
+        archives: Arc<crate::archive::ArchiveQueue>,
         db: Database,
         download_dir: PathBuf,
         managed_bin_dir: PathBuf,
@@ -75,6 +77,7 @@ impl Backend {
             wget,
             proxies,
             media,
+            archives,
             db,
             download_dir,
             managed_bin_dir,

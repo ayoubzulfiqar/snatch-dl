@@ -26,10 +26,11 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             libgtk-4-dev libadwaita-1-dev pkg-config
 
-      # ffmpeg is optional at runtime but the processor has an end-to-end test
-      # that exercises the real binary; without it that test skips itself.
+      # Optional at runtime, but the processor and archive tests exercise the
+      # real binaries end to end; without these they skip themselves, which is
+      # worse than it looks — the arguments they build would go unchecked.
       - name: Install test dependencies
-        run: sudo apt-get install --no-install-recommends -y ffmpeg
+        run: sudo apt-get install --no-install-recommends -y ffmpeg p7zip-full
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -129,6 +129,8 @@ pub struct Ui {
     schedule_allowing: std::cell::Cell<Option<bool>>,
     /// Whether anything has run since the last time the queue was empty.
     queue_was_busy: std::cell::Cell<bool>,
+    /// Extractions waiting on a password, so a retry can reuse the job.
+    pending_archives: RefCell<std::collections::HashMap<i64, crate::archive::ArchiveJob>>,
 }
 
 impl Ui {
@@ -359,6 +361,7 @@ impl Ui {
             settings_dirty: std::cell::Cell::new(false),
             schedule_allowing: std::cell::Cell::new(None),
             queue_was_busy: std::cell::Cell::new(false),
+            pending_archives: RefCell::new(std::collections::HashMap::new()),
         });
         ui.install_actions(app);
         ui.scraper.wire(&ui);
@@ -519,7 +522,10 @@ impl Ui {
             || self.backend.gallery.running_count() > 0
             || self.backend.video.running_count() > 0
             || self.backend.wget.running_count() > 0
-            || self.backend.media.outstanding() > 0;
+            || self.backend.media.outstanding() > 0
+            // Suspending the machine part-way through an extraction leaves a
+            // directory of half-written files that looks like a finished one.
+            || self.backend.archives.outstanding() > 0;
 
         if busy {
             self.queue_was_busy.set(true);
@@ -937,6 +943,7 @@ impl Ui {
                 self.downloads.handle_video(self, event);
                 self.refresh_title();
             }
+            UiEvent::Archive(event) => self.handle_archive(event),
             UiEvent::Wget(event) => {
                 self.downloads.handle_wget(self, event);
                 self.refresh_title();
@@ -1520,6 +1527,137 @@ impl Ui {
         if urls.len() > 1 {
             self.toast(&format!("Added {} items", urls.len()));
         }
+    }
+
+    /// Unpack a finished download if it turns out to be an archive.
+    ///
+    /// Called for every completed file, so the cheap "is this even an
+    /// archive" check happens before anything is spawned. A volume set is
+    /// only described by its first part, and an attempt that finds volumes
+    /// missing is a quiet no-op — so a set of five parts triggers five
+    /// attempts and unpacks exactly once, when the last one lands.
+    pub fn extract_if_archive(self: &Rc<Self>, path: std::path::PathBuf) {
+        let settings = self.backend.settings();
+        if !settings.download.extract_archives {
+            return;
+        }
+        let Some(archive) = crate::archive::identify(&path) else {
+            return;
+        };
+
+        let backend = self.backend.clone();
+        let queue = std::sync::Arc::clone(&backend.archives);
+        let job_id = queue.next_job_id();
+        let job = crate::archive::ArchiveJob {
+            archive,
+            password: None,
+            delete_after: settings.download.delete_archives_after,
+        };
+        self.pending_archives
+            .borrow_mut()
+            .insert(job_id, job.clone());
+        backend.spawn(async move {
+            queue.submit(job, job_id).await;
+        });
+    }
+
+    /// Reflect one extraction event in the interface.
+    fn handle_archive(self: &Rc<Self>, event: crate::archive::ArchiveEvent) {
+        use crate::archive::ArchiveEvent;
+        self.downloads.handle_archive(&event);
+        match event {
+            ArchiveEvent::Started {
+                ref name, parts, ..
+            } => {
+                let detail = if parts > 1 {
+                    format!("Unpacking {name} ({parts} parts)")
+                } else {
+                    format!("Unpacking {name}")
+                };
+                self.toast(&detail);
+            }
+            ArchiveEvent::Progress { .. } => {}
+            ArchiveEvent::NeedsPassword { job_id, name } => {
+                self.present_archive_password(job_id, name);
+            }
+            ArchiveEvent::Finished {
+                job_id,
+                destination,
+                removed_parts,
+            } => {
+                self.pending_archives.borrow_mut().remove(&job_id);
+                let folder = destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| destination.display().to_string());
+                let detail = if removed_parts > 0 {
+                    format!("Unpacked into {folder} and removed the archive")
+                } else {
+                    format!("Unpacked into {folder}")
+                };
+                self.toast(&detail);
+                self.notify("Archive unpacked", &detail);
+            }
+            ArchiveEvent::Failed { job_id, error } => {
+                self.pending_archives.borrow_mut().remove(&job_id);
+                self.toast(&format!("Could not unpack it: {error}"));
+            }
+        }
+    }
+
+    /// Ask for the password an encrypted archive needs, then try again.
+    fn present_archive_password(self: &Rc<Self>, job_id: i64, name: String) {
+        let Some(job) = self.pending_archives.borrow().get(&job_id).cloned() else {
+            log::warn!("no pending archive job {job_id}");
+            return;
+        };
+
+        let entry = gtk::PasswordEntry::builder()
+            .placeholder_text("Password")
+            .show_peek_icon(true)
+            .activates_default(true)
+            .build();
+
+        let dialog = adw::AlertDialog::builder()
+            .heading("This archive is locked")
+            .body(format!("{name} needs a password to unpack."))
+            .extra_child(&entry)
+            .build();
+        dialog.add_responses(&[("close", "Skip"), ("unlock", "Unpack")]);
+        dialog.set_response_appearance("unlock", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("unlock"));
+        dialog.set_close_response("close");
+
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            let Some(ui) = weak.upgrade() else { return };
+            if response != "unlock" {
+                // Skipping leaves the archive on disk, untouched.
+                ui.pending_archives.borrow_mut().remove(&job_id);
+                return;
+            }
+            let password = entry.text().to_string();
+            if password.is_empty() {
+                ui.pending_archives.borrow_mut().remove(&job_id);
+                return;
+            }
+            let backend = ui.backend().clone();
+            let queue = std::sync::Arc::clone(&backend.archives);
+            // A wrong password comes back as another NeedsPassword, so the
+            // job stays pending and the user simply gets asked again.
+            let retry = crate::archive::ArchiveJob {
+                password: Some(password),
+                ..job.clone()
+            };
+            ui.pending_archives
+                .borrow_mut()
+                .insert(job_id, retry.clone());
+            backend.spawn(async move {
+                queue.submit(retry, job_id).await;
+            });
+        });
+
+        dialog.present(Some(&self.window));
     }
 
     /// Show what a pattern expanded to before any of it is queued.
