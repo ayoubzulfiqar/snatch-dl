@@ -309,6 +309,13 @@ stage_extensions() {
   mkdir -p "${FIREFOX_EXT_DIR}"
   install -Dm644 "${CHROMIUM_EXT_DIR}/background.js" "${FIREFOX_EXT_DIR}/background.js"
 
+  # Without these the browser shows a letter placeholder instead of the icon.
+  local icon
+  for icon in 16 24 32 48 128; do
+    install -Dm644 "${CHROMIUM_EXT_DIR}/icons/icon-${icon}.png" \
+      "${FIREFOX_EXT_DIR}/icons/icon-${icon}.png"
+  done
+
   # Firefox: event-page background, identified by its gecko id, and without
   # the Chromium key -- Firefox rejects a manifest that carries one.
   compose_manifest "${FIREFOX_EXT_DIR}/manifest.json" "$(cat <<MEMBERS

@@ -1,6 +1,6 @@
 # Maintainer: Ayoub Zulfiqar <contact@ayoubzulfiqar.com>
 pkgname=snatch-dl
-pkgver=2.7.2
+pkgver=2.7.3
 pkgrel=1
 pkgdesc="Download manager for Linux: aria2, BitTorrent, yt-dlp and gallery-dl behind one GTK4 window"
 arch=('x86_64')
@@ -79,4 +79,13 @@ package() {
     "${pkgdir}/usr/share/${pkgname}/extension-firefox/manifest.json"
   install -Dm644 "extension/background.js" \
     "${pkgdir}/usr/share/${pkgname}/extension-firefox/background.js"
+
+  # Without these the browser shows a letter placeholder instead of the icon.
+  local icon
+  for icon in 16 24 32 48 128; do
+    install -Dm644 "extension/icons/icon-${icon}.png" \
+      "${pkgdir}/usr/share/${pkgname}/extension/icons/icon-${icon}.png"
+    install -Dm644 "extension/icons/icon-${icon}.png" \
+      "${pkgdir}/usr/share/${pkgname}/extension-firefox/icons/icon-${icon}.png"
+  done
 }

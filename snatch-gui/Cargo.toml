@@ -102,6 +102,17 @@ assets = [
   # who still has one.
   ["../LICENSE-GPL-3.0.txt", "usr/share/doc/snatch-dl/LICENSE-GPL-3.0.txt", "644"],
   ["../extension/background.js", "usr/share/snatch-dl/extension-firefox/", "644"],
+  # The browser shows a letter placeholder without these.
+  ["../extension/icons/icon-16.png", "usr/share/snatch-dl/extension/icons/", "644"],
+  ["../extension/icons/icon-24.png", "usr/share/snatch-dl/extension/icons/", "644"],
+  ["../extension/icons/icon-32.png", "usr/share/snatch-dl/extension/icons/", "644"],
+  ["../extension/icons/icon-48.png", "usr/share/snatch-dl/extension/icons/", "644"],
+  ["../extension/icons/icon-128.png", "usr/share/snatch-dl/extension/icons/", "644"],
+  ["../extension/icons/icon-16.png", "usr/share/snatch-dl/extension-firefox/icons/", "644"],
+  ["../extension/icons/icon-24.png", "usr/share/snatch-dl/extension-firefox/icons/", "644"],
+  ["../extension/icons/icon-32.png", "usr/share/snatch-dl/extension-firefox/icons/", "644"],
+  ["../extension/icons/icon-48.png", "usr/share/snatch-dl/extension-firefox/icons/", "644"],
+  ["../extension/icons/icon-128.png", "usr/share/snatch-dl/extension-firefox/icons/", "644"],
 ]
 
 # --- Fedora / RHEL / openSUSE ---------------------------------------------
@@ -133,6 +144,16 @@ assets = [
   { source = "../packaging/native-messaging/firefox.json", dest = "/usr/lib/mozilla/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
   { source = "../packaging/extension-firefox/manifest.json", dest = "/usr/share/snatch-dl/extension-firefox/manifest.json", mode = "644" },
   { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension-firefox/background.js", mode = "644" },
+  { source = "../extension/icons/icon-16.png", dest = "/usr/share/snatch-dl/extension/icons/icon-16.png", mode = "644" },
+  { source = "../extension/icons/icon-24.png", dest = "/usr/share/snatch-dl/extension/icons/icon-24.png", mode = "644" },
+  { source = "../extension/icons/icon-32.png", dest = "/usr/share/snatch-dl/extension/icons/icon-32.png", mode = "644" },
+  { source = "../extension/icons/icon-48.png", dest = "/usr/share/snatch-dl/extension/icons/icon-48.png", mode = "644" },
+  { source = "../extension/icons/icon-128.png", dest = "/usr/share/snatch-dl/extension/icons/icon-128.png", mode = "644" },
+  { source = "../extension/icons/icon-16.png", dest = "/usr/share/snatch-dl/extension-firefox/icons/icon-16.png", mode = "644" },
+  { source = "../extension/icons/icon-24.png", dest = "/usr/share/snatch-dl/extension-firefox/icons/icon-24.png", mode = "644" },
+  { source = "../extension/icons/icon-32.png", dest = "/usr/share/snatch-dl/extension-firefox/icons/icon-32.png", mode = "644" },
+  { source = "../extension/icons/icon-48.png", dest = "/usr/share/snatch-dl/extension-firefox/icons/icon-48.png", mode = "644" },
+  { source = "../extension/icons/icon-128.png", dest = "/usr/share/snatch-dl/extension-firefox/icons/icon-128.png", mode = "644" },
 ]
 
 [package.metadata.generate-rpm.requires]

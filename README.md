@@ -51,7 +51,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.7.2</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.7.3</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -62,9 +62,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.7.2-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.7.2-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.7.2-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.7.3-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.7.3-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.7.3-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
