@@ -133,9 +133,45 @@ jobs:
           name: arch-package
           path: "*.pkg.tar.zst"
 
+  # ---------------------------------------------------------------------
+  # Ready-to-load extension builds, so nobody has to dig one out of
+  # /usr/share. One build serves everyone: the manifest pins a public key, so
+  # every install derives the same extension id.
+  # ---------------------------------------------------------------------
+  extension:
+    name: Extension zips
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${VERSION}" = "${GITHUB_REF_NAME}" ]; then
+            VERSION="dev"
+          fi
+          mkdir -p dist/chromium dist/firefox
+
+          cp extension/manifest.json extension/background.js dist/chromium/
+          cp packaging/extension-firefox/manifest.json dist/firefox/
+          cp extension/background.js dist/firefox/
+
+          # Zipped from inside the directory so the manifest sits at the root
+          # of the archive, which is what both browsers expect.
+          (cd dist/chromium && zip -q -r "../snatch-extension-chromium-${VERSION}.zip" .)
+          (cd dist/firefox  && zip -q -r "../snatch-extension-firefox-${VERSION}.zip" .)
+          rm -rf dist/chromium dist/firefox
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-zips
+          path: dist/*
+
   publish:
     name: Attach to the release
-    needs: [deb-rpm, tarball, arch]
+    needs: [deb-rpm, tarball, arch, extension]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

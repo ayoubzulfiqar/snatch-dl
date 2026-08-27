@@ -226,6 +226,13 @@ browser land in Snatch instead of the browser's own download list.
 there is no pairing step and nothing to configure. Load the extension and it
 finds Snatch.
 
+The extension is installed with Snatch, at `/usr/share/snatch-dl/extension`.
+If you would rather have it as a file, every release also publishes
+`snatch-extension-chromium-*.zip` and `snatch-extension-firefox-*.zip`.
+Unzip either one and load the folder — it is the same build for everyone,
+because the manifest pins a public key and every install therefore derives
+the same extension ID.
+
 #### Chrome, Chromium, Brave, Edge, Opera, Vivaldi
 
 1. Open `chrome://extensions`
@@ -236,9 +243,14 @@ finds Snatch.
 
 Pick the **folder itself**, not a file inside it.
 
-The manifest pins a public key, so the extension ID is always
-`nlajonamjkdakodfojdlhbhlbcamjkik` — the same ID the native messaging manifest
-allows. That is why it keeps working across reloads and reinstalls.
+The extension ID is always `nlajonamjkdakodfojdlhbhlbcamjkik` — the same ID
+the native messaging manifest allows — so it keeps working across reloads and
+reinstalls.
+
+> Developer mode is currently the only way to install this in Chrome. Chrome
+> only accepts packaged extensions from the Web Store, and has been tightening
+> what it does with sideloaded ones, so a hosted `.crx` would not help. Getting
+> rid of the developer-mode step means publishing to the Chrome Web Store.
 
 #### Firefox
 
@@ -246,8 +258,10 @@ allows. That is why it keeps working across reloads and reinstalls.
 2. Click **Load Temporary Add-on…**
 3. Choose **`/usr/share/snatch-dl/extension-firefox/manifest.json`**
 
-> Firefox clears temporary add-ons when it restarts. To keep it permanently,
-> sign the extension yourself, or use Developer Edition with
+> **Firefox clears temporary add-ons when it restarts.** Firefox only installs
+> signed extensions, and signing goes through addons.mozilla.org even for an
+> extension you host yourself. Until this one is signed, the choices are to
+> reload it each session, or to use Developer Edition or Nightly with
 > `xpinstall.signatures.required=false`.
 
 Firefox needs its own copy because the two browsers genuinely disagree:
