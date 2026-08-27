@@ -273,6 +273,16 @@ impl Aria2Client {
             _ => {}
         }
 
+        // A download with its own start time joins the queue paused, so it
+        // holds its place and its settings without using bandwidth until the
+        // scheduler unpauses it.
+        if request
+            .start_at
+            .is_some_and(|start_at| start_at > crate::settings::now_unix())
+        {
+            options.insert("pause".to_owned(), json!("true"));
+        }
+
         // Every source for the same file. aria2 spreads its connections
         // across the mirrors and fails over between them, so one slow host
         // does not decide the speed.

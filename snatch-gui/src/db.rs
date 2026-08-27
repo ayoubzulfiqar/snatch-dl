@@ -495,6 +495,66 @@ impl Database {
     }
 
     /// Forget specific entries. Does not touch the files.
+    /// Remember that a download is paused until its own start time.
+    pub async fn schedule_start(&self, gid: String, filename: String, start_at: i64) -> Result<()> {
+        self.with(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO scheduled_starts (gid, filename, start_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(gid) DO UPDATE SET start_at = excluded.start_at",
+                    params![gid, filename, start_at],
+                )
+                .context("could not record the scheduled start")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every scheduled start, soonest first.
+    pub async fn scheduled_starts(&self) -> Result<Vec<(String, String, i64)>> {
+        self.with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT gid, filename, start_at FROM scheduled_starts ORDER BY start_at")
+                .context("could not prepare the schedule query")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("could not read the scheduled starts")?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Forget scheduled starts, by gid.
+    pub async fn unschedule_starts(&self, gids: Vec<String>) -> Result<usize> {
+        if gids.is_empty() {
+            return Ok(0);
+        }
+        self.with(move |connection| {
+            let mut removed = 0;
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction
+                    .prepare("DELETE FROM scheduled_starts WHERE gid = ?1")
+                    .context("could not prepare the delete")?;
+                for gid in gids {
+                    removed += statement.execute(params![gid])?;
+                }
+            }
+            transaction
+                .commit()
+                .context("could not commit the delete")?;
+            Ok(removed)
+        })
+        .await
+    }
+
     pub async fn forget_downloads(&self, ids: Vec<i64>) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -694,6 +754,16 @@ CREATE TABLE IF NOT EXISTS downloads (
 );
 
 CREATE INDEX IF NOT EXISTS downloads_recent ON downloads (finished_at DESC, id DESC);
+
+-- Downloads added paused, waiting for their own start time. Kept here rather
+-- than in memory so a scheduled download survives Snatch being closed: aria2's
+-- session file already brings the paused download back, and this brings back
+-- the reason it is paused.
+CREATE TABLE IF NOT EXISTS scheduled_starts (
+    gid       TEXT    PRIMARY KEY,
+    filename  TEXT    NOT NULL,
+    start_at  INTEGER NOT NULL
+);
 "#;
 
 #[cfg(test)]
@@ -915,5 +985,54 @@ mod history_tests {
         // The row survives even though the file does not, which is what lets
         // the page grey it out instead of losing the record.
         assert!(!history[0].exists());
+    }
+
+    #[tokio::test]
+    async fn scheduled_starts_round_trip_and_clear() {
+        let db = scratch("scheduled").await;
+        db.schedule_start("gid-a".to_owned(), "later.iso".to_owned(), 2_000)
+            .await
+            .expect("schedule a");
+        db.schedule_start("gid-b".to_owned(), "sooner.iso".to_owned(), 1_000)
+            .await
+            .expect("schedule b");
+
+        // Soonest first, so the caller can stop reading once it hits one that
+        // is not due yet.
+        let rows = db.scheduled_starts().await.expect("read");
+        assert_eq!(
+            rows,
+            vec![
+                ("gid-b".to_owned(), "sooner.iso".to_owned(), 1_000),
+                ("gid-a".to_owned(), "later.iso".to_owned(), 2_000),
+            ]
+        );
+
+        // Rescheduling the same download moves it rather than duplicating it.
+        db.schedule_start("gid-b".to_owned(), "sooner.iso".to_owned(), 3_000)
+            .await
+            .expect("reschedule");
+        let rows = db.scheduled_starts().await.expect("read");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "gid-a", "gid-b should have moved to last");
+
+        assert_eq!(
+            db.unschedule_starts(vec!["gid-a".to_owned()])
+                .await
+                .expect("clear"),
+            1
+        );
+        let rows = db.scheduled_starts().await.expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "gid-b");
+
+        // Clearing something already gone is not an error: the user may have
+        // resumed it by hand between the query and the delete.
+        assert_eq!(
+            db.unschedule_starts(vec!["gid-a".to_owned()])
+                .await
+                .expect("clear again"),
+            0
+        );
     }
 }

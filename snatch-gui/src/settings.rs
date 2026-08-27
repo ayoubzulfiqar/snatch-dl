@@ -321,6 +321,44 @@ impl ScheduleSettings {
     }
 }
 
+/// Seconds since the Unix epoch.
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// When the local clock will next read `target` minutes past midnight.
+///
+/// Takes the current time as both an epoch second and the local minute of day
+/// it corresponds to, which keeps the arithmetic pure and testable while
+/// leaving the timezone lookup to the caller — the UI already has glib's
+/// local clock and this module deliberately does not depend on GTK.
+///
+/// A time that has already passed today means tomorrow, which is what a bare
+/// `HH:MM` is understood to mean everywhere else.
+///
+/// The result is exact except across a daylight-saving change, where it can
+/// be an hour out; a download start time is not worth a timezone database to
+/// fix that.
+pub fn next_occurrence(now_unix: i64, now_minute_of_day: u32, target_minute: u32) -> i64 {
+    const DAY: i64 = 24 * 60 * 60;
+    let now_minute = i64::from(now_minute_of_day.min(24 * 60));
+    let target = i64::from(target_minute.min(24 * 60 - 1));
+    let mut delta = (target - now_minute) * 60;
+    if delta <= 0 {
+        delta += DAY;
+    }
+    now_unix + delta
+}
+
+/// `HH:MM` for a Unix time, given the local offset the caller resolved.
+pub fn format_local_hhmm(minute_of_day: u32) -> String {
+    let minute_of_day = minute_of_day % (24 * 60);
+    format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
+}
+
 /// `HH:MM` to minutes since midnight.
 pub fn parse_hhmm(value: &str) -> Option<u32> {
     let (hours, minutes) = value.trim().split_once(':')?;
@@ -749,6 +787,45 @@ mod schedule_tests {
         assert!(schedule.allows(12 * 60));
         // Equal bounds mean the whole day, not zero minutes.
         assert!(window("03:00", "03:00").allows(15 * 60));
+    }
+
+    #[test]
+    fn a_time_still_to_come_today_means_today() {
+        // 14:00 now, asked for 18:00: four hours away.
+        let now = 1_700_000_000;
+        let at = next_occurrence(now, 14 * 60, 18 * 60);
+        assert_eq!(at - now, 4 * 60 * 60);
+    }
+
+    #[test]
+    fn a_time_already_past_means_tomorrow() {
+        // 14:00 now, asked for 09:00: nineteen hours away, not minus five.
+        let now = 1_700_000_000;
+        let at = next_occurrence(now, 14 * 60, 9 * 60);
+        assert_eq!(at - now, 19 * 60 * 60);
+        assert!(at > now, "a scheduled start must never be in the past");
+    }
+
+    #[test]
+    fn the_current_minute_means_this_time_tomorrow() {
+        // Asking for the minute it already is means a whole day, not zero:
+        // "start at 14:00" typed at 14:00 should not fire instantly.
+        let now = 1_700_000_000;
+        assert_eq!(next_occurrence(now, 14 * 60, 14 * 60) - now, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn midnight_wraps_forward() {
+        // 23:30 now, asked for 00:30: half an hour away, across midnight.
+        let now = 1_700_000_000;
+        assert_eq!(next_occurrence(now, 23 * 60 + 30, 30) - now, 60 * 60);
+    }
+
+    #[test]
+    fn a_minute_of_day_formats_back() {
+        assert_eq!(format_local_hhmm(0), "00:00");
+        assert_eq!(format_local_hhmm(9 * 60 + 5), "09:05");
+        assert_eq!(format_local_hhmm(23 * 60 + 59), "23:59");
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Re
     let ui = Ui::new(app, backend);
     ui.window.present();
     ui.load_history();
+    ui.load_scheduled_starts();
 
     // The task owns the only strong reference to `Ui`: it is the application
     // state and lives exactly as long as the event channel.
@@ -64,6 +65,23 @@ pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Re
             ui.handle(event);
         }
     });
+}
+
+/// Minutes past local midnight, right now.
+///
+/// glib owns the timezone lookup; the scheduling arithmetic in `settings` is
+/// kept pure by taking this as an argument.
+fn current_minute_of_day() -> u32 {
+    glib::DateTime::now_local()
+        .map(|now| (now.hour() * 60 + now.minute()) as u32)
+        .unwrap_or(0)
+}
+
+/// Minutes past local midnight for a Unix time.
+fn local_minute_of(unix: i64) -> u32 {
+    glib::DateTime::from_unix_local(unix)
+        .map(|when| (when.hour() * 60 + when.minute()) as u32)
+        .unwrap_or(0)
 }
 
 /// Snatch's stylesheet, layered above the theme so a user override still wins.
@@ -90,6 +108,8 @@ fn install_stylesheet() {
 struct AddExtras {
     credentials: Option<(String, String)>,
     checksum: Option<String>,
+    /// Unix time the download should start at.
+    start_at: Option<i64>,
 }
 
 impl AddExtras {
@@ -100,6 +120,9 @@ impl AddExtras {
         }
         if let Some(checksum) = self.checksum.clone() {
             request.checksum = Some(checksum);
+        }
+        if let Some(start_at) = self.start_at {
+            request.start_at = Some(start_at);
         }
     }
 }
@@ -131,6 +154,8 @@ pub struct Ui {
     queue_was_busy: std::cell::Cell<bool>,
     /// Extractions waiting on a password, so a retry can reuse the job.
     pending_archives: RefCell<std::collections::HashMap<i64, crate::archive::ArchiveJob>>,
+    /// Downloads paused until their own start time: gid to Unix time.
+    scheduled_starts: RefCell<std::collections::HashMap<String, i64>>,
 }
 
 impl Ui {
@@ -362,6 +387,7 @@ impl Ui {
             schedule_allowing: std::cell::Cell::new(None),
             queue_was_busy: std::cell::Cell::new(false),
             pending_archives: RefCell::new(std::collections::HashMap::new()),
+            scheduled_starts: RefCell::new(std::collections::HashMap::new()),
         });
         ui.install_actions(app);
         ui.scraper.wire(&ui);
@@ -462,6 +488,7 @@ impl Ui {
                 return glib::ControlFlow::Break;
             };
             ui.enforce_schedule();
+            ui.release_due_downloads();
             ui.check_queue_drained();
             glib::ControlFlow::Continue
         });
@@ -486,12 +513,22 @@ impl Ui {
 
         let backend = self.backend.clone();
         let weak = Rc::downgrade(self);
+        let still_scheduled: Vec<String> = self.scheduled_starts.borrow().keys().cloned().collect();
         glib::spawn_future_local(async move {
             let client = backend.aria2.clone();
             let result = backend
                 .offload(async move {
                     if allowed {
-                        client.unpause_all().await
+                        client.unpause_all().await?;
+                        // unpauseAll is indiscriminate, so anything waiting
+                        // for its own start time goes straight back to
+                        // paused rather than jumping the queue.
+                        for gid in &still_scheduled {
+                            if let Err(error) = client.pause(gid).await {
+                                log::info!("could not re-pause {gid}: {error:#}");
+                            }
+                        }
+                        Ok(())
                     } else {
                         client.pause_all().await
                     }
@@ -1130,6 +1167,11 @@ impl Ui {
         let name = request.display_name();
         let weak = Rc::downgrade(self);
         let backend = self.backend.clone();
+        // Only meaningful if it is still ahead of us: a time in the past
+        // would leave the download paused forever.
+        let start_at = request
+            .start_at
+            .filter(|start_at| *start_at > crate::settings::now_unix());
 
         glib::spawn_future_local(async move {
             let client = backend.aria2.clone();
@@ -1140,11 +1182,133 @@ impl Ui {
             match result {
                 Ok(gid) => {
                     log::info!("queued '{name}' as gid {gid}");
-                    ui.toast(&format!("Added {name}"));
+                    match start_at {
+                        Some(start_at) => {
+                            ui.remember_scheduled_start(gid, name.clone(), start_at);
+                            ui.toast(&format!(
+                                "{name} will start at {}",
+                                crate::settings::format_local_hhmm(local_minute_of(start_at))
+                            ));
+                        }
+                        None => ui.toast(&format!("Added {name}")),
+                    }
                     ui.select_page(PAGE_DOWNLOADS);
                 }
                 Err(error) => ui.toast(&format!("Could not add {name}: {error:#}")),
             }
+        });
+    }
+
+    /// Record that a download is waiting for its own start time.
+    ///
+    /// Written to the database as well as held in memory: aria2's session file
+    /// brings the paused download back after a restart, and this brings back
+    /// the reason it is paused.
+    fn remember_scheduled_start(self: &Rc<Self>, gid: String, name: String, start_at: i64) {
+        self.scheduled_starts
+            .borrow_mut()
+            .insert(gid.clone(), start_at);
+        let backend = self.backend.clone();
+        backend.clone().spawn(async move {
+            if let Err(error) = backend.db.schedule_start(gid, name, start_at).await {
+                log::warn!("could not record a scheduled start: {error:#}");
+            }
+        });
+    }
+
+    /// Load scheduled starts left over from a previous run.
+    fn load_scheduled_starts(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let backend = self.backend.clone();
+        glib::spawn_future_local(async move {
+            let db = backend.db.clone();
+            let rows = backend
+                .offload(async move { db.scheduled_starts().await })
+                .await;
+            let Some(ui) = weak.upgrade() else { return };
+            match rows {
+                Ok(rows) => {
+                    let mut held = ui.scheduled_starts.borrow_mut();
+                    for (gid, _, start_at) in rows {
+                        held.insert(gid, start_at);
+                    }
+                }
+                Err(error) => log::warn!("could not read scheduled starts: {error:#}"),
+            }
+        });
+    }
+
+    /// The local minute this download is waiting to start at, if it is.
+    pub fn scheduled_minute_for(self: &Rc<Self>, gid: &str) -> Option<u32> {
+        self.scheduled_starts
+            .borrow()
+            .get(gid)
+            .copied()
+            .map(local_minute_of)
+    }
+
+    /// Unpause any download whose start time has arrived.
+    ///
+    /// The database is the source of truth rather than the in-memory map,
+    /// because a scheduled download can also arrive over the IPC socket from
+    /// the browser extension, which never touches this window's state. The
+    /// map is refreshed from the same query and exists only so a row can show
+    /// its start time without a database round trip per repaint.
+    fn release_due_downloads(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let backend = self.backend.clone();
+        glib::spawn_future_local(async move {
+            let db = backend.db.clone();
+            let rows = match backend
+                .offload(async move { db.scheduled_starts().await })
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    log::warn!("could not read scheduled starts: {error:#}");
+                    return;
+                }
+            };
+            let Some(ui) = weak.upgrade() else { return };
+
+            let now = crate::settings::now_unix();
+            let (due, pending): (Vec<_>, Vec<_>) =
+                rows.into_iter().partition(|(_, _, at)| *at <= now);
+
+            {
+                let mut held = ui.scheduled_starts.borrow_mut();
+                held.clear();
+                for (gid, _, start_at) in &pending {
+                    held.insert(gid.clone(), *start_at);
+                }
+            }
+
+            if due.is_empty() {
+                return;
+            }
+            let gids: Vec<String> = due.iter().map(|(gid, _, _)| gid.clone()).collect();
+            let client = backend.aria2.clone();
+            let db = backend.db.clone();
+            let started = gids.clone();
+            let result = backend
+                .offload(async move {
+                    for gid in &started {
+                        // One failure must not strand the rest: a download the
+                        // user already resumed by hand is not an error.
+                        if let Err(error) = client.unpause(gid).await {
+                            log::info!("could not start {gid} on schedule: {error:#}");
+                        }
+                    }
+                    db.unschedule_starts(started).await
+                })
+                .await;
+            if let Err(error) = result {
+                log::warn!("could not clear scheduled starts: {error:#}");
+            }
+            ui.toast(&match due.len() {
+                1 => format!("{} has started", due[0].1),
+                count => format!("{count} scheduled downloads have started"),
+            });
         });
     }
 
@@ -1332,6 +1496,51 @@ impl Ui {
             .child(&checksum_box)
             .build();
 
+        // A start time for this download alone, independent of the global
+        // window in Settings.
+        let start_time = gtk::Entry::builder()
+            .placeholder_text("HH:MM")
+            .max_length(5)
+            .build();
+        let start_status = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["snatch-hint"])
+            .label("Leave empty to start as soon as there is a free slot.")
+            .build();
+        let start_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(4)
+            .build();
+        start_box.append(&start_time);
+        start_box.append(&start_status);
+        let timing = gtk::Expander::builder()
+            .label("Start it later")
+            .child(&start_box)
+            .build();
+
+        // Say which day it lands on, since a time already past means tomorrow.
+        start_time.connect_changed({
+            let status = start_status.clone();
+            move |entry| {
+                let text = entry.text();
+                let text = text.trim();
+                if text.is_empty() {
+                    status.set_label("Leave empty to start as soon as there is a free slot.");
+                    return;
+                }
+                match crate::settings::parse_hhmm(text) {
+                    Some(target) => status.set_label(if target > current_minute_of_day() {
+                        "Starts today. It waits in the queue, paused, until then."
+                    } else {
+                        "That time has passed, so it starts tomorrow."
+                    }),
+                    None => status.set_label("Enter a time as HH:MM, such as 02:30."),
+                }
+            }
+        });
+
         // Say straight away whether what was pasted is usable, rather than
         // failing much later when the download finishes.
         checksum.connect_changed({
@@ -1361,6 +1570,7 @@ impl Ui {
         fields.append(&as_mirrors);
         fields.append(&auth);
         fields.append(&integrity);
+        fields.append(&timing);
 
         let dialog = adw::AlertDialog::builder()
             .heading("Add to Snatch")
@@ -1427,9 +1637,19 @@ impl Ui {
             let text = buffer_text(&buffer);
             let user = username.text().trim().to_owned();
             let digest = checksum.text().trim().to_owned();
+            // A bare HH:MM means the next time the clock reads it, which is
+            // tomorrow if it has already gone by today.
+            let start_at = crate::settings::parse_hhmm(start_time.text().trim()).map(|target| {
+                crate::settings::next_occurrence(
+                    crate::settings::now_unix(),
+                    current_minute_of_day(),
+                    target,
+                )
+            });
             let extras = AddExtras {
                 credentials: (!user.is_empty()).then(|| (user, password.text().to_string())),
                 checksum: (!digest.is_empty()).then_some(digest),
+                start_at,
             };
             ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active(), extras);
         });

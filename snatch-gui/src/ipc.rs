@@ -154,7 +154,23 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
                     backend.wget_events.clone(),
                 )?
                 .to_string(),
-            crate::settings::HttpEngine::Aria2 => backend.aria2.add_uri(&request).await?,
+            crate::settings::HttpEngine::Aria2 => {
+                let gid = backend.aria2.add_uri(&request).await?;
+                // add_uri adds a scheduled download paused. Without the
+                // matching database row nothing would ever start it, so this
+                // path has to record it exactly as the UI does.
+                if let Some(start_at) = request
+                    .start_at
+                    .filter(|start_at| *start_at > crate::settings::now_unix())
+                    && let Err(error) = backend
+                        .db
+                        .schedule_start(gid.clone(), request.display_name(), start_at)
+                        .await
+                {
+                    log::warn!("could not record a scheduled start: {error:#}");
+                }
+                gid
+            }
         },
         JobKind::Magnet => {
             let engine = backend.torrents()?;

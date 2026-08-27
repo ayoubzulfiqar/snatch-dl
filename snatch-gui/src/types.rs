@@ -74,6 +74,10 @@ pub struct DownloadRequest {
     /// of use, so the wire format stays whatever the sender had to hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    /// Unix time this download should start at. Until then it is added
+    /// paused, so it holds its place in the queue without using bandwidth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +169,7 @@ impl DownloadRequest {
             username: None,
             password: None,
             checksum: None,
+            start_at: None,
             mime: None,
             size: None,
             mirrors: Vec::new(),

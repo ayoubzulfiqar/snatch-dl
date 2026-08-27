@@ -155,7 +155,7 @@ impl DownloadsPage {
                     self.list.append(&row.root);
                     row
                 });
-                row.update(download);
+                row.update(download, ui.scheduled_minute_for(&download.gid));
                 self.record_if_finished(ui, download);
 
                 if download.is_active() {
@@ -797,7 +797,7 @@ impl Row {
         })
     }
 
-    fn update(&self, download: &DownloadStatus) {
+    fn update(&self, download: &DownloadStatus, scheduled: Option<u32>) {
         let name = download.display_name();
         self.title.set_text(&name);
         self.title.set_tooltip_text(download.path());
@@ -829,7 +829,16 @@ impl Row {
         } else {
             ("Cancelled", &["snatch-status"], "")
         };
-        self.status.set_text(label);
+        // A download waiting for its own start time is paused as far as aria2
+        // is concerned, but "Paused" alone reads as something the user did and
+        // leaves them wondering why it never resumes.
+        match scheduled.filter(|_| download.is_paused()) {
+            Some(minute) => self.status.set_text(&format!(
+                "Starts {}",
+                crate::settings::format_local_hhmm(minute)
+            )),
+            None => self.status.set_text(label),
+        }
         self.status.set_css_classes(pill);
         self.root.set_css_classes(&["snatch-row", row_state]);
         self.detail.set_text(&detail_line(download));
