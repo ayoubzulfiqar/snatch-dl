@@ -1,0 +1,46 @@
+name: Close pull requests
+
+# Snatch has one maintainer and does not take pull requests. Saying so in a
+# template only helps people who read it before opening one, so this says it
+# again on the pull request itself and closes it.
+#
+# `pull_request_target` runs with write permission even for a fork, which is
+# what lets it comment. It is only safe because nothing here checks out or
+# runs any code from the pull request -- it just calls the API.
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    name: Explain and close
+    runs-on: ubuntu-latest
+    # The maintainer's own branches are how work actually lands, so those are
+    # left alone.
+    if: github.event.pull_request.user.login != github.repository_owner
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          gh pr comment "$PR" --repo "$REPO" --body "Hi @${AUTHOR}, and thanks for this.
+
+          Snatch does not take pull requests. It has one maintainer, and this
+          keeps the review queue at zero. Nothing here is about your code, and
+          I have not read it before closing.
+
+          **Please [open an issue](https://github.com/${REPO}/issues/new/choose) instead.**
+
+          If you already have a fix, paste it into the issue. It will get used
+          and you will be credited.
+
+          You are also free to fork this and ship your own version. It is
+          GPL-3.0-or-later, so you need no permission and do not have to ask."
+
+          gh pr close "$PR" --repo "$REPO"

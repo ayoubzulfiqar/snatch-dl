@@ -1,33 +1,25 @@
-## What does this change?
+## This project does not take pull requests
 
-<!-- One or two sentences. What is different after this? -->
+Thanks for wanting to help. Snatch has one maintainer, and pull requests are
+closed unread. This is not about your code. It is about keeping one person's
+review queue at zero.
 
-## Why?
+**Please [open an issue](https://github.com/ayoubzulfiqar/snatch-dl/issues/new/choose)
+instead.**
 
-<!-- What problem does it fix? Link the issue if there is one, like: Fixes #12 -->
+An issue is more useful here than a patch:
 
-## How did you test it?
+- Found a bug? Say what happened and how to make it happen again. That is
+  usually enough to fix it.
+- Want a feature? Describe the problem you are stuck on. The fix is sometimes
+  not the one you had in mind.
+- Fixed it yourself already? Open an issue and paste your fix in it. It will
+  get used, and you will be credited.
 
-<!-- Tell us what you actually ran or clicked. "It builds" is not testing. -->
+## You can still use the code
 
-## Checks
+Snatch is GPL-3.0-or-later. You may fork it, change it, and share your version.
+You do not need permission and you do not need to ask.
 
-<!-- Tick each box once you have done it. Put an x inside, like [x] -->
-
-- [ ] `cargo fmt --all`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `node --check extension/background.js` passes (only if you changed the extension)
-
-## The rules
-
-<!-- These are in CONTRIBUTING.md. Tick the ones that apply to your change. -->
-
-- [ ] No `.unwrap()`, `.expect()`, `panic!` or `unreachable!` in real code
-- [ ] Nothing blocks the GTK main loop
-- [ ] Any new parser is tested against real output I captured, not guessed
-- [ ] Any new subprocess reads stdout and stderr at the same time
-
-## Anything else?
-
-<!-- Screenshots help a lot for anything you can see. Delete this if empty. -->
+If you build something good on top of it, open an issue and tell me. I would
+like to see it.

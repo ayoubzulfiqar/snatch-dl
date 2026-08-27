@@ -1,10 +1,45 @@
 # Contributing
 
-Thanks for wanting to help. Here is how.
+Thanks for wanting to help.
 
-## Set up
+## Read this first
 
-Install what you need to build:
+**Snatch does not take pull requests.** It has one maintainer. Pull requests
+are closed unread, so please do not spend your time on one.
+
+**Open an issue instead.** That is the way in, and it works well:
+
+- **Found a bug?** [Report it.](https://github.com/ayoubzulfiqar/snatch-dl/issues/new/choose)
+  Say what happened and how to make it happen again. That is usually enough.
+- **Want a feature?** [Ask for it.](https://github.com/ayoubzulfiqar/snatch-dl/issues/new/choose)
+  Describe the problem you are stuck on, not just the fix you had in mind.
+- **Already fixed it?** Open an issue and paste your fix into it. It will get
+  used, and you will be credited.
+
+**Found a security hole?** Do not open an issue. Read [SECURITY.md](SECURITY.md).
+
+## A good bug report
+
+The forms ask for these. Here is why each one matters:
+
+| We ask | Why |
+|---|---|
+| The steps | We cannot fix what we cannot repeat. |
+| Your Snatch version | The bug may already be gone. |
+| Your Linux | Some bugs only happen on one. |
+| What it printed | Run `snatch-gui` in a terminal and copy the output. |
+
+## Fork it if you like
+
+Snatch is GPL-3.0-or-later. You can fork it, change it, and share your
+version. You need no permission and do not have to ask.
+
+Built something on top of it? Open an issue and tell me. I would like to see
+it.
+
+## Building it yourself
+
+Install what you need:
 
 ```bash
 # Fedora
@@ -14,7 +49,7 @@ sudo dnf install aria2 ffmpeg yt-dlp gtk4-devel libadwaita-devel p7zip wget2
 sudo apt install aria2 ffmpeg yt-dlp libgtk-4-dev libadwaita-1-dev p7zip-full wget2
 ```
 
-Then build it:
+Then build:
 
 ```bash
 git clone https://github.com/ayoubzulfiqar/snatch-dl.git
@@ -22,11 +57,9 @@ cd snatch-dl
 cargo build --release
 ```
 
-To install your build for yourself, run `./install.sh`.
+Run `./install.sh` to install your build for yourself.
 
-## Before you open a pull request
-
-Run these four. CI runs the same ones.
+Check your work with the same four commands CI runs:
 
 ```bash
 cargo fmt --all
@@ -35,44 +68,38 @@ cargo test --workspace
 node --check extension/background.js
 ```
 
-Clippy fails on any warning. So a new warning breaks the build.
+Clippy fails on any warning. CI uses the newest stable Rust, so run
+`rustup update stable` if yours is old.
 
-CI uses the newest stable Rust. If yours is older, clippy can pass for you and
-fail there. Run `rustup update stable` first.
+## How the code works
 
-## The rules
-
-These are not style preferences. Each one is here because breaking it caused a
-real bug.
+If you are reading the source, these are the things that will confuse you.
+Each one is here because getting it wrong caused a real bug.
 
 ### Never use `.unwrap()` in real code
 
 Also no `.expect()`, no `panic!`, no `unreachable!`.
 
-Return a `Result` instead. Add a note with `anyhow::Context` so the error says
-what went wrong.
+Return a `Result`. Add a note with `anyhow::Context` so the error says what
+went wrong.
 
 `unwrap_or`, `unwrap_or_else` and `unwrap_or_default` are fine. They cannot
-crash.
-
-Tests may use `.expect()`. Write the message as a sentence.
+crash. Tests may use `.expect()`.
 
 ### Never block the window
 
 Widgets live on the GTK main loop. Every socket, subprocess and web request
 lives on the Tokio runtime.
 
-To cross between them, use `Backend::offload` inside
-`glib::spawn_future_local`. Never use `block_on`.
+Cross between them with `Backend::offload` inside `glib::spawn_future_local`.
+Never use `block_on`. Block the main loop and the window freezes.
 
-Block the main loop and the window freezes.
+### Parsers are written against real output
 
-### Write parsers against real output
+Nobody guesses what a tool prints. You run it, copy what it printed, and put
+those exact lines in the test.
 
-Do not guess what a tool prints. Run it. Copy what it printed. Put those exact
-lines in the test.
-
-Five things in here look wrong but are not:
+Five things look wrong but are not:
 
 - ffmpeg's `out_time_ms` is **microseconds**, not milliseconds. Read it wrong
   and every progress bar jumps to 100%.
@@ -85,23 +112,18 @@ Five things in here look wrong but are not:
   the opposite.** Read both. Reading one meant every failed download reported
   "no output" instead of the reason.
 
-### Read both pipes at once
+### Subprocesses read both pipes at once
 
-When you run a subprocess, read stdout and stderr at the same time.
+Read stdout to the end before touching stderr and the program hangs. The other
+pipe fills up and the program stops, waiting for space.
 
-Read one to the end first and the program hangs. The other pipe fills up and
-the program stops waiting for space.
+Use `tokio::select!` over both, or one reader task each.
 
-Use `tokio::select!` over both, or one reader task each. The existing engines
-show how.
+### Nothing from a web page is trusted
 
-### Trust nothing from a web page
-
-A URL from a browser is not safe. Check it against the list of allowed
-schemes. Cut filenames down to the last part. Strip control characters out of
-headers.
-
-Keep it that way.
+URLs are checked against a list of allowed schemes. Filenames are cut to the
+last part, so `../../etc/passwd` cannot escape. Control characters are stripped
+out of headers.
 
 ## Where things are
 
@@ -120,7 +142,3 @@ run `./install.sh`.
 ## Be kind
 
 Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-
-## Found a security hole?
-
-Do not open an issue. Read [SECURITY.md](SECURITY.md).

@@ -352,7 +352,8 @@ good at it.
 The window and the engines run apart. That is why the window never freezes
 while four downloads are going.
 
-Want to work on it? Read [CONTRIBUTING.md](CONTRIBUTING.md).
+Reading the source? [CONTRIBUTING.md](CONTRIBUTING.md) explains the parts
+that look wrong but are not.
 
 ---
 
@@ -360,10 +361,18 @@ Want to work on it? Read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Found a bug? [Open an issue](https://github.com/ayoubzulfiqar/snatch-dl/issues/new/choose).
 
+Want a feature? [Ask for it.](https://github.com/ayoubzulfiqar/snatch-dl/issues/new/choose)
+
 Found a security hole? Read [SECURITY.md](SECURITY.md) first. Please do not
 open a public issue for that one.
 
-Want to help? Read [CONTRIBUTING.md](CONTRIBUTING.md).
+**Snatch does not take pull requests.** One person maintains it, so they are
+closed unread. Open an issue instead — and if you already have a fix, paste it
+in. It will get used and you will be credited. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+You are free to fork Snatch and ship your own version. It is
+GPL-3.0-or-later, so you need no permission.
 
 Be kind to people here: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
