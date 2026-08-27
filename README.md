@@ -199,8 +199,7 @@ Everything is per-user; nothing is written outside `$HOME` and no step needs
 
 - builds the workspace in release mode,
 - installs `snatch-gui` and `snatch-nmh` to `~/.local/bin`,
-- stages the browser extension into `extension-chromium/` and
-  `extension-firefox/`,
+- generates the Firefox build of the extension into `extension-firefox/`,
 - registers the native messaging host for every browser it finds,
 - installs a desktop entry.
 
@@ -209,21 +208,26 @@ Everything is per-user; nothing is written outside `$HOME` and no step needs
 ### Load the extension
 
 **Chromium / Chrome** — `chrome://extensions` → enable *Developer mode* →
-*Load unpacked* → select the **`extension-chromium/` folder**.
+*Load unpacked* → select the **`extension/` folder itself** (the folder, not a
+file inside it).
 
-The installer generates an RSA key and pins the extension ID, so the ID stays
-the same across reloads and the native messaging manifest keeps matching it.
+`extension/` is the Chromium extension as committed, so this works from a bare
+clone with no build step. Its manifest pins a public key, which fixes the ID at
+`nlajonamjkdakodfojdlhbhlbcamjkik` — the same ID the installer writes into the
+native messaging manifest, so the two keep matching across reloads.
 
 **Firefox** — `about:debugging#/runtime/this-firefox` → *Load Temporary Add-on*
-→ select **`extension-firefox/manifest.json`**.
+→ select **`extension-firefox/manifest.json`**, which `./install.sh` generates.
 
 > Firefox clears temporary add-ons on restart. To keep it, sign the extension
 > or use Developer Edition with `xpinstall.signatures.required=false`.
 
-The two directories are **not interchangeable**: Manifest V3 in Chromium
-requires `background.service_worker` and rejects `background.scripts`, while
-Firefox has no service-worker background and needs `background.scripts`. Both
-are generated from `extension/manifest.base.json`.
+The two are **not interchangeable**, which is why Firefox needs a generated
+copy at all: Manifest V3 in Chromium accepts only `background.service_worker`
+and rejects `background.scripts`, while Firefox has no service-worker
+background and needs `background.scripts`. The installer builds
+`extension-firefox/` by swapping those members and dropping the Chromium key,
+keeping everything else byte-identical to `extension/manifest.json`.
 
 ---
 

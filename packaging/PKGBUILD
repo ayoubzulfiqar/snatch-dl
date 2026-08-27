@@ -54,9 +54,9 @@ package() {
   install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 
-  # The WebExtension source, so a user can load it unpacked.
-  install -Dm644 "extension/manifest.base.json" \
-    "${pkgdir}/usr/share/${pkgname}/extension/manifest.base.json"
+  # The Chromium WebExtension, ready for "Load unpacked".
+  install -Dm644 "extension/manifest.json" \
+    "${pkgdir}/usr/share/${pkgname}/extension/manifest.json"
   install -Dm644 "extension/background.js" \
     "${pkgdir}/usr/share/${pkgname}/extension/background.js"
 }

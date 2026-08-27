@@ -30,17 +30,22 @@ readonly DATA_DIR="${DATA_HOME}/snatch-dl"
 readonly MANAGED_BIN="${DATA_DIR}/bin"
 readonly APPS_DIR="${DATA_HOME}/applications"
 readonly ICONS_DIR="${DATA_HOME}/icons/hicolor"
-# The signing key stays in the data directory: it is a private key and has no
-# business sitting in a source tree that might get committed or pushed.
-readonly KEY_FILE="${DATA_DIR}/chromium-extension-key.pem"
+# extension/ is the Chromium extension, complete and loadable straight from
+# the checkout: its manifest carries both the service worker and the committed
+# public key, so "Load unpacked" needs no install step and always resolves to
+# the id the native messaging host allows.
+readonly CHROMIUM_EXT_DIR="${SOURCE_DIR}/extension"
 
-# The loadable extensions are staged next to the source so browsers can point
-# straight at the checkout.
+# Firefox is the one that has to be generated. The two browsers genuinely
+# disagree and no single manifest satisfies both: Manifest V3 in Chromium
+# accepts only `background.service_worker` and rejects `background.scripts`
+# outright, while Firefox has no service-worker background at all and runs an
+# event page declared with `background.scripts`.
 readonly FIREFOX_EXT_DIR="${SOURCE_DIR}/extension-firefox"
-readonly CHROMIUM_EXT_DIR="${SOURCE_DIR}/extension-chromium"
 
 # Where earlier versions of this script staged them.
 readonly LEGACY_EXT_DIRS=(
+  "${SOURCE_DIR}/extension-chromium"
   "${DATA_DIR}/extension-firefox"
   "${DATA_DIR}/extension-chromium"
 )
@@ -99,8 +104,8 @@ Usage: ./install.sh [OPTIONS]
 
 Installs to:
   ${BIN_DIR}/snatch-gui, ${BIN_DIR}/snatch-nmh
-  ${DATA_DIR}                 (signing key, aria2 session, IPC socket)
-  ${SOURCE_DIR}/extension-firefox, ${SOURCE_DIR}/extension-chromium
+  ${DATA_DIR}                 (aria2 session, history, IPC socket)
+  ${SOURCE_DIR}/extension-firefox  (generated; Chromium loads ${SOURCE_DIR}/extension)
   ${APPS_DIR}/${DESKTOP_FILE_NAME}
   native messaging manifests for every browser detected
 USAGE
@@ -114,18 +119,30 @@ require() {
 # Chromium extension identity
 # ---------------------------------------------------------------------------
 
-# Chromium derives an unpacked extension's ID from its public key. By shipping a
-# fixed "key" in the manifest we get a stable ID, which lets the native
-# messaging manifest name the exact extension allowed to talk to the host.
+# Pull the committed public key out of the Chromium manifest.
+manifest_key() {
+  local manifest="${CHROMIUM_EXT_DIR}/manifest.json"
+  [ -f "${manifest}" ] || die "${manifest} is missing"
+  sed -n 's/^[[:space:]]*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "${manifest}" | head -n 1
+}
+
+# Chromium derives an unpacked extension's id from its public key: the first
+# 16 bytes of the SHA-256 of the DER key, hex-encoded, then mapped a-p. The
+# key is committed, so every install derives the same id and the native
+# messaging manifest can name the exact extension allowed to talk to the host.
 derive_chromium_id() {
   local pubkey_b64="$1"
-  printf '%s' "${pubkey_b64}" \
-    | base64 -d \
-    | openssl dgst -sha256 -binary \
-    | head -c 16 \
-    | od -An -v -t x1 \
-    | tr -d ' \n' \
-    | tr '0-9a-f' 'a-p'
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${pubkey_b64}" | base64 -d | sha256sum | cut -d' ' -f1)"
+  elif command -v openssl >/dev/null 2>&1; then
+    digest="$(printf '%s' "${pubkey_b64}" | base64 -d \
+      | openssl dgst -sha256 -hex | awk '{print $NF}')"
+  else
+    die "neither sha256sum nor openssl is available to derive the extension id"
+  fi
+  printf '%s' "${digest}" | cut -c1-32 | tr '0-9a-f' 'a-p'
 }
 
 # ---------------------------------------------------------------------------
@@ -173,7 +190,8 @@ uninstall() {
 
   step "Removing staged extensions"
   local staged
-  for staged in "${FIREFOX_EXT_DIR}" "${CHROMIUM_EXT_DIR}" "${LEGACY_EXT_DIRS[@]}"; do
+  # Only the generated ones: CHROMIUM_EXT_DIR is the source tree.
+  for staged in "${FIREFOX_EXT_DIR}" "${LEGACY_EXT_DIRS[@]}"; do
     if [ -d "${staged}" ]; then
       rm -rf "${staged}"
       info "removed ${staged}"
@@ -181,7 +199,7 @@ uninstall() {
   done
 
   printf '\n%sSnatch has been uninstalled.%s\n' "${GREEN}" "${RESET}"
-  note "Kept ${DATA_DIR} (aria2 session and the Chromium signing key)."
+  note "Kept ${DATA_DIR} (aria2 session, download history and settings)."
   note "Delete it with: rm -rf '${DATA_DIR}'"
   note "Remove the extension from your browser by hand."
 }
@@ -248,34 +266,30 @@ refresh_desktop_database() {
   fi
 }
 
-# Build one manifest by inserting browser-specific members after the opening
-# brace of the shared base.
-#
-# The two browsers genuinely disagree here and no single manifest satisfies
-# both: Manifest V3 in Chromium accepts only `background.service_worker` and
-# rejects `background.scripts` outright, while Firefox has no service-worker
-# background at all and runs an event page declared with `background.scripts`.
+# Build the Firefox manifest from the Chromium one by swapping the members
+# that precede "manifest_version" -- exactly the browser-specific ones -- and
+# keeping the shared tail verbatim, so the two can never drift apart.
 compose_manifest() {
   local target="$1" members="$2"
-  local base="${SOURCE_DIR}/extension/manifest.base.json"
+  local base="${CHROMIUM_EXT_DIR}/manifest.json"
+  local shared
 
   [ -f "${base}" ] || die "${base} is missing"
-  head -n 1 "${base}" | grep -q '^{[[:space:]]*$' \
-    || die "${base} must begin with a line containing only '{'"
+  shared="$(grep -n '^[[:space:]]*"manifest_version"' "${base}" | head -n 1 | cut -d: -f1)"
+  [ -n "${shared}" ] || die "${base} has no \"manifest_version\" line to split on"
 
   {
     printf '{\n'
     printf '%s\n' "${members}"
-    tail -n +2 "${base}"
+    tail -n "+${shared}" "${base}"
   } > "${target}"
   chmod 644 "${target}"
 }
 
 stage_extensions() {
-  local pubkey_b64="$1"
   local legacy
 
-  # Clean up the old location if a previous run used it.
+  # Clean up locations earlier versions of this script wrote to.
   for legacy in "${LEGACY_EXT_DIRS[@]}"; do
     if [ -d "${legacy}" ]; then
       rm -rf "${legacy}"
@@ -283,13 +297,13 @@ stage_extensions() {
     fi
   done
 
-  rm -rf "${FIREFOX_EXT_DIR}" "${CHROMIUM_EXT_DIR}"
-  mkdir -p "${FIREFOX_EXT_DIR}" "${CHROMIUM_EXT_DIR}"
+  # Chromium needs nothing staged: extension/ is already the real thing.
+  rm -rf "${FIREFOX_EXT_DIR}"
+  mkdir -p "${FIREFOX_EXT_DIR}"
+  install -Dm644 "${CHROMIUM_EXT_DIR}/background.js" "${FIREFOX_EXT_DIR}/background.js"
 
-  install -Dm644 "${SOURCE_DIR}/extension/background.js" "${FIREFOX_EXT_DIR}/background.js"
-  install -Dm644 "${SOURCE_DIR}/extension/background.js" "${CHROMIUM_EXT_DIR}/background.js"
-
-  # Firefox: event-page background, identified by its gecko id.
+  # Firefox: event-page background, identified by its gecko id, and without
+  # the Chromium key -- Firefox rejects a manifest that carries one.
   compose_manifest "${FIREFOX_EXT_DIR}/manifest.json" "$(cat <<MEMBERS
   "background": {
     "scripts": [
@@ -305,19 +319,8 @@ stage_extensions() {
 MEMBERS
   )"
 
-  # Chromium: service-worker background, plus the pinned public key so the
-  # extension id stays stable and matches the native messaging manifest.
-  compose_manifest "${CHROMIUM_EXT_DIR}/manifest.json" "$(cat <<MEMBERS
-  "key": "${pubkey_b64}",
-  "background": {
-    "service_worker": "background.js"
-  },
-MEMBERS
-  )"
-
   verify_manifests
   info "staged ${FIREFOX_EXT_DIR}"
-  info "staged ${CHROMIUM_EXT_DIR}"
 }
 
 # Catch the mistakes that only surface as a browser load error.
@@ -325,10 +328,11 @@ verify_manifests() {
   local chromium="${CHROMIUM_EXT_DIR}/manifest.json"
   local firefox="${FIREFOX_EXT_DIR}/manifest.json"
 
-  grep -q '"key"' "${chromium}" || die "the Chromium manifest lost its signing key"
+  grep -q '"key"' "${chromium}" || die "the Chromium manifest lost its public key"
   grep -q '"service_worker"' "${chromium}" \
     || die "the Chromium manifest has no service_worker background"
   grep -q '"scripts"' "${firefox}" || die "the Firefox manifest has no background scripts"
+  grep -q '"gecko"' "${firefox}" || die "the Firefox manifest has no gecko id"
 
   if grep -q '"scripts"' "${chromium}"; then
     die "the Chromium manifest uses background.scripts, which Manifest V3 rejects"
@@ -603,9 +607,7 @@ main() {
     shift
   done
 
-  require openssl
   require base64
-  require od
   require awk
   require install
 
@@ -627,25 +629,17 @@ main() {
   chmod 700 "${DATA_DIR}"
   info "ready"
 
-  step "Preparing the Chromium extension identity"
-  if [ ! -f "${KEY_FILE}" ]; then
-    openssl genrsa -out "${KEY_FILE}" 2048 >/dev/null 2>&1 \
-      || die "openssl could not generate the extension signing key"
-    chmod 600 "${KEY_FILE}"
-    info "generated ${KEY_FILE}"
-  else
-    info "reusing ${KEY_FILE}"
-  fi
-
+  step "Resolving the Chromium extension identity"
   local pubkey_b64 chromium_id
-  pubkey_b64="$(openssl rsa -in "${KEY_FILE}" -pubout -outform DER 2>/dev/null | base64 | tr -d '\n')"
-  [ -n "${pubkey_b64}" ] || die "could not read the public key from ${KEY_FILE}"
+  pubkey_b64="$(manifest_key)"
+  [ -n "${pubkey_b64}" ] \
+    || die "${CHROMIUM_EXT_DIR}/manifest.json has no \"key\" member"
   chromium_id="$(derive_chromium_id "${pubkey_b64}")"
   [ ${#chromium_id} -eq 32 ] || die "derived an invalid Chromium extension id: ${chromium_id}"
   info "extension id: ${chromium_id}"
 
-  step "Staging the WebExtension"
-  stage_extensions "${pubkey_b64}"
+  step "Staging the Firefox WebExtension"
+  stage_extensions
 
   step "Registering the native messaging host"
   register_hosts "${chromium_id}"
@@ -683,10 +677,12 @@ ${BOLD}Load the extension${RESET}
             to keep it permanently)${RESET}
 
   Chromium  chrome://extensions
-            Enable "Developer mode", then "Load unpacked" and pick
+            Enable "Developer mode", then "Load unpacked" and pick the
+            ${BOLD}folder${RESET}
             ${CHROMIUM_EXT_DIR}
-            ${DIM}The id is pinned to ${chromium_id}, so the native host
-            keeps working across reloads.${RESET}
+            ${DIM}Pick the folder itself, not a file inside it. The id is
+            pinned to ${chromium_id} by the committed key, so the
+            native host keeps working across reloads.${RESET}
 
 ${BOLD}Try it${RESET}
 

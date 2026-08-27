@@ -46,10 +46,48 @@ jobs:
       - name: Tests
         run: cargo test --workspace --release
 
-      - name: Extension syntax
+      - name: Extension
         run: |
           node --check extension/background.js
-          python3 -c "import json; json.load(open('extension/manifest.base.json'))"
+          python3 - <<'CHECK'
+          import base64, hashlib, json, pathlib, re, sys
+
+          path = pathlib.Path("extension/manifest.json")
+          raw = path.read_text()
+          manifest = json.loads(raw)
+          problems = []
+
+          # extension/ is loaded straight from the checkout with "Load
+          # unpacked", so a missing member here is a silently broken
+          # extension: it installs, shows as enabled, and does nothing.
+          if manifest.get("manifest_version") != 3:
+              problems.append("manifest_version must be 3")
+          worker = manifest.get("background", {}).get("service_worker")
+          if worker != "background.js":
+              problems.append("background.service_worker must be background.js")
+          if "scripts" in manifest.get("background", {}):
+              problems.append("background.scripts is Firefox-only and Manifest V3 rejects it")
+
+          # install.sh derives the Firefox manifest by replacing everything
+          # above this line, and derives the extension id from the key.
+          if not re.search(r'^\s*"manifest_version"', raw, re.M):
+              problems.append('"manifest_version" must start its own line')
+          key = manifest.get("key")
+          if not key:
+              problems.append('"key" is missing, so the id would not be stable')
+          else:
+              digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+              ident = "".join(chr(ord("a") + int(c, 16)) for c in digest)
+              print(f"extension id: {ident}")
+
+          version = re.search(r'^version = "([^"]+)"', pathlib.Path("Cargo.toml").read_text(), re.M)
+          if version and manifest.get("version") != version.group(1):
+              problems.append(f"version {manifest.get('version')} != Cargo.toml {version.group(1)}")
+
+          if problems:
+              sys.exit("extension/manifest.json: " + "; ".join(problems))
+          print("extension/manifest.json is loadable in Chromium")
+          CHECK
 
       - name: Installer syntax
         run: bash -n install.sh

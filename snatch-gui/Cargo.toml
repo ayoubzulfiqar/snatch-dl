@@ -83,7 +83,7 @@ assets = [
   ["../assets/icons/com.snatch.dl-128.png", "usr/share/icons/hicolor/128x128/apps/com.snatch.dl.png", "644"],
   ["../assets/icons/com.snatch.dl-256.png", "usr/share/icons/hicolor/256x256/apps/com.snatch.dl.png", "644"],
   ["../assets/icons/com.snatch.dl-512.png", "usr/share/icons/hicolor/512x512/apps/com.snatch.dl.png", "644"],
-  ["../extension/manifest.base.json", "usr/share/snatch-dl/extension/", "644"],
+  ["../extension/manifest.json", "usr/share/snatch-dl/extension/", "644"],
   ["../extension/background.js", "usr/share/snatch-dl/extension/", "644"],
 ]
 
@@ -108,7 +108,7 @@ assets = [
   { source = "../assets/icons/com.snatch.dl-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/com.snatch.dl.png", mode = "644" },
   { source = "../assets/icons/com.snatch.dl-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/com.snatch.dl.png", mode = "644" },
   { source = "../assets/icons/com.snatch.dl-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/com.snatch.dl.png", mode = "644" },
-  { source = "../extension/manifest.base.json", dest = "/usr/share/snatch-dl/extension/manifest.base.json", mode = "644" },
+  { source = "../extension/manifest.json", dest = "/usr/share/snatch-dl/extension/manifest.json", mode = "644" },
   { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension/background.js", mode = "644" },
 ]
 
