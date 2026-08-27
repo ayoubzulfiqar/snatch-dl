@@ -1168,6 +1168,36 @@ impl Ui {
             .active(false)
             .build();
 
+        // Most downloads need no credentials, so the fields stay folded away
+        // until asked for rather than cluttering every add.
+        let username = gtk::Entry::builder()
+            .placeholder_text("Username")
+            .input_purpose(gtk::InputPurpose::FreeForm)
+            .build();
+        let password = gtk::PasswordEntry::builder()
+            .placeholder_text("Password")
+            .show_peek_icon(true)
+            .build();
+        let credentials = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(4)
+            .build();
+        credentials.append(&username);
+        credentials.append(&password);
+        credentials.append(
+            &gtk::Label::builder()
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["snatch-hint"])
+                .label("Used for this download only. Nothing is saved to disk.")
+                .build(),
+        );
+        let auth = gtk::Expander::builder()
+            .label("Sign in to the server")
+            .child(&credentials)
+            .build();
+
         let fields = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -1176,6 +1206,7 @@ impl Ui {
         fields.append(&hint);
         fields.append(&kinds);
         fields.append(&as_mirrors);
+        fields.append(&auth);
 
         let dialog = adw::AlertDialog::builder()
             .heading("Add to Snatch")
@@ -1229,19 +1260,33 @@ impl Ui {
             }
             let Some(ui) = weak.upgrade() else { return };
             let text = buffer_text(&buffer);
-            ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active());
+            let user = username.text().trim().to_owned();
+            let credentials = (!user.is_empty()).then(|| (user, password.text().to_string()));
+            ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active(), credentials);
         });
 
         dialog.present(Some(&self.window));
     }
 
     /// Turn whatever was typed into one or more jobs.
-    fn add_from_text(self: &Rc<Self>, text: &str, kind_choice: u32, as_mirrors: bool) {
+    fn add_from_text(
+        self: &Rc<Self>,
+        text: &str,
+        kind_choice: u32,
+        as_mirrors: bool,
+        credentials: Option<(String, String)>,
+    ) {
         // A pasted cURL command carries its own credentials, so it bypasses
         // the kind selector entirely.
         if crate::curl::looks_like_curl(text) {
             match crate::curl::parse(text) {
-                Ok(request) => {
+                Ok(mut request) => {
+                    // Typed credentials still win: the user filled the fields
+                    // in after pasting, which only makes sense as an override.
+                    if let Some((user, password)) = credentials {
+                        request.username = Some(user);
+                        request.password = Some(password);
+                    }
                     let name = request.display_name();
                     self.enqueue(request);
                     self.toast(&format!("Imported {name} from the cURL command"));
@@ -1264,7 +1309,7 @@ impl Ui {
         };
 
         let build = |url: String| -> DownloadRequest {
-            match kind_choice {
+            let mut request = match kind_choice {
                 1 => DownloadRequest::from_url(url),
                 2 => DownloadRequest::magnet(url),
                 3 => DownloadRequest::scrape(url),
@@ -1272,7 +1317,12 @@ impl Ui {
                 5 => DownloadRequest::sniff(url),
                 // 0: let `inferred_kind` decide from the scheme.
                 _ => DownloadRequest::from_url(url),
+            };
+            if let Some((user, password)) = credentials.clone() {
+                request.username = Some(user);
+                request.password = Some(password);
             }
+            request
         };
 
         if as_mirrors && !rest.is_empty() {

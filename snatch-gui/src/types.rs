@@ -61,6 +61,14 @@ pub struct DownloadRequest {
     pub referer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// HTTP Basic or FTP username for a link that asks for one.
+    ///
+    /// Deliberately never persisted: it lives on the request only long enough
+    /// to reach the engine, so nothing writes a password to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +92,20 @@ impl DownloadRequest {
             }
         }
         sources
+    }
+
+    /// The username and password to authenticate with, if one was given.
+    ///
+    /// A username is required, a password is not: anonymous FTP and a few
+    /// HTTP endpoints take an empty one, and refusing that would block a
+    /// working case for no reason.
+    pub fn credentials(&self) -> Option<(String, String)> {
+        let user = self.username.as_deref().map(str::trim).unwrap_or_default();
+        if user.is_empty() {
+            return None;
+        }
+        let password = self.password.clone().unwrap_or_default();
+        Some((user.to_owned(), password))
     }
 
     /// A magnet link, for the torrent engine.
@@ -135,6 +157,8 @@ impl DownloadRequest {
             cookies: None,
             referer: None,
             user_agent: None,
+            username: None,
+            password: None,
             mime: None,
             size: None,
             mirrors: Vec::new(),

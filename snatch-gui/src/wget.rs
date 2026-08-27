@@ -35,6 +35,87 @@ use crate::types::DownloadRequest;
 /// How often the on-disk size is sampled.
 const POLL: Duration = Duration::from_millis(500);
 
+/// The host a `.netrc` entry keys on: no userinfo, no port.
+fn host_from_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    parsed.host_str().map(str::to_ascii_lowercase)
+}
+
+/// A short-lived `.netrc` holding one machine's credentials.
+///
+/// wget takes `--user` and `--password` on the command line, where any user on
+/// the machine can read them out of `ps`. A netrc file readable only by its
+/// owner does not have that problem, so the password goes there instead and
+/// the file is removed as soon as the download ends.
+#[derive(Debug)]
+struct NetrcFile(PathBuf);
+
+/// One netrc token, always quoted.
+///
+/// Wget2's parser takes a double-quoted value with `\` and `"` backslash
+/// escaped — verified against wget2 2.2.1 rather than assumed. Quoting
+/// unconditionally is what makes a password containing a space work at all:
+/// unquoted, the parser stops at the space and the rest becomes stray tokens
+/// that a crafted value could turn into a second `machine` entry.
+fn quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        if character == '\\' || character == '"' {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+    out
+}
+
+impl NetrcFile {
+    fn create(job_id: i64, host: &str, user: &str, password: &str) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = crate::paths::data_dir()?.join(format!("netrc-{job_id}"));
+        // Stale file from a previous run that died before its cleanup.
+        let _ = std::fs::remove_file(&path);
+        // A line break would end the entry and let the rest of the value be
+        // read as a second `machine` block for a host we never intended.
+        // Nothing legitimate needs one, so refuse rather than mangle.
+        if [host, user, password]
+            .iter()
+            .any(|value| value.contains(['\r', '\n']))
+        {
+            bail!("credentials cannot contain a line break");
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("could not create {}", path.display()))?;
+        writeln!(
+            file,
+            "machine {} login {} password {}",
+            quote(host),
+            quote(user),
+            quote(password)
+        )
+        .context("could not write the credentials file")?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for NetrcFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn wget_binary() -> String {
     std::env::var("SNATCH_WGET")
         .ok()
@@ -270,6 +351,35 @@ impl WgetEngine {
             command.env("https_proxy", proxy.url());
         }
 
+        // Bound, not discarded: dropping it deletes the file, so it has to
+        // outlive the child process.
+        let _netrc = match request.credentials() {
+            Some((user, password)) => match host_from_url(&request.url) {
+                Some(host) if flavour == Flavour::Wget2 => {
+                    let file = NetrcFile::create(job_id, &host, &user, &password)?;
+                    command.arg("--netrc").arg("--netrc-file").arg(file.path());
+                    Some(file)
+                }
+                Some(_) => {
+                    // Classic wget has no --netrc-file, so there is nowhere to
+                    // put the password except argv. Say so rather than doing
+                    // it silently.
+                    log::warn!(
+                        "classic wget cannot read a private credentials file; \
+                         the password will be visible in the process list"
+                    );
+                    command
+                        .arg("--user")
+                        .arg(&user)
+                        .arg("--password")
+                        .arg(&password);
+                    None
+                }
+                None => bail!("the URL has no host to authenticate against"),
+            },
+            None => None,
+        };
+
         command
             .arg("--")
             .arg(request.url.trim())
@@ -465,5 +575,89 @@ mod tests {
     fn header_values_cannot_carry_a_line_break() {
         assert_eq!(sanitise_header("a=b\r\nX-Evil: 1"), "a=bX-Evil: 1");
         assert_eq!(sanitise_header("plain"), "plain");
+    }
+
+    #[test]
+    fn netrc_keys_on_the_bare_host() {
+        // Port and userinfo must not reach the netrc entry: it matches on
+        // neither, so leaving them in would silently stop it applying.
+        assert_eq!(
+            host_from_url("https://files.example.com:8443/a/b.iso").as_deref(),
+            Some("files.example.com")
+        );
+        assert_eq!(
+            host_from_url("ftp://someone@ftp.example.com/pub/f").as_deref(),
+            Some("ftp.example.com")
+        );
+        assert_eq!(
+            host_from_url("https://EXAMPLE.com/f").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(host_from_url("not a url").as_deref(), None);
+    }
+
+    #[test]
+    fn the_credentials_file_is_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = {
+            let netrc = NetrcFile::create(987_654, "example.com", "alice", "s3cret")
+                .expect("the credentials file is created");
+            let path = netrc.path().to_path_buf();
+
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            // Nobody but the owner: this is the whole point of the file.
+            assert_eq!(mode & 0o077, 0, "mode was {:o}", mode);
+
+            let body = std::fs::read_to_string(&path).expect("read");
+            assert_eq!(
+                body.trim(),
+                r#"machine "example.com" login "alice" password "s3cret""#
+            );
+            path
+        };
+
+        // Dropping it takes the password off disk.
+        assert!(!path.exists(), "the credentials file outlived its guard");
+    }
+
+    #[test]
+    fn a_password_may_contain_spaces_quotes_and_backslashes() {
+        // Quoting is what makes these work; the escapes match what wget2
+        // 2.2.1 actually accepts.
+        assert_eq!(quote("pa ss word"), r#""pa ss word""#);
+        assert_eq!(quote(r#"pa"ss"#), r#""pa\"ss""#);
+        assert_eq!(quote(r"pa\ss"), r#""pa\\ss""#);
+        assert_eq!(quote("simple"), r#""simple""#);
+    }
+
+    #[test]
+    fn a_crafted_password_cannot_forge_a_second_entry() {
+        // Quoted and escaped, the whole value stays one token, so the
+        // injected keywords are read as part of the password.
+        let netrc = NetrcFile::create(
+            987_655,
+            "example.com",
+            "alice",
+            r#"x" machine evil.test login root password "hunter2"#,
+        )
+        .expect("created");
+        let body = std::fs::read_to_string(netrc.path()).expect("read");
+        // The quote that would have closed the value is escaped, so the
+        // injected keywords stay inside the password and no second `machine`
+        // entry exists.
+        assert_eq!(
+            body.trim(),
+            r#"machine "example.com" login "alice" password "x\" machine evil.test login root password \"hunter2""#
+        );
+        assert_eq!(body.lines().count(), 1, "got: {body:?}");
+    }
+
+    #[test]
+    fn a_line_break_in_a_credential_is_refused() {
+        // The one thing quoting cannot contain.
+        let error = NetrcFile::create(987_656, "example.com", "alice", "a\nmachine evil.test")
+            .expect_err("a line break must be refused");
+        assert!(error.to_string().contains("line break"), "got: {error}");
     }
 }

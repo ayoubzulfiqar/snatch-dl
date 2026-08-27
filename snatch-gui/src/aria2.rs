@@ -240,6 +240,24 @@ impl Aria2Client {
             options.insert("header".to_owned(), json!([format!("Cookie: {cookies}")]));
         }
 
+        // Credentials go through the RPC options rather than aria2's command
+        // line, so a password never appears in `ps` output. aria2 keys them by
+        // protocol, so the scheme decides which pair to set.
+        if let Some((user, password)) = request.credentials() {
+            let (user_key, password_key) = if request
+                .url
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("ftp")
+            {
+                ("ftp-user", "ftp-passwd")
+            } else {
+                ("http-user", "http-passwd")
+            };
+            options.insert(user_key.to_owned(), json!(user));
+            options.insert(password_key.to_owned(), json!(password));
+        }
+
         // Every source for the same file. aria2 spreads its connections
         // across the mirrors and fails over between them, so one slow host
         // does not decide the speed.

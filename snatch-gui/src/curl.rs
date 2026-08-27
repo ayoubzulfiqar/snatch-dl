@@ -33,6 +33,8 @@ pub fn parse(command: &str) -> Result<DownloadRequest> {
     let mut cookies: Option<String> = None;
     let mut user_agent: Option<String> = None;
     let mut referer: Option<String> = None;
+    let mut username: Option<String> = None;
+    let mut password: Option<String> = None;
 
     let mut index = 1;
     while index < tokens.len() {
@@ -79,12 +81,25 @@ pub fn parse(command: &str) -> Result<DownloadRequest> {
                     url = Some(value);
                 }
             }
+            // `-u user:password`. The password may itself contain a colon, so
+            // only the first one separates the two.
+            "-u" | "--user" => {
+                if let Some(value) = take(&mut index) {
+                    let (name, secret) = value
+                        .split_once(':')
+                        .map_or((value.as_str(), ""), |(n, s)| (n, s));
+                    if !name.is_empty() {
+                        username = Some(name.to_owned());
+                        password = Some(secret.to_owned());
+                    }
+                }
+            }
             // Flags that take a value we do not need, but whose argument must
             // not be mistaken for the URL.
             "-X" | "--request" | "-d" | "--data" | "--data-raw" | "--data-binary"
-            | "--data-urlencode" | "-o" | "--output" | "-u" | "--user" | "--proxy" | "-x"
-            | "--connect-timeout" | "--max-time" | "-m" | "--retry" | "-w" | "--write-out"
-            | "-T" | "--upload-file" | "-F" | "--form" | "--cookie-jar" | "-c" => {
+            | "--data-urlencode" | "-o" | "--output" | "--proxy" | "-x" | "--connect-timeout"
+            | "--max-time" | "-m" | "--retry" | "-w" | "--write-out" | "-T" | "--upload-file"
+            | "-F" | "--form" | "--cookie-jar" | "-c" => {
                 let _ = take(&mut index);
             }
             other if other.starts_with('-') => {
@@ -121,6 +136,8 @@ pub fn parse(command: &str) -> Result<DownloadRequest> {
     request.cookies = cookies.filter(|value| !value.trim().is_empty());
     request.user_agent = user_agent.filter(|value| !value.trim().is_empty());
     request.referer = referer.filter(|value| !value.trim().is_empty());
+    request.username = username.filter(|value| !value.trim().is_empty());
+    request.password = password;
     request.validate()?;
     Ok(request)
 }
@@ -294,6 +311,43 @@ mod tests {
         assert!(parse("curl -H 'a: b'").is_err());
         // A scheme no engine can fetch.
         assert!(parse("curl 'file:///etc/passwd'").is_err());
+    }
+
+    #[test]
+    fn credentials_come_from_the_user_flag() {
+        let request = parse("curl -u alice:s3cret https://x.test/private.bin").expect("parses");
+        assert_eq!(request.url, "https://x.test/private.bin");
+        assert_eq!(request.username.as_deref(), Some("alice"));
+        assert_eq!(request.password.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn a_password_may_contain_a_colon() {
+        // Only the first colon separates the pair, or a password like a URL
+        // would be truncated at its scheme.
+        let request = parse("curl --user 'bob:pa:ss:word' https://x.test/f").expect("parses");
+        assert_eq!(request.username.as_deref(), Some("bob"));
+        assert_eq!(request.password.as_deref(), Some("pa:ss:word"));
+    }
+
+    #[test]
+    fn a_username_with_no_password_is_accepted() {
+        // Anonymous FTP and a few HTTP endpoints take an empty password.
+        let request = parse("curl -u anonymous ftp://x.test/pub/f").expect("parses");
+        assert_eq!(request.username.as_deref(), Some("anonymous"));
+        assert_eq!(request.password.as_deref(), Some(""));
+        assert_eq!(
+            request.credentials(),
+            Some(("anonymous".to_owned(), String::new()))
+        );
+    }
+
+    #[test]
+    fn the_user_flag_no_longer_swallows_the_url() {
+        // -u used to be discarded along with its argument; the URL still has
+        // to survive that.
+        let request = parse("curl -u a:b -X POST https://x.test/real").expect("parses");
+        assert_eq!(request.url, "https://x.test/real");
     }
 
     #[test]
