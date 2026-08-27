@@ -4,7 +4,7 @@ description = "GTK4/libadwaita front-end and aria2 orchestrator for Snatch"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -56,7 +56,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", 
 [package.metadata.deb]
 name = "snatch-dl"
 maintainer = "Ayoub Zulfiqar <ayoubzulfiqar3@gmail.com>"
-copyright = "2026, Snatch contributors"
+copyright = "2026, Ayoub Zulfiqar"
 license-file = ["../LICENSE", "0"]
 extended-description = """\
 Snatch is a download manager for Linux. HTTP and FTP transfers run through \
@@ -98,6 +98,9 @@ assets = [
   # Firefox needs its own manifest -- Manifest V3 there has no service worker
   # -- but the same background script, installed from the one source copy.
   ["../packaging/extension-firefox/manifest.json", "usr/share/snatch-dl/extension-firefox/", "644"],
+  # The licence the older, GPL-covered releases were under, kept for anyone
+  # who still has one.
+  ["../LICENSE-GPL-3.0.txt", "usr/share/doc/snatch-dl/LICENSE-GPL-3.0.txt", "644"],
   ["../extension/background.js", "usr/share/snatch-dl/extension-firefox/", "644"],
 ]
 
@@ -106,12 +109,13 @@ assets = [
 [package.metadata.generate-rpm]
 name = "snatch-dl"
 summary = "Download manager for Linux with aria2, BitTorrent, yt-dlp and gallery-dl"
-license = "GPL-3.0-or-later"
+license = "LicenseRef-Snatch-Source-Available-1.0"
 assets = [
   { source = "../target/release/snatch-gui", dest = "/usr/bin/snatch-gui", mode = "755" },
   { source = "../target/release/snatch-nmh", dest = "/usr/bin/snatch-nmh", mode = "755" },
   { source = "../packaging/com.snatch.dl.desktop", dest = "/usr/share/applications/com.snatch.dl.desktop", mode = "644" },
   { source = "../LICENSE", dest = "/usr/share/licenses/snatch-dl/LICENSE", mode = "644", doc = true },
+  { source = "../LICENSE-GPL-3.0.txt", dest = "/usr/share/licenses/snatch-dl/LICENSE-GPL-3.0.txt", mode = "644", doc = true },
   { source = "../README.md", dest = "/usr/share/doc/snatch-dl/README.md", mode = "644", doc = true },
   { source = "../assets/icons/com.snatch.dl-16.png", dest = "/usr/share/icons/hicolor/16x16/apps/com.snatch.dl.png", mode = "644" },
   { source = "../assets/icons/com.snatch.dl-24.png", dest = "/usr/share/icons/hicolor/24x24/apps/com.snatch.dl.png", mode = "644" },

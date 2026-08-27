@@ -51,7 +51,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.6.9</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.7.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -62,9 +62,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.6.9-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.6.9-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.6.9-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.7.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.7.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.7.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -371,8 +371,8 @@ closed unread. Open an issue instead — and if you already have a fix, paste it
 in. It will get used and you will be credited. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-You are free to fork Snatch and ship your own version. It is
-GPL-3.0-or-later, so you need no permission.
+Want to fork it? Ask first — [email me](mailto:ayoubzulfiqar3@gmail.com).
+Permission is usually yes. See [LICENSE](LICENSE).
 
 Be kind to people here: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
@@ -388,7 +388,20 @@ More of my work: [ayoubzulfiqar.com/projects](https://ayoubzulfiqar.com/projects
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Snatch is **source-available**, not open source. See [LICENSE](LICENSE).
 
-Snatch runs aria2, ffmpeg, yt-dlp and gallery-dl as separate programs. It does
-not include their code. Each keeps its own license.
+In short:
+
+- **Read it, build it, run it.** Anywhere, at home or at work, free or paid.
+- **Change your own copy** and use it yourself.
+- **Ask first** before you publish a fork, share a changed copy, or sell it.
+  Email [ayoubzulfiqar3@gmail.com](mailto:ayoubzulfiqar3@gmail.com). The
+  answer is usually yes.
+- **Credit the author** wherever you share it.
+
+Versions up to **2.6.9 were GPL-3.0-or-later** and stay that way for good.
+Nothing takes that away. The GPL text is kept as
+[LICENSE-GPL-3.0.txt](LICENSE-GPL-3.0.txt).
+
+Snatch runs aria2, ffmpeg, yt-dlp, gallery-dl, Wget2 and 7-Zip as separate
+programs. It does not include their code. Each keeps its own license.

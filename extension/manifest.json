@@ -5,7 +5,7 @@
   },
   "manifest_version": 3,
   "name": "Snatch Download Manager",
-  "version": "2.6.9",
+  "version": "2.7.0",
   "description": "Hands browser downloads to Snatch, the aria2-powered download manager for Linux.",
   "permissions": [
     "downloads",

@@ -40,7 +40,8 @@ jobs:
           If you already have a fix, paste it into the issue. It will get used
           and you will be credited.
 
-          You are also free to fork this and ship your own version. It is
-          GPL-3.0-or-later, so you need no permission and do not have to ask."
+          You can read, build, run and change your own copy freely. Publishing
+          a fork needs permission first -- email ayoubzulfiqar3@gmail.com and
+          say what you want to do. The answer is usually yes."
 
           gh pr close "$PR" --repo "$REPO"

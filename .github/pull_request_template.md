@@ -18,8 +18,9 @@ An issue is more useful here than a patch:
 
 ## You can still use the code
 
-Snatch is GPL-3.0-or-later. You may fork it, change it, and share your version.
-You do not need permission and you do not need to ask.
+Read it, build it, run it, and change your own copy. All of that is fine and
+needs no permission.
 
-If you build something good on top of it, open an issue and tell me. I would
-like to see it.
+Publishing a fork does need permission. Email
+[ayoubzulfiqar3@gmail.com](mailto:ayoubzulfiqar3@gmail.com) and say what you
+want to do. The answer is usually yes. See [LICENSE](../LICENSE).

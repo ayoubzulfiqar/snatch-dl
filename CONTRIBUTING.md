@@ -29,13 +29,17 @@ The forms ask for these. Here is why each one matters:
 | Your Linux | Some bugs only happen on one. |
 | What it printed | Run `snatch-gui` in a terminal and copy the output. |
 
-## Fork it if you like
+## Want to fork it?
 
-Snatch is GPL-3.0-or-later. You can fork it, change it, and share your
-version. You need no permission and do not have to ask.
+Ask first. Snatch is source-available, not open source. You may read it,
+build it, run it and change your own copy freely. Publishing a fork needs
+written permission.
 
-Built something on top of it? Open an issue and tell me. I would like to see
-it.
+Email [ayoubzulfiqar3@gmail.com](mailto:ayoubzulfiqar3@gmail.com) and say what
+you want to do. The answer is usually yes. Asking costs you one email.
+
+If you get permission, you must credit the author where people will see it,
+and pick your own name for it. The details are in [LICENSE](LICENSE).
 
 ## Building it yourself
 
