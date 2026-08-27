@@ -84,7 +84,8 @@ jobs:
           STAGE="snatch-${VERSION}-x86_64-linux"
           mkdir -p "dist/${STAGE}"
           cp target/release/snatch-gui target/release/snatch-nmh "dist/${STAGE}/"
-          cp -r extension install.sh get.sh README.md LICENSE "dist/${STAGE}/"
+          cp -r extension install.sh get.sh README.md LICENSE LICENSE-GPL-3.0.txt \
+            "dist/${STAGE}/"
           # get.sh installs the portable build by hand on distributions with
           # no package of their own, and needs these to register the
           # extension for the whole machine.
