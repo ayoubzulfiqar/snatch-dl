@@ -30,7 +30,6 @@ const MENU_DOWNLOAD = "snatch-download-with";
 const MENU_SCRAPE = "snatch-scrape-page";
 const MENU_VIDEO = "snatch-extract-video";
 const MENU_SNIFF = "snatch-sniff-page";
-const MENU_MAGNET = "snatch-open-magnet";
 const HINT_TTL_MS = 90000;
 const HINT_LIMIT = 256;
 const BADGE_MS = 4000;
@@ -564,24 +563,16 @@ api.webRequest.onHeadersReceived.addListener(
   ["responseHeaders"]
 );
 
-// A magnet navigation never becomes a download item, so it has to be caught
-// on the request itself. Chromium cannot cancel it in MV3, but Snatch still
-// receives the link and the external-handler prompt can simply be dismissed.
-api.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (!isMagnet(details.url)) {
-      return;
-    }
-    isEnabled()
-      .then((enabled) => {
-        if (enabled) {
-          return hijackDirect(details.url, details.originUrl || details.initiator);
-        }
-      })
-      .catch((error) => console.error("Snatch: magnet capture failed", error));
-  },
-  { urls: ["magnet:*"], types: ["main_frame", "sub_frame"] }
-);
+// There is deliberately no webRequest listener for magnet links.
+//
+// An earlier version filtered on `magnet:*`, which browsers reject: a match
+// pattern must be <scheme>://<host>/<path>, and `magnet:` has no host. Chrome
+// reported "'magnet:*' is not a valid URL pattern." on every load.
+//
+// Widening the filter would not have helped either. webRequest only ever sees
+// http, https, ws, wss, ftp and file. A magnet link is handed to an external
+// protocol handler and never becomes a web request at all, so no filter can
+// catch one. Magnets are sent to Snatch from the context menu instead.
 
 api.downloads.onCreated.addListener((item) => {
   hijack(item).catch((error) => console.error("Snatch: capture failed", error));
@@ -625,7 +616,6 @@ api.contextMenus.onClicked.addListener((info, tab) => {
       );
       return;
     }
-    case MENU_MAGNET:
     case MENU_DOWNLOAD: {
       const url = info.linkUrl || info.srcUrl || (info.selectionText || "").trim();
       hijackDirect(url, info.pageUrl).catch((error) =>
@@ -656,12 +646,15 @@ async function installContextMenu() {
       title: "Download with Snatch",
       contexts: ["link", "image", "video", "audio", "selection"]
     });
-    api.contextMenus.create({
-      id: MENU_MAGNET,
-      title: "Send Magnet to Snatch",
-      contexts: ["link"],
-      targetUrlPatterns: ["magnet:*"]
-    });
+    // There is no separate magnet entry. It would need
+    // `targetUrlPatterns: ["magnet:*"]` to appear only on magnet links, and a
+    // match pattern must be <scheme>://<host>/<path>, so that one can never
+    // match anything -- the entry was registered but never shown. Without the
+    // pattern it would appear on every link instead, which is worse.
+    //
+    // "Download with Snatch" already covers it: it has no pattern, so it does
+    // appear on a magnet link, and hijackDirect sends anything starting with
+    // `magnet:` to the torrent engine rather than the downloader.
     api.contextMenus.create({
       id: MENU_VIDEO,
       title: "Extract Video with Snatch",

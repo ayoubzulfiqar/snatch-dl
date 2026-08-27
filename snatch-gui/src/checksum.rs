@@ -600,7 +600,9 @@ mod tests {
         (base, handle)
     }
 
-    #[tokio::test]
+    // Serving and fetching on one thread can starve the accept loop when
+    // the suite runs in parallel, which made this flaky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_digest_beside_the_file_is_found() {
         // The `<file>.sha256` convention, holding the digest alone.
         const DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -616,7 +618,9 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
+    // Serving and fetching on one thread can starve the accept loop when
+    // the suite runs in parallel, which made this flaky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_sums_file_in_the_same_directory_is_found() {
         // No file-specific digest, so the second wave has to do the work,
         // and the right line has to be picked out of several.
@@ -635,7 +639,9 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
+    // Serving and fetching on one thread can starve the accept loop when
+    // the suite runs in parallel, which made this flaky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_server_with_nothing_published_yields_nothing() {
         // Every candidate 404s. A miss must be quiet, not an error.
         let (base, server) = serve(Vec::new()).await;
@@ -645,7 +651,9 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
+    // Serving and fetching on one thread can starve the accept loop when
+    // the suite runs in parallel, which made this flaky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_sums_file_that_omits_this_file_is_not_used() {
         // A directory-wide sums file that never mentions the download must
         // not hand back somebody else's digest.
