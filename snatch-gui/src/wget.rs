@@ -47,6 +47,25 @@ fn host_from_url(url: &str) -> Option<String> {
 /// the machine can read them out of `ps`. A netrc file readable only by its
 /// owner does not have that problem, so the password goes there instead and
 /// the file is removed as soon as the download ends.
+/// Check the finished file against the digest the request carried, if any.
+///
+/// An unreadable digest is reported rather than ignored. Unlike the aria2
+/// path — where a bad option would make aria2 reject the add and lose the
+/// download outright — nothing is at stake here but the message, and silently
+/// skipping a check the user asked for would be worse than saying so.
+async fn verify_if_requested(request: &DownloadRequest, path: &Path) -> Result<()> {
+    let Some(text) = request.checksum.as_deref().map(str::trim) else {
+        return Ok(());
+    };
+    if text.is_empty() {
+        return Ok(());
+    }
+    let Some(expected) = crate::checksum::parse(text) else {
+        bail!("'{text}' is not a checksum in any recognised form");
+    };
+    crate::checksum::verify_file(path, &expected).await
+}
+
 #[derive(Debug)]
 struct NetrcFile(PathBuf);
 
@@ -238,7 +257,25 @@ impl WgetEngine {
                 .await
             {
                 Ok(path) => {
-                    let _ = events.send(WgetEvent::Finished { job_id, path }).await;
+                    // wget has no equivalent of aria2's --checksum, so the
+                    // file is hashed here instead. A mismatch is a failure,
+                    // not a warning: the point of asking for a digest is that
+                    // the wrong bytes are worse than no bytes.
+                    match verify_if_requested(&request, &path).await {
+                        Ok(()) => {
+                            let _ = events.send(WgetEvent::Finished { job_id, path }).await;
+                        }
+                        Err(error) => {
+                            log::warn!("wget job {job_id} failed verification: {error:#}");
+                            let _ = std::fs::remove_file(&path);
+                            let _ = events
+                                .send(WgetEvent::Failed {
+                                    job_id,
+                                    error: format!("{error:#}"),
+                                })
+                                .await;
+                        }
+                    }
                 }
                 Err(error) => {
                     log::warn!("wget job {job_id} failed: {error:#}");

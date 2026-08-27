@@ -69,6 +69,11 @@ pub struct DownloadRequest {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// A digest to check the finished file against, in any form a download
+    /// page might print it. Parsed by [`crate::checksum::parse`] at the point
+    /// of use, so the wire format stays whatever the sender had to hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +164,7 @@ impl DownloadRequest {
             user_agent: None,
             username: None,
             password: None,
+            checksum: None,
             mime: None,
             size: None,
             mirrors: Vec::new(),

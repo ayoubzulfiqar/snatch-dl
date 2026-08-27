@@ -81,6 +81,29 @@ fn install_stylesheet() {
     );
 }
 
+/// The optional extras the add dialog attaches to every job it creates.
+///
+/// A struct rather than more positional arguments: they are all "empty unless
+/// the user opened a disclosure and typed something", and at the call site a
+/// row of `None, None` says nothing about which is which.
+#[derive(Debug, Clone, Default)]
+struct AddExtras {
+    credentials: Option<(String, String)>,
+    checksum: Option<String>,
+}
+
+impl AddExtras {
+    fn apply(&self, request: &mut DownloadRequest) {
+        if let Some((user, password)) = self.credentials.clone() {
+            request.username = Some(user);
+            request.password = Some(password);
+        }
+        if let Some(checksum) = self.checksum.clone() {
+            request.checksum = Some(checksum);
+        }
+    }
+}
+
 pub struct Ui {
     window: adw::ApplicationWindow,
     title: adw::WindowTitle,
@@ -1015,6 +1038,62 @@ impl Ui {
     }
 
     fn add_download(self: &Rc<Self>, request: DownloadRequest) {
+        // Nearly every project that publishes a file publishes its digest
+        // beside it, and nobody goes and checks. Look before queueing, so
+        // verification costs the user nothing.
+        if request.checksum.is_none() && self.backend.settings().download.verify_downloads {
+            let weak = Rc::downgrade(self);
+            let backend = self.backend.clone();
+            glib::spawn_future_local(async move {
+                let mut request = request;
+                let url = request.url.clone();
+                let filename = request
+                    .sanitized_filename()
+                    .or_else(|| crate::types::name_from_url(&url))
+                    .unwrap_or_default();
+
+                let proxies = std::sync::Arc::clone(&backend.proxies);
+                let probe = {
+                    let filename = filename.clone();
+                    async move {
+                        let proxy = proxies
+                            .resolve_for("checksum", crate::network::Engine::Http)
+                            .unwrap_or(None);
+                        let client = proxies.client(proxy.as_ref())?;
+                        // A server that never answers must not hold up the
+                        // download it was only ever going to annotate.
+                        let found = tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            crate::checksum::discover(&client, &url, &filename),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        Ok(found)
+                    }
+                };
+                // A failed lookup is not a failed download: it only means
+                // this one will not be verified.
+                let found = backend.offload(probe).await.unwrap_or_else(|error| {
+                    log::debug!("no checksum lookup: {error:#}");
+                    None
+                });
+
+                let Some(ui) = weak.upgrade() else { return };
+                if let Some((checksum, source)) = found {
+                    log::info!("verifying {filename} against {source}");
+                    ui.toast(&format!("Found a {} for {filename}", checksum.label()));
+                    request.checksum = Some(checksum.aria2_value());
+                }
+                ui.dispatch_download(request);
+            });
+            return;
+        }
+        self.dispatch_download(request);
+    }
+
+    /// Hand a download to whichever engine is configured.
+    fn dispatch_download(self: &Rc<Self>, request: DownloadRequest) {
         // The configured engine decides who fetches it.
         if self.backend.settings().download.engine == crate::settings::HttpEngine::Wget {
             return self.add_wget_download(request);
@@ -1198,6 +1277,48 @@ impl Ui {
             .child(&credentials)
             .build();
 
+        // A digest the download page printed. Paste the whole line if you
+        // like — the coreutils and BSD layouts both parse.
+        let checksum = gtk::Entry::builder()
+            .placeholder_text("Paste a checksum, or leave empty to look for one")
+            .build();
+        let checksum_status = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["snatch-hint"])
+            .label("Snatch checks the file against a published digest when it can find one.")
+            .build();
+        let checksum_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(4)
+            .build();
+        checksum_box.append(&checksum);
+        checksum_box.append(&checksum_status);
+        let integrity = gtk::Expander::builder()
+            .label("Verify the finished file")
+            .child(&checksum_box)
+            .build();
+
+        // Say straight away whether what was pasted is usable, rather than
+        // failing much later when the download finishes.
+        checksum.connect_changed({
+            let status = checksum_status.clone();
+            move |entry| {
+                let text = entry.text();
+                let text = text.trim();
+                if text.is_empty() {
+                    status.set_label(
+                        "Snatch checks the file against a published digest when it can find one.",
+                    );
+                } else if let Some(parsed) = crate::checksum::parse(text) {
+                    status.set_label(&format!("Recognised {}", parsed.label()));
+                } else {
+                    status.set_label("Not a checksum in any form Snatch recognises.");
+                }
+            }
+        });
+
         let fields = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -1207,6 +1328,7 @@ impl Ui {
         fields.append(&kinds);
         fields.append(&as_mirrors);
         fields.append(&auth);
+        fields.append(&integrity);
 
         let dialog = adw::AlertDialog::builder()
             .heading("Add to Snatch")
@@ -1261,8 +1383,12 @@ impl Ui {
             let Some(ui) = weak.upgrade() else { return };
             let text = buffer_text(&buffer);
             let user = username.text().trim().to_owned();
-            let credentials = (!user.is_empty()).then(|| (user, password.text().to_string()));
-            ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active(), credentials);
+            let digest = checksum.text().trim().to_owned();
+            let extras = AddExtras {
+                credentials: (!user.is_empty()).then(|| (user, password.text().to_string())),
+                checksum: (!digest.is_empty()).then_some(digest),
+            };
+            ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active(), extras);
         });
 
         dialog.present(Some(&self.window));
@@ -1274,19 +1400,16 @@ impl Ui {
         text: &str,
         kind_choice: u32,
         as_mirrors: bool,
-        credentials: Option<(String, String)>,
+        extras: AddExtras,
     ) {
         // A pasted cURL command carries its own credentials, so it bypasses
         // the kind selector entirely.
         if crate::curl::looks_like_curl(text) {
             match crate::curl::parse(text) {
                 Ok(mut request) => {
-                    // Typed credentials still win: the user filled the fields
-                    // in after pasting, which only makes sense as an override.
-                    if let Some((user, password)) = credentials {
-                        request.username = Some(user);
-                        request.password = Some(password);
-                    }
+                    // Typed values still win: the user filled the fields in
+                    // after pasting, which only makes sense as an override.
+                    extras.apply(&mut request);
                     let name = request.display_name();
                     self.enqueue(request);
                     self.toast(&format!("Imported {name} from the cURL command"));
@@ -1318,10 +1441,7 @@ impl Ui {
                 // 0: let `inferred_kind` decide from the scheme.
                 _ => DownloadRequest::from_url(url),
             };
-            if let Some((user, password)) = credentials.clone() {
-                request.username = Some(user);
-                request.password = Some(password);
-            }
+            extras.apply(&mut request);
             request
         };
 

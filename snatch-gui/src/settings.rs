@@ -106,6 +106,17 @@ pub struct DownloadSettings {
     /// File the download into a subfolder chosen by its type, instead of
     /// dropping everything into one directory.
     pub categorise: bool,
+    /// Look for a digest published beside the file and check the download
+    /// against it. Costs one or two extra requests to the same host per
+    /// download, which is why it can be turned off.
+    #[serde(default = "yes")]
+    pub verify_downloads: bool,
+}
+
+/// serde default for a flag that should be on unless a settings file written
+/// before it existed says otherwise.
+fn yes() -> bool {
+    true
 }
 
 impl Default for DownloadSettings {
@@ -126,6 +137,7 @@ impl Default for DownloadSettings {
             user_agent: "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
                 .to_owned(),
             categorise: true,
+            verify_downloads: true,
         }
     }
 }

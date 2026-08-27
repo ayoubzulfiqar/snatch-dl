@@ -258,6 +258,21 @@ impl Aria2Client {
             options.insert(password_key.to_owned(), json!(password));
         }
 
+        // aria2 hashes the finished file itself and fails the download if it
+        // does not match, so this is the whole of verification for the
+        // default engine. An unparseable digest is dropped rather than passed
+        // through: aria2 would reject the whole add and the user would lose
+        // the download over a typo in an optional field.
+        match request.checksum.as_deref().map(str::trim) {
+            Some(text) if !text.is_empty() => match crate::checksum::parse(text) {
+                Some(checksum) => {
+                    options.insert("checksum".to_owned(), json!(checksum.aria2_value()));
+                }
+                None => log::warn!("ignoring '{text}': not a checksum in any recognised form"),
+            },
+            _ => {}
+        }
+
         // Every source for the same file. aria2 spreads its connections
         // across the mirrors and fails over between them, so one slow host
         // does not decide the speed.

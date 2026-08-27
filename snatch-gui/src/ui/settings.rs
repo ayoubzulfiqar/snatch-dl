@@ -219,6 +219,25 @@ impl SettingsPage {
         });
         group.add(&categorise);
 
+        let verify = adw::SwitchRow::builder()
+            .title("Check downloads against a published checksum")
+            .subtitle(
+                "Looks for a digest published beside the file and verifies the download \
+                 against it. Costs one or two extra requests to the same server.",
+            )
+            .active(draft.download.verify_downloads)
+            .build();
+        verify.connect_active_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let on = row.is_active();
+                this.edit(&ui, |settings| settings.download.verify_downloads = on);
+            }
+        });
+        group.add(&verify);
+
         // This is the ".aria2 file" question, phrased as what it actually costs.
         let resume = adw::SwitchRow::builder()
             .title("Write resume data while downloading")
