@@ -371,9 +371,6 @@ closed unread. Open an issue instead — and if you already have a fix, paste it
 in. It will get used and you will be credited. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Want to fork it? Ask first — [email me](mailto:contact@ayoubzulfiqar.com).
-Permission is usually yes. See [LICENSE](LICENSE).
-
 Be kind to people here: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ---
@@ -388,20 +385,7 @@ More of my work: [ayoubzulfiqar.com/projects](https://ayoubzulfiqar.com/projects
 
 ## License
 
-Snatch is **source-available**, not open source. See [LICENSE](LICENSE).
-
-In short:
-
-- **Read it, build it, run it.** Anywhere, at home or at work, free or paid.
-- **Change your own copy** and use it yourself.
-- **Ask first** before you publish a fork, share a changed copy, or sell it.
-  Email [contact@ayoubzulfiqar.com](mailto:contact@ayoubzulfiqar.com). The
-  answer is usually yes.
-- **Credit the author** wherever you share it.
-
-Versions up to **2.6.9 were GPL-3.0-or-later** and stay that way for good.
-Nothing takes that away. The GPL text is kept as
-[LICENSE-GPL-3.0.txt](LICENSE-GPL-3.0.txt).
+See [LICENSE](LICENSE).
 
 Snatch runs aria2, ffmpeg, yt-dlp, gallery-dl, Wget2 and 7-Zip as separate
 programs. It does not include their code. Each keeps its own license.
