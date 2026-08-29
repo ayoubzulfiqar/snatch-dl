@@ -87,8 +87,19 @@ pub struct DownloadRequest {
     /// [`JobKind::Formats`] request returned. Ignored by every other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_id: Option<String>,
-    /// Unix time this download should start at. Until then it is added
-    /// paused, so it holds its place in the queue without using bandwidth.
+    /// Which quality to record, named by height. Stream jobs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Stop the recording after this long. Stream jobs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_seconds: Option<u64>,
+    /// Begin this far into the stream. Stream jobs only, and ignored for a
+    /// live one, which has no beginning to measure from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_seconds: Option<u64>,
+    /// Unix time this job should start at. A download is added paused until
+    /// then, so it holds its place in the queue without using bandwidth; a
+    /// recording waits as a visible job that can be cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +208,9 @@ impl DownloadRequest {
             password: None,
             checksum: None,
             format_id: None,
+            height: None,
+            record_seconds: None,
+            skip_seconds: None,
             start_at: None,
             mime: None,
             size: None,

@@ -638,6 +638,17 @@ async function handOff(details) {
   if (Number.isFinite(details.size) && details.size > 0) {
     message.size = details.size;
   }
+  // Recording options. Each is checked here rather than trusted: they come
+  // from fields in a page, and reach a subprocess on the other side.
+  if (Number.isFinite(details.height) && details.height > 0) {
+    message.height = Math.round(details.height);
+  }
+  if (Number.isFinite(details.recordSeconds) && details.recordSeconds > 0) {
+    message.record_seconds = Math.round(details.recordSeconds);
+  }
+  if (Number.isFinite(details.startAt) && details.startAt > 0) {
+    message.start_at = Math.round(details.startAt);
+  }
 
   return sendNative(message);
 }
@@ -874,7 +885,10 @@ async function handleContentMessage(message, sender) {
         url: requireUrl(message.url),
         kind: "stream",
         filename: sanitiseName(message.title),
-        referer: page
+        referer: page,
+        height: message.height,
+        recordSeconds: message.record_seconds,
+        startAt: message.start_at
       });
       flashBadge("ok", "#3584e4");
       return { ok: true };

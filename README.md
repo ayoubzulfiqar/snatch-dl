@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.10.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.11.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.10.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.10.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.10.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.11.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.11.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.11.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -153,8 +153,25 @@ name the sizes, it looks at what the player is loading and offers that instead.
 
 Snatch tells them apart and picks the right one for you.
 
+Streams come in sizes too. If the site offers 720p, 480p and 240p, you get all
+three in the list. Pick the one you want.
+
+**Want it later, or just a bit of it?** Click **Recording options** in the
+list:
+
+| Box | What it does |
+|---|---|
+| **Start at** | Waits until that time, then records. Great for a show that starts at 8. |
+| **Record for** | Stops on its own after that many minutes. |
+
+Leave them blank to start now and run until you press stop.
+
 If the button says it found nothing, press play first and click it again.
 Snatch can only see a stream once the player asks for it.
+
+**Some videos are locked.** Big paid services lock their video with DRM. The
+key stays inside your browser and never comes out. Snatch says so when it sees
+one. No download tool can save those — not Snatch, and not any other.
 
 Snatch only looks when you click the button. It does not read the pages you are
 just visiting.

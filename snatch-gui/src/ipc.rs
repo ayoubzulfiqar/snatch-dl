@@ -179,10 +179,16 @@ async fn accept_request(
             .clone()
             .start_stream(
                 crate::stream::Recording {
-                    url: request.url.clone(),
                     name_hint: request.filename.clone(),
-                    directory: crate::ytdlp::destination_for(&backend.download_dir),
                     headers: stream_headers(&request),
+                    height: request.height,
+                    start_at: request.start_at,
+                    skip: request.skip_seconds.map(Duration::from_secs),
+                    limit: request.record_seconds.map(Duration::from_secs),
+                    ..crate::stream::Recording::new(
+                        request.url.clone(),
+                        crate::ytdlp::destination_for(&backend.download_dir),
+                    )
                 },
                 backend.proxies.clone(),
                 backend.video_events.clone(),
@@ -298,7 +304,10 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     )
     .await;
 
-    let mut rows: Vec<(FormatSource, String, crate::stream::StreamInfo)> = streams
+    // One row per quality, not per address: a master playlist is a list of
+    // qualities, and offering only its best would throw the rest away.
+    let mut rows: Vec<crate::ytdlp::MediaFormat> = Vec::new();
+    for (source, url, info) in streams
         .into_iter()
         .map(|(url, info)| (FormatSource::Stream, url, info))
         .chain(
@@ -306,44 +315,63 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
                 .into_iter()
                 .map(|(url, info)| (FormatSource::File, url, info)),
         )
-        .collect();
+    {
+        // A file is downloaded as it is, so it keeps its own extension; only a
+        // recording gets to choose a container.
+        let ext = match source {
+            FormatSource::File => {
+                crate::stream::extension_of(&url).unwrap_or_else(|| info.container().to_owned())
+            }
+            _ => info.container().to_owned(),
+        };
+        let qualities: Vec<Option<crate::stream::Rendition>> = match source {
+            // Every quality of a playlist is separately recordable.
+            FormatSource::Stream if !info.renditions.is_empty() => {
+                info.renditions.iter().copied().map(Some).collect()
+            }
+            // A file is one thing however many streams ffprobe found in it.
+            _ => vec![info.renditions.first().copied()],
+        };
+        for rendition in qualities {
+            rows.push(crate::ytdlp::MediaFormat {
+                id: String::new(),
+                label: match &rendition {
+                    Some(rendition) => info.label_for(rendition),
+                    None => info.label(),
+                },
+                ext: ext.clone(),
+                // Only a file has a size worth showing. ffprobe reports the
+                // size of a *playlist* as the playlist's own few hundred
+                // bytes, which would put "385 B" beside a two-hour stream.
+                size: match source {
+                    FormatSource::File => info.size,
+                    _ => None,
+                },
+                estimated: false,
+                height: rendition.and_then(|rendition| rendition.height),
+                audio_only: !info.has_video(),
+                source,
+                url: Some(url.clone()),
+            });
+        }
+    }
 
     // Best first, and only one row per description. A player fetches its
     // master playlist and then the rendition inside it, which come back as
     // two rows saying exactly the same thing.
-    rows.sort_by_key(|(_, _, info)| std::cmp::Reverse(info.height));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.height));
     let mut seen: Vec<String> = Vec::new();
-    rows.retain(|(_, _, info)| {
-        let label = info.label();
-        if seen.contains(&label) {
+    rows.retain(|row| {
+        if seen.contains(&row.label) {
             return false;
         }
-        seen.push(label);
+        seen.push(row.label.clone());
         true
     });
 
     crate::ytdlp::MediaProbe {
         title: request.filename.clone(),
         duration: None,
-        formats: rows
-            .into_iter()
-            .map(|(source, url, info)| crate::ytdlp::MediaFormat {
-                id: String::new(),
-                label: info.label(),
-                // A file is downloaded as it is, so it keeps its own
-                // extension; only a recording gets to choose a container.
-                ext: match source {
-                    FormatSource::File => crate::stream::extension_of(&url)
-                        .unwrap_or_else(|| info.container().to_owned()),
-                    _ => info.container().to_owned(),
-                },
-                size: info.size,
-                estimated: false,
-                height: info.height,
-                audio_only: !info.has_video(),
-                source,
-                url: Some(url),
-            })
-            .collect(),
+        formats: rows,
     }
 }

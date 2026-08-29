@@ -142,6 +142,19 @@ it writes the trailer and exits 0. Killing it instead is what leaves a file
 with no trailer. So `stream.rs` gives ffmpeg a real stdin pipe and does **not**
 pass `-nostdin`.
 
+### Each quality carries its own sound
+
+A master playlist is several variants, and ffprobe reports every one. Each has
+its own audio, so `-map` has to take the pair from **one** variant.
+
+Mapping 240p video with the first audio ffprobe listed works, and quietly makes
+ffmpeg fetch the 720p segments too, purely for their soundtrack. `-show_programs`
+is what says which streams belong together.
+
+A quality is remembered by **height**, never by stream index. A live playlist
+can be rewritten between the picker listing it and the recording starting, and
+an index that has shifted records the wrong thing without saying so.
+
 ### One progress event per tick, not per line
 
 ffmpeg's `-progress` writes about a dozen `key=value` lines per tick. Publish

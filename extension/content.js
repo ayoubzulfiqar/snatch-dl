@@ -62,6 +62,12 @@
   let panelStatus = null;
 
   let video = null;
+  let optionsBox = null;
+  let startField = null;
+  let minutesField = null;
+  /** Videos seen firing `encrypted`, which is EME starting up. */
+  const encryptedVideos = new WeakSet();
+  const watchedVideos = new WeakSet();
   let pillVisible = false;
   let panelOpen = false;
   let hideTimer = 0;
@@ -189,6 +195,48 @@
       }
     }
     return null;
+  }
+
+  /**
+   * Whether this video is playing DRM-protected content.
+   *
+   * Two signals, because either alone can be missed. `mediaKeys` is set once
+   * by the player and stays set, so it survives arriving late; the `encrypted`
+   * event fires when protected content starts and catches players that set
+   * their keys after we looked.
+   *
+   * This is only used to explain, never to work around. What travels over the
+   * wire for DRM is the encrypted bytes; the key goes to a module inside the
+   * browser that never hands it back, so there is nothing to fetch. Saying so
+   * plainly beats a download that fails for reasons nobody can see.
+   */
+  function isProtected(candidate) {
+    if (!candidate) {
+      return false;
+    }
+    if (encryptedVideos.has(candidate)) {
+      return true;
+    }
+    try {
+      return candidate.mediaKeys != null;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function watchForEncryption(candidate) {
+    if (!candidate || watchedVideos.has(candidate)) {
+      return;
+    }
+    watchedVideos.add(candidate);
+    try {
+      candidate.addEventListener("encrypted", () => encryptedVideos.add(candidate), {
+        once: true,
+        passive: true
+      });
+    } catch (error) {
+      // An element that will not take a listener tells us nothing either way.
+    }
   }
 
   /** A plain file we could hand over even when yt-dlp cannot read the page. */
@@ -336,6 +384,45 @@
   font-size: 12px;
   word-break: break-word;
 }
+.options {
+  display: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 8px 11px 10px;
+}
+.options.shown { display: block; }
+.more {
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.66);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+.more:hover { color: #ffffff; }
+.fields { display: none; padding-top: 8px; }
+.fields.shown { display: block; }
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.78);
+}
+.field input {
+  width: 108px;
+  box-sizing: border-box;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.35);
+  color: #ffffff;
+  font: inherit;
+  font-size: 12px;
+}
+.field input:focus { outline: 1px solid #3584e4; border-color: #3584e4; }
 .status.bad { color: #ff9a92; }
 .status.good { color: #8ff0a4; }
 `;
@@ -423,10 +510,44 @@
 
     panelBody = document.createElement("div");
     panelBody.className = "body";
+
+    // Only shown when there is a recording to schedule. A quality from yt-dlp
+    // is a download, and a download does not have a running time.
+    optionsBox = document.createElement("div");
+    optionsBox.className = "options";
+    const more = document.createElement("button");
+    more.className = "more";
+    more.textContent = "Recording options ▾";
+    const fields = document.createElement("div");
+    fields.className = "fields";
+
+    const startRow = document.createElement("label");
+    startRow.className = "field";
+    startRow.append(document.createTextNode("Start at"));
+    startField = document.createElement("input");
+    startField.type = "time";
+    startRow.appendChild(startField);
+
+    const minutesRow = document.createElement("label");
+    minutesRow.className = "field";
+    minutesRow.append(document.createTextNode("Record for"));
+    minutesField = document.createElement("input");
+    minutesField.type = "number";
+    minutesField.min = "1";
+    minutesField.placeholder = "minutes";
+    minutesRow.appendChild(minutesField);
+
+    fields.append(startRow, minutesRow);
+    more.addEventListener("click", () => {
+        const shown = fields.classList.toggle("shown");
+        more.textContent = shown ? "Recording options ▴" : "Recording options ▾";
+    });
+    optionsBox.append(more, fields);
+
     panelStatus = document.createElement("div");
     panelStatus.className = "status";
 
-    panel.append(head, panelBody, panelStatus);
+    panel.append(head, panelBody, optionsBox, panelStatus);
     layer.append(pill, panel);
     root.appendChild(layer);
 
@@ -528,6 +649,7 @@
     }
     build();
     attach();
+    watchForEncryption(candidate);
     if (candidate !== video) {
       // The pointer moved to a different video: the open list belongs to the
       // old one and would download the wrong thing.
@@ -631,6 +753,7 @@
     panel.classList.add("open");
     panelTitle.textContent = document.title || location.hostname;
     note("Reading the page…");
+    optionsBox.classList.remove("shown");
     status("Snatch is looking at what this page offers");
     place();
     if (!frame) {
@@ -659,6 +782,7 @@
 
   function renderFormats(reply, target) {
     clear(panelBody);
+    let recordable = false;
     const heading = [reply.title, humanDuration(reply.duration)]
       .filter(Boolean)
       .join("  ·  ");
@@ -674,8 +798,18 @@
       // and a selector goes to yt-dlp.
       const address = typeof format.url === "string" ? format.url : "";
       if (format.source === "stream" && address) {
+        recordable = true;
         addRow(String(format.label || "Stream"), detailOf(format), () =>
-          pick("stream", { url: address, title: document.title }, format.label)
+          pick(
+            "stream",
+            {
+              url: address,
+              title: document.title,
+              height: format.height,
+              ...recordingOptions()
+            },
+            format.label
+          )
         );
         continue;
       }
@@ -689,7 +823,10 @@
         pick("video", { url: target, format_id: format.id }, format.label)
       );
     }
-    status("Pick a quality");
+    // Scheduling belongs to a recording. Offering it beside a yt-dlp format
+    // would promise something that row cannot do.
+    optionsBox.classList.toggle("shown", recordable);
+    status(recordable ? "Pick a quality, or set when and how long" : "Pick a quality");
   }
 
   /**
@@ -698,6 +835,19 @@
    */
   function renderFallback(error, fallback, target) {
     clear(panelBody);
+    optionsBox.classList.remove("shown");
+
+    // Detected, and explained rather than attempted. The encrypted bytes are
+    // all that crosses the wire; the key goes to a module inside the browser
+    // that never gives it back.
+    if (isProtected(video)) {
+      note(
+        "This video is locked with DRM. The key never leaves your browser, " +
+          "so no download tool can save it — not Snatch, not any other."
+      );
+      status("Locked by the site", "bad");
+      return;
+    }
     if (fallback) {
       addRow("Download the video file", "direct", () =>
         pick("direct", { url: fallback, referer: target }, "the file")
@@ -715,6 +865,40 @@
         " If the video has not started, press play and try again."
     );
     status("");
+  }
+
+  /**
+   * The time the user typed, as a Unix timestamp.
+   *
+   * A time input gives an hour and a minute with no date. Today is meant, and
+   * tomorrow if today's has already gone -- which is what somebody setting
+   * "02:00" at midnight means.
+   */
+  function scheduledFor(value) {
+    const parts = /^(\d{1,2}):(\d{2})$/.exec(String(value || "").trim());
+    if (!parts) {
+      return null;
+    }
+    const when = new Date();
+    when.setHours(Number(parts[1]), Number(parts[2]), 0, 0);
+    if (when.getTime() <= Date.now()) {
+      when.setDate(when.getDate() + 1);
+    }
+    return Math.round(when.getTime() / 1000);
+  }
+
+  /** Whatever was filled in, for a row that records rather than downloads. */
+  function recordingOptions() {
+    const options = {};
+    const at = scheduledFor(startField && startField.value);
+    if (at) {
+      options.start_at = at;
+    }
+    const minutes = Number.parseInt((minutesField && minutesField.value) || "", 10);
+    if (Number.isFinite(minutes) && minutes > 0) {
+      options.record_seconds = minutes * 60;
+    }
+    return options;
   }
 
   function pick(type, request, what) {

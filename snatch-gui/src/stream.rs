@@ -42,7 +42,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::network::{Engine, ProxyManager};
 use crate::processor::{Field, parse_progress_line};
@@ -117,7 +117,8 @@ fn clean(value: Option<&str>) -> Option<&str> {
     Some(value)
 }
 
-/// One recording to make: what to read, and where to put it.
+/// One recording to make: what to read, when, how much of it, and where to
+/// put the result.
 #[derive(Debug, Clone)]
 pub struct Recording {
     pub url: String,
@@ -125,6 +126,53 @@ pub struct Recording {
     pub name_hint: Option<String>,
     pub directory: PathBuf,
     pub headers: Headers,
+    /// Which quality to take, named by height.
+    ///
+    /// Deliberately not the stream index: a live master playlist can be
+    /// rewritten between the moment the picker listed it and the moment the
+    /// recording starts, and an index that has shifted silently records the
+    /// wrong quality. A height either still exists or it does not.
+    pub height: Option<u32>,
+    /// Unix time to begin at. Until then the job sits waiting and can be
+    /// cancelled like any other.
+    pub start_at: Option<i64>,
+    /// How far into the stream to begin. Ignored for a live one, which has no
+    /// beginning to measure from.
+    pub skip: Option<Duration>,
+    /// Stop after this much has been recorded.
+    pub limit: Option<Duration>,
+}
+
+impl Recording {
+    /// A recording that starts now, takes the best quality, and runs until it
+    /// is stopped.
+    pub fn new(url: String, directory: PathBuf) -> Self {
+        Self {
+            url,
+            name_hint: None,
+            directory,
+            headers: Headers::default(),
+            height: None,
+            start_at: None,
+            skip: None,
+            limit: None,
+        }
+    }
+}
+
+/// One quality an address offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rendition {
+    /// The input stream index ffmpeg has to be told to take.
+    pub index: u32,
+    pub height: Option<u32>,
+    /// The audio that belongs with this quality.
+    ///
+    /// Each variant of a master playlist carries its own sound. Pairing a
+    /// quality with another variant's audio works, and makes ffmpeg fetch that
+    /// whole variant as well -- so recording 240p would quietly download the
+    /// 720p segments too, for their soundtrack.
+    pub audio_index: Option<u32>,
 }
 
 /// What ffprobe could work out about a stream.
@@ -132,16 +180,14 @@ pub struct Recording {
 pub struct StreamInfo {
     /// `None` for a live stream, which has no end to measure to.
     pub duration: Option<Duration>,
-    pub height: Option<u32>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
-    /// Which stream of the input the numbers above describe.
+    /// Every video quality the address offers, tallest first.
     ///
-    /// An HLS master playlist lists every rendition, so ffprobe reports a
-    /// video stream per quality. ffmpeg left to itself takes the first, which
-    /// is usually the smallest -- the row would promise 1080p and record
-    /// 480p. These say which one it must actually take.
-    pub video_index: Option<u32>,
+    /// A master playlist lists one per quality, so this is usually several.
+    /// ffmpeg left to itself takes the first stream, which is usually the
+    /// smallest, so the one that is wanted has to be named with `-map`.
+    pub renditions: Vec<Rendition>,
     pub audio_index: Option<u32>,
     /// Bytes, when the address is one file rather than a playlist.
     pub size: Option<u64>,
@@ -154,12 +200,39 @@ impl StreamInfo {
     }
 
     pub fn has_video(&self) -> bool {
-        self.video_codec.is_some()
+        !self.renditions.is_empty()
     }
 
-    /// What the picker shows: `1080p live`, `720p · 42:10`, `Audio stream`.
-    pub fn label(&self) -> String {
-        let quality = match (self.height, self.has_video()) {
+    /// The rendition to record, given the height the user picked.
+    ///
+    /// Falls back to the tallest that does not exceed what was asked for, and
+    /// then to the tallest of all: a live playlist can drop a quality between
+    /// the picker listing it and the recording starting, and recording
+    /// something is better than refusing.
+    pub fn choose(&self, wanted: Option<u32>) -> Option<Rendition> {
+        if let Some(wanted) = wanted {
+            if let Some(exact) = self
+                .renditions
+                .iter()
+                .find(|rendition| rendition.height == Some(wanted))
+            {
+                return Some(*exact);
+            }
+            if let Some(under) = self
+                .renditions
+                .iter()
+                .filter(|rendition| rendition.height.is_some_and(|height| height <= wanted))
+                .max_by_key(|rendition| rendition.height)
+            {
+                return Some(*under);
+            }
+        }
+        self.renditions.first().copied()
+    }
+
+    /// What one quality of this address is called: `1080p live`, `720p · 3:45`.
+    pub fn label_for(&self, rendition: &Rendition) -> String {
+        let quality = match (rendition.height, self.has_video()) {
             (Some(height), _) => format!("{height}p"),
             (None, true) => "Stream".to_owned(),
             (None, false) => "Audio stream".to_owned(),
@@ -173,6 +246,18 @@ impl StreamInfo {
                 crate::processor::format_duration(duration)
             ),
             None => quality,
+        }
+    }
+
+    /// What the picker shows for the best quality on offer.
+    pub fn label(&self) -> String {
+        match self.renditions.first() {
+            Some(best) => self.label_for(best),
+            None => self.label_for(&Rendition {
+                index: 0,
+                height: None,
+                audio_index: None,
+            }),
         }
     }
 
@@ -190,6 +275,16 @@ impl StreamInfo {
 struct RawProbe {
     #[serde(default)]
     format: Option<RawFormat>,
+    #[serde(default)]
+    streams: Vec<RawStream>,
+    /// One per variant of a master playlist, each listing the streams that
+    /// belong together. Absent for a plain file.
+    #[serde(default)]
+    programs: Vec<RawProgram>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProgram {
     #[serde(default)]
     streams: Vec<RawStream>,
 }
@@ -253,7 +348,10 @@ pub async fn probe(url: &str, headers: &Headers) -> Result<StreamInfo> {
         .arg("-print_format")
         .arg("json")
         .arg("-show_format")
-        .arg("-show_streams");
+        .arg("-show_streams")
+        // Which streams belong to which variant, so a quality is recorded
+        // with its own sound rather than another variant's.
+        .arg("-show_programs");
     apply_headers(&mut command, headers);
     command
         .arg("-i")
@@ -318,12 +416,14 @@ fn distil(raw: &RawProbe) -> StreamInfo {
         let index = stream.index.unwrap_or(position as u32);
         match stream.codec_type.as_deref() {
             Some("video") => {
-                // Keep the tallest: a manifest carries one per rendition.
-                if stream.height > info.height || info.video_codec.is_none() {
-                    info.height = stream.height.or(info.height);
+                if info.video_codec.is_none() {
                     info.video_codec = stream.codec_name.clone();
-                    info.video_index = Some(index);
                 }
+                info.renditions.push(Rendition {
+                    index,
+                    height: stream.height,
+                    audio_index: None,
+                });
             }
             Some("audio") if info.audio_codec.is_none() => {
                 info.audio_codec = stream.codec_name.clone();
@@ -332,6 +432,30 @@ fn distil(raw: &RawProbe) -> StreamInfo {
             _ => {}
         }
     }
+
+    // Pair each quality with the sound from its own variant.
+    for program in &raw.programs {
+        let audio = program
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type.as_deref() == Some("audio"))
+            .and_then(|stream| stream.index);
+        for stream in &program.streams {
+            if stream.codec_type.as_deref() != Some("video") {
+                continue;
+            }
+            if let Some(rendition) = info
+                .renditions
+                .iter_mut()
+                .find(|rendition| Some(rendition.index) == stream.index)
+            {
+                rendition.audio_index = audio;
+            }
+        }
+    }
+    // Tallest first, so `first()` is the best on offer everywhere else.
+    info.renditions
+        .sort_by_key(|rendition| std::cmp::Reverse(rendition.height));
     info
 }
 
@@ -431,6 +555,19 @@ pub fn extension_of(url: &str) -> Option<String> {
     Some(extension.to_ascii_lowercase())
 }
 
+/// "3 minutes", "2 hours" -- enough for a row that is only counting down.
+fn human_wait(wait: Duration) -> String {
+    let seconds = wait.as_secs();
+    if seconds < 90 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 90 {
+        return format!("{minutes} min");
+    }
+    format!("{}h {:02}m", minutes / 60, minutes % 60)
+}
+
 fn sanitize(value: &str) -> String {
     let cleaned: String = value
         .chars()
@@ -488,18 +625,54 @@ pub async fn record(
         name_hint,
         directory,
         headers,
+        height,
+        start_at,
+        skip,
+        limit,
     } = job;
     let url = url.as_str();
     validate_url(url)?;
 
-    // Probing first is what decides the container, and it turns the row in the
-    // window from "stream" into "1080p live" before a byte is written.
+    let mut stop = stop;
+
+    // A scheduled recording waits here, as a visible job that can be cancelled
+    // like any other. Waiting before the probe is deliberate: a programme that
+    // has not started yet has nothing to probe.
+    if let Some(at) = *start_at {
+        let now = crate::settings::now_unix();
+        if at > now {
+            let wait = Duration::from_secs((at - now) as u64);
+            let name = output_name(name_hint.as_deref(), url);
+            let _ = events
+                .send(VideoEvent::Title {
+                    job_id,
+                    title: format!("{name} (waiting {})", human_wait(wait)),
+                })
+                .await;
+            log::info!(
+                "stream job {job_id} waits {}s before starting",
+                wait.as_secs()
+            );
+            tokio::select! {
+                _ = sleep(wait) => {}
+                _ = &mut stop => bail!("stopped before the recording was due to start"),
+            }
+        }
+    }
+
+    // Probing decides the container and which quality to take, and turns the
+    // row in the window from "stream" into "1080p live" before a byte lands.
     let info = probe(url, headers).await?;
+    let chosen = info.choose(*height);
     let name = output_name(name_hint.as_deref(), url);
+    let described = match &chosen {
+        Some(rendition) => info.label_for(rendition),
+        None => info.label(),
+    };
     let _ = events
         .send(VideoEvent::Title {
             job_id,
-            title: format!("{name} ({})", info.label()),
+            title: format!("{name} ({described})"),
         })
         .await;
 
@@ -514,14 +687,30 @@ pub async fn record(
     // nothing for it to steal.
     command.arg("-hide_banner").arg("-loglevel").arg("error");
     apply_headers(&mut command, headers);
+    // Seeking before the input is the fast kind: ffmpeg jumps to the nearest
+    // keyframe rather than decoding its way there. With `-c copy` that is the
+    // only kind available, and a keyframe is where a copied stream has to
+    // start anyway. A live stream has no beginning to seek from, so it is
+    // skipped there rather than failing.
+    if let Some(skip) = skip.filter(|skip| !skip.is_zero() && !info.is_live()) {
+        command.arg("-ss").arg(format!("{:.3}", skip.as_secs_f64()));
+    }
     command.arg("-i").arg(url);
     // Take the rendition the row promised, not whichever ffmpeg would have
     // picked. Without this a master playlist records its smallest variant.
-    if let Some(index) = info.video_index {
+    if let Some(rendition) = &chosen {
+        command.arg("-map").arg(format!("0:{}", rendition.index));
+    }
+    // The chosen quality's own sound, falling back to the input's only audio
+    // when there are no variants to belong to.
+    if let Some(index) = chosen
+        .and_then(|rendition| rendition.audio_index)
+        .or(info.audio_index)
+    {
         command.arg("-map").arg(format!("0:{index}"));
     }
-    if let Some(index) = info.audio_index {
-        command.arg("-map").arg(format!("0:{index}"));
+    if let Some(limit) = limit.filter(|limit| !limit.is_zero()) {
+        command.arg("-t").arg(format!("{:.3}", limit.as_secs_f64()));
     }
     // Copy the packets across: no CPU cost, no quality lost.
     command.arg("-c").arg("copy");
@@ -562,7 +751,6 @@ pub async fn record(
     };
 
     let mut keyboard = child.stdin.take();
-    let mut stop = stop;
     let mut stopping = false;
     let stdout = child.stdout.take().context("ffmpeg produced no stdout")?;
     let stderr = child.stderr.take().context("ffmpeg produced no stderr")?;
@@ -760,9 +948,57 @@ mod tests {
                            {"index":2,"codec_type":"audio","codec_name":"aac"}],
                 "format":{"duration":"60"}}"#,
         );
-        assert_eq!(info.height, Some(1080));
-        assert_eq!(info.video_index, Some(1));
+        // Tallest first, and every quality kept: each is separately
+        // recordable, so offering only the best would throw the rest away.
+        assert_eq!(
+            info.renditions
+                .iter()
+                .map(|r| (r.height, r.index))
+                .collect::<Vec<_>>(),
+            [(Some(1080), 1), (Some(480), 0)]
+        );
+        assert_eq!(info.choose(None).map(|r| r.index), Some(1));
+        assert_eq!(info.choose(Some(480)).map(|r| r.index), Some(0));
+        // A quality that has gone falls back to the tallest beneath it.
+        assert_eq!(info.choose(Some(720)).map(|r| r.index), Some(0));
+        // ...and to the best of all when there is nothing beneath it.
+        assert_eq!(info.choose(Some(144)).map(|r| r.index), Some(1));
         assert_eq!(info.audio_index, Some(2));
+    }
+
+    #[test]
+    fn each_quality_is_paired_with_its_own_sound() {
+        // Captured from a real three-variant master playlist. Pairing 240p
+        // with program 0's audio would make ffmpeg fetch the 720p segments
+        // too, purely for their soundtrack.
+        let info = probe_of(
+            r#"{"format":{"duration":"20.0"},
+                "streams":[{"index":0,"codec_type":"video","codec_name":"h264","height":720},
+                           {"index":1,"codec_type":"audio","codec_name":"aac"},
+                           {"index":2,"codec_type":"video","codec_name":"h264","height":480},
+                           {"index":3,"codec_type":"audio","codec_name":"aac"},
+                           {"index":4,"codec_type":"video","codec_name":"h264","height":240},
+                           {"index":5,"codec_type":"audio","codec_name":"aac"}],
+                "programs":[
+                  {"streams":[{"index":0,"codec_type":"video","height":720},
+                              {"index":1,"codec_type":"audio"}]},
+                  {"streams":[{"index":2,"codec_type":"video","height":480},
+                              {"index":3,"codec_type":"audio"}]},
+                  {"streams":[{"index":4,"codec_type":"video","height":240},
+                              {"index":5,"codec_type":"audio"}]}]}"#,
+        );
+        assert_eq!(
+            info.renditions
+                .iter()
+                .map(|r| (r.height, r.index, r.audio_index))
+                .collect::<Vec<_>>(),
+            [
+                (Some(720), 0, Some(1)),
+                (Some(480), 2, Some(3)),
+                (Some(240), 4, Some(5)),
+            ]
+        );
+        assert_eq!(info.choose(Some(240)).and_then(|r| r.audio_index), Some(5));
     }
 
     #[test]
@@ -772,7 +1008,7 @@ mod tests {
                            {"codec_type":"audio","codec_name":"aac"}],
                 "format":{}}"#,
         );
-        assert_eq!(info.video_index, Some(0));
+        assert_eq!(info.renditions.first().map(|r| r.index), Some(0));
         assert_eq!(info.audio_index, Some(1));
     }
 
@@ -890,6 +1126,15 @@ mod stop_tests {
     /// test. Range headers are ignored and the whole body is sent, which
     /// ffmpeg is content with.
     async fn serve_slowly(path: PathBuf) -> u16 {
+        serve(path, Duration::from_millis(60)).await
+    }
+
+    /// As above, at full speed, for the tests that are not about timing.
+    async fn serve_fast(path: PathBuf) -> u16 {
+        serve(path, Duration::ZERO).await
+    }
+
+    async fn serve(path: PathBuf, pace: Duration) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
@@ -915,12 +1160,153 @@ mod stop_tests {
                         if socket.write_all(chunk).await.is_err() {
                             return;
                         }
-                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        if !pace.is_zero() {
+                            tokio::time::sleep(pace).await;
+                        }
                     }
                 });
             }
         });
         port
+    }
+
+    /// Build a clip of `seconds`, keyframed once a second so a seek can land
+    /// close to where it was asked to.
+    async fn build_clip(dir: &Path, seconds: u32) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("scratch directory");
+        let source = dir.join("clip.mp4");
+        let video = format!("testsrc2=size=320x240:rate=25:duration={seconds}");
+        let audio = format!("sine=frequency=440:duration={seconds}");
+        let built = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-f", "lavfi", "-i"])
+            .arg(&video)
+            .args(["-f", "lavfi", "-i"])
+            .arg(&audio)
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "25",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-shortest",
+                "-y",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .expect("ffmpeg runs");
+        assert!(built.status.success(), "could not build the test clip");
+        source
+    }
+
+    /// Six seconds asked for, starting five in, must give six seconds -- not
+    /// the whole half minute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn records_only_the_segment_asked_for() {
+        if which("ffmpeg").is_none() || which("ffprobe").is_none() {
+            eprintln!("skipping: ffmpeg/ffprobe not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("snatch-seg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = build_clip(&dir, 30).await;
+        let port = serve_fast(source).await;
+
+        let (events, mut seen) = mpsc::channel(64);
+        tokio::spawn(async move { while seen.recv().await.is_some() {} });
+        let (_stopper, stop) = oneshot::channel();
+
+        let job = Recording {
+            name_hint: Some("segment".to_owned()),
+            skip: Some(Duration::from_secs(5)),
+            limit: Some(Duration::from_secs(6)),
+            ..Recording::new(format!("http://127.0.0.1:{port}/clip.mp4"), dir.clone())
+        };
+        let proxies = ProxyManager::load(dir.join("proxies.json"));
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            record(2, &job, &proxies, stop, &events),
+        )
+        .await
+        .expect("the segment ends on its own")
+        .expect("the recording succeeded");
+
+        let seconds = crate::processor::probe_duration(&output)
+            .await
+            .expect("ffprobe reads it")
+            .expect("it has a duration")
+            .as_secs_f64();
+        // `-ss` seeks to the nearest keyframe, so where it starts is
+        // approximate. How much it takes is not.
+        assert!(
+            (seconds - 6.0).abs() < 1.5,
+            "expected about six seconds, got {seconds}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scheduled recording waits, says so, and leaves nothing behind if it
+    /// is called off before its time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scheduled_recording_waits_and_can_be_called_off() {
+        if which("ffmpeg").is_none() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("snatch-sched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+
+        let (events, mut seen) = mpsc::channel(64);
+        let (stopper, stop) = oneshot::channel();
+        // An hour away, and an address nothing answers on: if the wait were
+        // not honoured this would fail trying to reach it.
+        let job = Recording {
+            start_at: Some(crate::settings::now_unix() + 3600),
+            ..Recording::new("http://127.0.0.1:1/never.m3u8".to_owned(), dir.clone())
+        };
+        let proxies = ProxyManager::load(dir.join("proxies.json"));
+        let waiting = tokio::spawn(async move { record(3, &job, &proxies, stop, &events).await });
+
+        let titled = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .expect("a title arrives promptly")
+            .expect("the channel is open");
+        match titled {
+            VideoEvent::Title { title, .. } => {
+                assert!(title.contains("waiting"), "unhelpful title: {title}");
+            }
+            other => panic!("expected a title, got {other:?}"),
+        }
+
+        stopper.send(()).expect("still waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("it gives up promptly once called off")
+            .expect("the task did not panic");
+        let error = format!(
+            "{:#}",
+            outcome.expect_err("a called-off wait is not a recording")
+        );
+        assert!(
+            error.contains("before the recording"),
+            "unclear reason: {error}"
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("the directory exists")
+                .flatten()
+                .all(|entry| entry.file_name() != "never.mkv"),
+            "a called-off recording left a file behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The decisive test for stopping a recording.
@@ -939,52 +1325,16 @@ mod stop_tests {
 
         let dir = std::env::temp_dir().join(format!("snatch-stop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch directory");
-        let source = dir.join("clip.mp4");
-
         // `+faststart` puts the index at the front, so the probe that `record`
         // does first finishes quickly even though the body arrives slowly.
-        let built = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-nostdin",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=size=320x240:rate=25:duration=30",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=30",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                "-shortest",
-                "-y",
-            ])
-            .arg(&source)
-            .output()
-            .await
-            .expect("ffmpeg runs");
-        assert!(built.status.success(), "could not build the test clip");
-
+        let source = build_clip(&dir, 30).await;
         let port = serve_slowly(source).await;
         let (events, mut seen) = mpsc::channel(64);
         let (stopper, stop) = oneshot::channel();
 
         let job = Recording {
-            url: format!("http://127.0.0.1:{port}/clip.mp4"),
             name_hint: Some("stop test".to_owned()),
-            directory: dir.clone(),
-            headers: Headers::default(),
+            ..Recording::new(format!("http://127.0.0.1:{port}/clip.mp4"), dir.clone())
         };
         let proxies = ProxyManager::load(dir.join("proxies.json"));
 
