@@ -327,9 +327,12 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
         for rendition in qualities {
             rows.push(crate::ytdlp::MediaFormat {
                 id: String::new(),
-                label: match &rendition {
-                    Some(rendition) => info.label_for(rendition),
-                    None => info.label(),
+                label: match (&rendition, source) {
+                    // A file is never live, however little ffprobe could
+                    // measure about it.
+                    (Some(rendition), FormatSource::File) => info.file_label_for(rendition),
+                    (Some(rendition), _) => info.label_for(rendition),
+                    (None, _) => info.label(),
                 },
                 ext: ext.clone(),
                 // Only a file has a size worth showing. ffprobe reports the
@@ -351,13 +354,18 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     // Best first, and only one row per description. A player fetches its
     // master playlist and then the rendition inside it, which come back as
     // two rows saying exactly the same thing.
+    //
+    // Kept per source, not per label: a plain file and a playlist of the same
+    // programme describe themselves identically, and they are different
+    // answers -- one is recorded and one is fetched in sixteen pieces.
     rows.sort_by_key(|row| std::cmp::Reverse(row.height));
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: Vec<(String, crate::ytdlp::FormatSource)> = Vec::new();
     rows.retain(|row| {
-        if seen.contains(&row.label) {
+        let key = (row.label.clone(), row.source);
+        if seen.contains(&key) {
             return false;
         }
-        seen.push(row.label.clone());
+        seen.push(key);
         true
     });
 

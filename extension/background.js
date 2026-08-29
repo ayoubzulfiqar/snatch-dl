@@ -59,8 +59,14 @@ const DOWNLOAD_EXTENSIONS = new Set([
   "wmv", "xls", "xlsx", "xz", "zip", "zst"
 ]);
 
-/** Playlist and manifest types, by file extension. */
-const MANIFEST_EXTENSIONS = new Set(["m3u8", "m3u", "mpd", "ism", "f4m"]);
+/**
+ * Playlist and manifest types, by file extension.
+ *
+ * Smooth Streaming (.ism) and Adobe HDS (.f4m) are deliberately absent:
+ * ffmpeg has no demuxer for either, so noticing one would only spend a
+ * candidate slot on something that can never be recorded.
+ */
+const MANIFEST_EXTENSIONS = new Set(["m3u8", "m3u", "mpd"]);
 
 /** ...and by what the server says they are, for the ones with no extension. */
 const MANIFEST_TYPES = new Set([
@@ -75,16 +81,24 @@ const MANIFEST_TYPES = new Set([
 /** Whole media files, for the sites that just serve one. */
 const MEDIA_EXTENSIONS = new Set([
   "mp4", "webm", "m4v", "mov", "mkv", "avi", "flv", "3gp", "ogv",
+  "ts", "mts", "m2ts",
   "m4a", "mp3", "aac", "flac", "wav", "ogg", "opus", "m4b"
 ]);
 
 /**
- * Pieces of a stream, never a file to offer on their own.
- *
- * A four-second fragment is not a download, and a page playing one produces
- * hundreds of them.
+ * Pieces of a stream, whatever their size. A four-second fragment is not a
+ * download, and a page playing one produces hundreds of them.
  */
-const FRAGMENT_EXTENSIONS = new Set(["m4s", "cmfv", "cmfa", "fmp4", "ts"]);
+const FRAGMENT_EXTENSIONS = new Set(["m4s", "cmfv", "cmfa", "fmp4"]);
+
+/**
+ * MPEG-TS is both: the container a whole broadcast is served in, and the
+ * container each four-second piece of an HLS stream is served in. Only the
+ * size tells them apart, so one of these counts as a file to offer only when
+ * the server says how big it is and it is far too big to be a fragment.
+ */
+const SEGMENT_OR_WHOLE = new Set(["ts", "mts", "m2ts"]);
+const WHOLE_FILE_BYTES = 20 * 1024 * 1024;
 
 /** Most manifests worth remembering for one tab. */
 const STREAM_LIMIT = 24;
@@ -364,12 +378,15 @@ function extensionOf(url) {
  * a media file; the manifest is already the better answer for that page, so
  * there is nothing to gain by listing its pieces.
  */
-function rememberFile(tabId, url) {
+function rememberFile(tabId, url, knownWhole) {
   if ((streams.get(tabId) ?? []).length > 0) {
     return;
   }
   const extension = extensionOf(url);
-  if (FRAGMENT_EXTENSIONS.has(extension) || !MEDIA_EXTENSIONS.has(extension)) {
+  if (!MEDIA_EXTENSIONS.has(extension) || FRAGMENT_EXTENSIONS.has(extension)) {
+    return;
+  }
+  if (SEGMENT_OR_WHOLE.has(extension) && !knownWhole) {
     return;
   }
   remember(files, tabId, url, FILE_LIMIT);
@@ -986,6 +1003,16 @@ api.webRequest.onHeadersReceived.addListener(
     const declared = headerValue(details.responseHeaders, "content-type");
     if (declared && MANIFEST_TYPES.has(declared.split(";")[0].trim().toLowerCase())) {
       rememberStream(details.tabId, details.url);
+    }
+
+    // A whole broadcast served as one MPEG-TS file looks exactly like a piece
+    // of an HLS stream until the server says how big it is.
+    const declaredLength = Number.parseInt(
+      headerValue(details.responseHeaders, "content-length") ?? "",
+      10
+    );
+    if (Number.isFinite(declaredLength) && declaredLength >= WHOLE_FILE_BYTES) {
+      rememberFile(details.tabId, details.url, true);
     }
 
     const disposition = headerValue(details.responseHeaders, "content-disposition");

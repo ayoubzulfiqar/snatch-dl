@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.13.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.14.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.13.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.13.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.13.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.14.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.14.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.14.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -230,6 +230,22 @@ Press stop and it asks what you want:
 
 Snatch always closes the file properly. A recording you stop halfway still
 opens and still plays.
+
+**What kinds of stream work?**
+
+| Kind | Written as | How |
+|---|---|---|
+| HLS | `.m3u8`, `.m3u` | Found on the page. Every quality is listed. |
+| DASH | `.mpd` | Found on the page. |
+| MPEG-TS | `.ts`, `.mts`, `.m2ts` | Found on the page when it is a whole show, not a piece of one. |
+| Plain files | `.mp4`, `.mkv`, `.webm`, `.flv`, `.mov`, `.avi`, and more | Downloaded fast, in 16 pieces. |
+| RTMP, RTSP, SRT, MMS, RTP, UDP | `rtmp://`, `rtsp://`, `srt://`, `mms://`, `rtp://`, `udp://` | Type it into **Add to Snatch** and pick **Record stream**. |
+
+Your browser only ever sees web addresses, so the last row is for ones you type
+in yourself. Old `mms://` addresses are fixed up for you.
+
+Snatch checks every address before it offers it. If it cannot be read, it is
+never put in the list.
 
 **Record a row of channels in one go.**
 Open **Add to Snatch**. Paste the addresses, one per line. Pick **Record

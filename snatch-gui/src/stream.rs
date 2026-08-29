@@ -79,10 +79,32 @@ pub fn check_batch(count: usize) -> Result<()> {
 /// dozens; the player's own manifest is always among the first few.
 const MAX_CANDIDATES: usize = 4;
 
-/// Protocols ffmpeg can be pointed at. Anything else is either a local path
-/// (`file:`, and a bare path) or something a web page must not be able to
-/// reach, and this address arrives from a browser.
-const ALLOWED_SCHEMES: [&str; 7] = ["http", "https", "rtmp", "rtmps", "rtsp", "rtsps", "mms"];
+/// Protocols ffmpeg can be pointed at, checked against `ffmpeg -protocols`
+/// and its demuxer list rather than guessed.
+///
+/// Anything else is either a local path (`file:`, and a bare path) or
+/// something a web page must not be able to reach. Only the first two ever
+/// arrive from a browser: the extension will not hand over anything but
+/// http and https, so the rest are reachable only by typing one in.
+///
+/// `rtsp` and `rtsps` are not in `ffmpeg -protocols` because RTSP is a
+/// demuxer there rather than a protocol; `ffmpeg -i rtsp://…` works.
+const ALLOWED_SCHEMES: [&str; 12] = [
+    "http", "https", "rtmp", "rtmps", "rtsp", "rtsps", "srt", "mms", "mmsh", "mmst", "rtp", "udp",
+];
+
+/// Rewrite an address ffmpeg would refuse for a reason nobody would guess.
+///
+/// `mms://` is how every Windows Media address was ever written down, and
+/// ffmpeg answers "Protocol not found" for it: it carries `mmsh` and `mmst`
+/// and no plain `mms`. Players have rewritten it to `mmsh` for twenty years.
+pub fn normalise_url(url: &str) -> String {
+    let url = url.trim();
+    match url.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("mms") => format!("mmsh://{rest}"),
+        _ => url.to_owned(),
+    }
+}
 
 fn ffmpeg_binary() -> String {
     std::env::var("SNATCH_FFMPEG")
@@ -189,7 +211,7 @@ impl Recording {
     /// is stopped.
     pub fn new(url: String, directory: PathBuf) -> Self {
         Self {
-            url,
+            url: normalise_url(&url),
             name_hint: None,
             directory,
             headers: Headers::default(),
@@ -271,16 +293,34 @@ impl StreamInfo {
         self.renditions.first().copied()
     }
 
-    /// What one quality of this address is called: `1080p live`, `720p · 3:45`.
-    pub fn label_for(&self, rendition: &Rendition) -> String {
-        let quality = match (rendition.height, self.has_video()) {
+    fn quality_of(&self, rendition: &Rendition) -> String {
+        match (rendition.height, self.has_video()) {
             (Some(height), _) => format!("{height}p"),
             (None, true) => "Stream".to_owned(),
             (None, false) => "Audio stream".to_owned(),
-        };
+        }
+    }
+
+    /// What one quality of this address is called: `1080p live`, `720p · 3:45`.
+    pub fn label_for(&self, rendition: &Rendition) -> String {
+        let quality = self.quality_of(rendition);
         if self.is_live() {
             return format!("{quality} live");
         }
+        self.with_duration(quality)
+    }
+
+    /// The same, for an address that is a file rather than a broadcast.
+    ///
+    /// A file is never live. Raw MPEG-TS carries no duration in its header, so
+    /// ffprobe often cannot measure one -- which means "not known", not "still
+    /// happening", and a row reading "360p live" beside a finished recording
+    /// of last night's match is simply wrong.
+    pub fn file_label_for(&self, rendition: &Rendition) -> String {
+        self.with_duration(self.quality_of(rendition))
+    }
+
+    fn with_duration(&self, quality: String) -> String {
         match self.duration {
             Some(duration) => format!(
                 "{quality} · {}",
@@ -1389,6 +1429,19 @@ mod tests {
     }
 
     #[test]
+    fn a_file_is_never_called_live() {
+        // Raw MPEG-TS has no duration in its header, so ffprobe reports none.
+        // For a broadcast that means live; for a file it means unmeasured.
+        let info = probe_of(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","height":360}],
+                "format":{}}"#,
+        );
+        let rendition = info.renditions.first().copied().expect("one quality");
+        assert_eq!(info.label_for(&rendition), "360p live");
+        assert_eq!(info.file_label_for(&rendition), "360p");
+    }
+
+    #[test]
     fn an_audio_only_stream_says_so() {
         let info =
             probe_of(r#"{"streams":[{"codec_type":"audio","codec_name":"aac"}],"format":{}}"#);
@@ -1432,9 +1485,36 @@ mod tests {
     }
 
     #[test]
+    fn mms_addresses_are_rewritten_to_something_ffmpeg_has() {
+        // ffmpeg answers "Protocol not found" for a plain mms:// address: it
+        // carries mmsh and mmst and no alias between them.
+        assert_eq!(
+            normalise_url("mms://media.example/stream"),
+            "mmsh://media.example/stream"
+        );
+        assert_eq!(
+            normalise_url("MMS://media.example/stream"),
+            "mmsh://media.example/stream"
+        );
+        // Everything else is left exactly as it was.
+        assert_eq!(
+            normalise_url("https://example.com/a.m3u8"),
+            "https://example.com/a.m3u8"
+        );
+        assert_eq!(normalise_url("  rtsp://x/y  "), "rtsp://x/y");
+        // ...and it is applied on the way in, not left to the caller.
+        let job = Recording::new("mms://media.example/s".to_owned(), PathBuf::from("/tmp"));
+        assert_eq!(job.url, "mmsh://media.example/s");
+    }
+
+    #[test]
     fn only_protocols_ffmpeg_should_be_pointed_at_are_allowed() {
         assert!(validate_url("https://example.com/live/index.m3u8").is_ok());
         assert!(validate_url("rtmp://example.com/live/key").is_ok());
+        // Checked against `ffmpeg -protocols`, not assumed.
+        assert!(validate_url("srt://example.com:9000").is_ok());
+        assert!(validate_url("mmsh://media.example/stream").is_ok());
+        assert!(validate_url("udp://239.0.0.1:1234").is_ok());
         // A page must not be able to make Snatch read the disk.
         assert!(validate_url("file:///etc/passwd").is_err());
         assert!(validate_url("concat:/etc/passwd").is_err());
