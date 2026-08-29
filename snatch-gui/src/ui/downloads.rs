@@ -507,6 +507,9 @@ struct JobRow {
     title: gtk::Label,
     detail: gtk::Label,
     progress: gtk::ProgressBar,
+    /// Only a recording can be paused, so this stays hidden for every other
+    /// kind of job rather than sitting there doing nothing.
+    pause: gtk::Button,
     cancel: gtk::Button,
 }
 
@@ -518,10 +521,13 @@ impl JobRow {
         let detail = caption_label(false);
         detail.add_css_class("snatch-detail");
         let progress = gtk::ProgressBar::builder().hexpand(true).build();
+        let pause = control_button("media-playback-pause-symbolic", "Pause this recording");
+        pause.set_visible(false);
         let cancel = control_button("process-stop-symbolic", "Stop this job");
 
         let heading = gtk::Box::builder().spacing(12).build();
         heading.append(&title);
+        heading.append(&pause);
         heading.append(&cancel);
 
         let body = row_body();
@@ -537,6 +543,7 @@ impl JobRow {
             title,
             detail,
             progress,
+            pause,
             cancel,
         })
     }
@@ -562,6 +569,37 @@ impl JobRow {
         self.cancel.connect_clicked(move |button| {
             let Some(ui) = weak.upgrade() else { return };
             present_stop_recording(&ui, job_id, button.clone());
+        });
+
+        // Pausing stops capturing and starts again where the button says so.
+        // What was missed while paused is missing from the result, which for a
+        // broadcast is the only thing pausing can mean.
+        self.pause.set_visible(true);
+        let weak = Rc::downgrade(ui);
+        let paused = std::cell::Cell::new(false);
+        self.pause.connect_clicked(move |button| {
+            let Some(ui) = weak.upgrade() else { return };
+            let wanted = !paused.get();
+            if !ui.backend().video.set_paused(job_id, wanted) {
+                ui.toast("That recording has already finished");
+                return;
+            }
+            paused.set(wanted);
+            button.set_icon_name(if wanted {
+                "media-playback-start-symbolic"
+            } else {
+                "media-playback-pause-symbolic"
+            });
+            button.set_tooltip_text(Some(if wanted {
+                "Carry on recording"
+            } else {
+                "Pause this recording"
+            }));
+            ui.toast(if wanted {
+                "Paused — what happens now will not be recorded"
+            } else {
+                "Recording again"
+            });
         });
     }
 

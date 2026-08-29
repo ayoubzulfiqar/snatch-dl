@@ -274,12 +274,13 @@ fn parse_line(line: &str) -> Line {
 pub struct VideoEngine {
     db: Database,
     jobs: Mutex<HashMap<i64, JoinHandle<()>>>,
-    /// The graceful way out of a recording, one per running stream job.
+    /// The way to reach a running recording, one per stream job.
     ///
     /// Aborting the task kills ffmpeg mid-write. A live recording ends by
     /// being stopped -- that is the only way one ever ends -- so stopping has
-    /// to close the file properly rather than leave a stump behind.
-    stoppers: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>,
+    /// to close the file properly rather than leave a stump behind. Pausing
+    /// and resuming travel the same way.
+    controls: Mutex<HashMap<i64, mpsc::Sender<crate::stream::Control>>>,
 }
 
 impl VideoEngine {
@@ -287,7 +288,7 @@ impl VideoEngine {
         Arc::new(Self {
             db,
             jobs: Mutex::new(HashMap::new()),
-            stoppers: Mutex::new(HashMap::new()),
+            controls: Mutex::new(HashMap::new()),
         })
     }
 
@@ -297,17 +298,17 @@ impl VideoEngine {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn stoppers(
+    fn controls(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<i64, tokio::sync::oneshot::Sender<()>>> {
-        self.stoppers
+    ) -> std::sync::MutexGuard<'_, HashMap<i64, mpsc::Sender<crate::stream::Control>>> {
+        self.controls
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Whether this job is a recording that can be finished on request.
+    /// Whether this job is a recording, and so can be paused or finished.
     pub fn is_recording(&self, job_id: i64) -> bool {
-        self.stoppers().contains_key(&job_id)
+        self.controls().contains_key(&job_id)
     }
 
     /// Ask a recording to finish and close its file properly.
@@ -316,14 +317,31 @@ impl VideoEngine {
     /// extraction is always: it has no half-written container to rescue, so
     /// the caller falls back to [`VideoEngine::cancel`].
     pub fn stop(&self, job_id: i64) -> bool {
-        match self.stoppers().remove(&job_id) {
-            Some(stopper) => {
-                // An error means the recording finished on its own between the
-                // click and here, which needs no rescuing either.
-                let _ = stopper.send(());
+        // Removed as well as told: nothing else may be asked of it now.
+        match self.controls().remove(&job_id) {
+            Some(control) => {
+                // A closed channel means the recording finished on its own
+                // between the click and here, which needs no rescuing either.
+                let _ = control.try_send(crate::stream::Control::Stop);
                 log::info!("asked recording {job_id} to finish");
                 true
             }
+            None => false,
+        }
+    }
+
+    /// Pause or resume a recording, keeping everything captured so far.
+    ///
+    /// The stretches are joined into one file when the recording finally ends,
+    /// so a pause leaves a gap in the result rather than a second file.
+    pub fn set_paused(&self, job_id: i64, paused: bool) -> bool {
+        let wanted = if paused {
+            crate::stream::Control::Pause
+        } else {
+            crate::stream::Control::Resume
+        };
+        match self.controls().get(&job_id) {
+            Some(control) => control.try_send(wanted).is_ok(),
             None => false,
         }
     }
@@ -337,10 +355,10 @@ impl VideoEngine {
 
     /// Abort a job. `kill_on_drop` turns the abort into a killed subprocess.
     pub fn cancel(&self, job_id: i64) {
-        // Dropping the stopper without sending is the same as sending: the
-        // recording is ending either way, and the task abort below is what
+        // Dropping the control without sending is the same as sending a stop:
+        // the recording is ending either way, and the task abort below is what
         // makes this the abrupt version.
-        self.stoppers().remove(&job_id);
+        self.controls().remove(&job_id);
         if let Some(task) = self.jobs().remove(&job_id) {
             task.abort();
             log::info!("cancelled video job {job_id}");
@@ -445,13 +463,15 @@ impl VideoEngine {
             })
             .await;
 
-        let (stopper, stop) = tokio::sync::oneshot::channel();
-        self.stoppers().insert(job_id, stopper);
+        // Room for a pause and a stop to be queued behind each other without
+        // the sender ever having to wait on the recording.
+        let (control, commands) = mpsc::channel(8);
+        self.controls().insert(job_id, control);
 
         let engine = Arc::clone(self);
         let task = tokio::spawn(async move {
             let outcome =
-                crate::stream::record(job_id, &job, proxies.as_ref(), stop, &events).await;
+                crate::stream::record(job_id, &job, proxies.as_ref(), commands, &events).await;
 
             let (state, error) = match outcome {
                 Ok(output) => {
@@ -479,7 +499,7 @@ impl VideoEngine {
             if let Err(error) = engine.db.finish_media_job(job_id, state, error).await {
                 log::warn!("could not close stream job {job_id}: {error:#}");
             }
-            engine.stoppers().remove(&job_id);
+            engine.controls().remove(&job_id);
             engine.jobs().remove(&job_id);
         });
 

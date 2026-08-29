@@ -41,7 +41,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 use crate::network::{Engine, ProxyManager};
@@ -613,11 +613,39 @@ pub fn unique_path(directory: &Path, name: &str, extension: &str) -> PathBuf {
 /// ffmpeg is asked to finish, so the file is closed properly and plays. The
 /// task can still be aborted outright, which kills ffmpeg mid-write -- which
 /// is the other reason a live recording goes to Matroska.
+/// What ended one part of a recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartEnd {
+    /// The stream itself finished, or the length asked for was reached.
+    Source,
+    Paused,
+    Stopped,
+}
+
+/// Pause, resume or stop a recording in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Pause,
+    Resume,
+    Stop,
+}
+
+/// Record `url` until it ends, or until it is stopped.
+///
+/// A pause is not a suspended process. A live stream carries on whether it is
+/// being recorded or not, so pausing has to mean *stop capturing cleanly and
+/// capture again later* -- which is why each stretch is written as its own
+/// part file and the parts are joined at the end. Suspending ffmpeg instead
+/// would leave it not reading its socket while the broadcast ran on, and it
+/// would come back to a playlist that had moved on without it.
+///
+/// The task can still be aborted outright, which kills ffmpeg mid-write --
+/// which is the other reason a live recording goes to Matroska.
 pub async fn record(
     job_id: i64,
     job: &Recording,
     proxies: &ProxyManager,
-    stop: oneshot::Receiver<()>,
+    control: mpsc::Receiver<Control>,
     events: &mpsc::Sender<VideoEvent>,
 ) -> Result<PathBuf> {
     let Recording {
@@ -633,7 +661,8 @@ pub async fn record(
     let url = url.as_str();
     validate_url(url)?;
 
-    let mut stop = stop;
+    let mut control = control;
+    let name = output_name(name_hint.as_deref(), url);
 
     // A scheduled recording waits here, as a visible job that can be cancelled
     // like any other. Waiting before the probe is deliberate: a programme that
@@ -642,7 +671,6 @@ pub async fn record(
         let now = crate::settings::now_unix();
         if at > now {
             let wait = Duration::from_secs((at - now) as u64);
-            let name = output_name(name_hint.as_deref(), url);
             let _ = events
                 .send(VideoEvent::Title {
                     job_id,
@@ -655,7 +683,9 @@ pub async fn record(
             );
             tokio::select! {
                 _ = sleep(wait) => {}
-                _ = &mut stop => bail!("stopped before the recording was due to start"),
+                _ = control.recv() => {
+                    bail!("stopped before the recording was due to start")
+                }
             }
         }
     }
@@ -664,7 +694,6 @@ pub async fn record(
     // row in the window from "stream" into "1080p live" before a byte lands.
     let info = probe(url, headers).await?;
     let chosen = info.choose(*height);
-    let name = output_name(name_hint.as_deref(), url);
     let described = match &chosen {
         Some(rendition) => info.label_for(rendition),
         None => info.label(),
@@ -678,12 +707,227 @@ pub async fn record(
 
     std::fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
-    let output = unique_path(directory.as_path(), &name, info.container());
+    let extension = info.container();
+    // Reserved up front so every part of one recording shares a stem, even if
+    // another recording of the same programme is running beside it.
+    let final_path = unique_path(directory.as_path(), &name, extension);
+    let stem = final_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.clone());
+
+    let mut parts: Vec<PathBuf> = Vec::new();
+    let mut progress = VideoProgress::default();
+    let mut recorded = Duration::ZERO;
+
+    loop {
+        // The length asked for covers the recording, not the wall clock, so
+        // what a paused stretch missed does not count against it.
+        let remaining = match limit {
+            Some(limit) if !limit.is_zero() => match limit.checked_sub(recorded) {
+                Some(left) if left > Duration::from_millis(200) => Some(left),
+                // Already have everything that was asked for.
+                _ => break,
+            },
+            _ => None,
+        };
+
+        let seek = resume_seek(&info, *skip, recorded);
+        let part = directory.join(format!("{stem}.part{}.{extension}", parts.len() + 1));
+        let ended = run_part(
+            job_id,
+            url,
+            headers,
+            &info,
+            chosen.as_ref(),
+            seek,
+            remaining,
+            &part,
+            proxies,
+            &mut control,
+            events,
+            &mut progress,
+            &mut recorded,
+        )
+        .await?;
+        parts.push(part);
+
+        match ended {
+            PartEnd::Source | PartEnd::Stopped => break,
+            PartEnd::Paused => {
+                let _ = events
+                    .send(VideoEvent::Title {
+                        job_id,
+                        title: format!("{name} (paused)"),
+                    })
+                    .await;
+                log::info!("stream job {job_id} paused after {} part(s)", parts.len());
+                // Nothing is running now, so this simply waits. A dropped
+                // sender means the engine went away and the recording is over.
+                match control.recv().await {
+                    Some(Control::Resume) => {
+                        let _ = events
+                            .send(VideoEvent::Title {
+                                job_id,
+                                title: format!("{name} ({described})"),
+                            })
+                            .await;
+                        log::info!("stream job {job_id} resumed");
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    join_parts(job_id, parts, &final_path, events).await
+}
+
+/// Put the parts together, or hand back the only one there was.
+async fn join_parts(
+    job_id: i64,
+    parts: Vec<PathBuf>,
+    final_path: &Path,
+    events: &mpsc::Sender<VideoEvent>,
+) -> Result<PathBuf> {
+    let kept: Vec<PathBuf> = parts.into_iter().filter(|part| part.is_file()).collect();
+    match kept.len() {
+        0 => bail!("the recording produced no file"),
+        // Never paused: a rename is the whole job.
+        1 => {
+            std::fs::rename(&kept[0], final_path).with_context(|| {
+                format!(
+                    "could not move {} into place",
+                    kept[0].file_name().unwrap_or_default().to_string_lossy()
+                )
+            })?;
+            Ok(final_path.to_owned())
+        }
+        _ => {
+            let _ = events
+                .send(VideoEvent::Title {
+                    job_id,
+                    title: format!("Joining {} parts", kept.len()),
+                })
+                .await;
+            match concatenate(&kept, final_path).await {
+                Ok(()) => {
+                    // Only once the joined file exists: a failed join that had
+                    // already deleted its inputs would lose the recording.
+                    for part in &kept {
+                        if let Err(error) = std::fs::remove_file(part) {
+                            log::warn!("could not remove {}: {error}", part.display());
+                        }
+                    }
+                    Ok(final_path.to_owned())
+                }
+                Err(error) => {
+                    // The parts are each watchable on their own, so say where
+                    // they are rather than pretending nothing was recorded.
+                    log::warn!("stream job {job_id} could not be joined: {error:#}");
+                    bail!(
+                        "the {} parts were recorded but could not be joined ({error:#}); \
+                         they are beside each other in {}",
+                        kept.len(),
+                        final_path.parent().unwrap_or(final_path).display()
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Join the parts with the concat demuxer, copying the packets across.
+///
+/// Every part came from the same stream at the same quality, so their codecs
+/// match and nothing has to be re-encoded.
+async fn concatenate(parts: &[PathBuf], output: &Path) -> Result<()> {
+    let list = output.with_extension("parts.txt");
+    let mut manifest = String::new();
+    for part in parts {
+        // The concat demuxer's own quoting: a single quote inside a path is
+        // written by closing, escaping and reopening.
+        let path = part.to_string_lossy().replace('\'', "'\\''");
+        manifest.push_str(&format!("file '{path}'\n"));
+    }
+    std::fs::write(&list, manifest)
+        .with_context(|| format!("could not write {}", list.display()))?;
 
     let binary = ffmpeg_binary();
+    let outcome = Command::new(&binary)
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("concat")
+        // The parts are ours, in our own directory, and named by us.
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&list)
+        .arg("-c")
+        .arg("copy")
+        .arg("-y")
+        .arg(output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("could not run ffmpeg to join the parts")?;
+
+    let _ = std::fs::remove_file(&list);
+    if !outcome.status.success() {
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        let reason = stderr
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or("ffmpeg gave no reason");
+        bail!("{reason}");
+    }
+    Ok(())
+}
+
+/// Where the next stretch of a recording should begin.
+///
+/// A live stream has no beginning to seek from, so resuming picks up at the
+/// live edge and whatever happened while paused is simply missing -- which is
+/// the only thing pausing a broadcast can mean.
+///
+/// Anything with a duration is seekable, so resuming carries on from where it
+/// left off. Without this the second stretch would start the file again and
+/// record the same minutes twice, and joining the parts would play them twice.
+fn resume_seek(info: &StreamInfo, skip: Option<Duration>, recorded: Duration) -> Option<Duration> {
+    if info.is_live() {
+        return None;
+    }
+    Some(skip.unwrap_or(Duration::ZERO) + recorded)
+}
+
+/// Record one uninterrupted stretch into `output`.
+#[allow(clippy::too_many_arguments)]
+async fn run_part(
+    job_id: i64,
+    url: &str,
+    headers: &Headers,
+    info: &StreamInfo,
+    chosen: Option<&Rendition>,
+    skip: Option<Duration>,
+    limit: Option<Duration>,
+    output: &Path,
+    proxies: &ProxyManager,
+    control: &mut mpsc::Receiver<Control>,
+    events: &mpsc::Sender<VideoEvent>,
+    progress: &mut VideoProgress,
+    recorded: &mut Duration,
+) -> Result<PartEnd> {
+    let binary = ffmpeg_binary();
     let mut command = Command::new(&binary);
-    // No `-nostdin`: ffmpeg is given a pipe of its own and read from it is how
-    // it is asked to stop. It is not attached to a terminal, so there is
+    // No `-nostdin`: ffmpeg is given a pipe of its own and reading from it is
+    // how it is asked to stop. It is not attached to a terminal, so there is
     // nothing for it to steal.
     command.arg("-hide_banner").arg("-loglevel").arg("error");
     apply_headers(&mut command, headers);
@@ -698,7 +942,7 @@ pub async fn record(
     command.arg("-i").arg(url);
     // Take the rendition the row promised, not whichever ffmpeg would have
     // picked. Without this a master playlist records its smallest variant.
-    if let Some(rendition) = &chosen {
+    if let Some(rendition) = chosen {
         command.arg("-map").arg(format!("0:{}", rendition.index));
     }
     // The chosen quality's own sound, falling back to the input's only audio
@@ -709,7 +953,7 @@ pub async fn record(
     {
         command.arg("-map").arg(format!("0:{index}"));
     }
-    if let Some(limit) = limit.filter(|limit| !limit.is_zero()) {
+    if let Some(limit) = limit {
         command.arg("-t").arg(format!("{:.3}", limit.as_secs_f64()));
     }
     // Copy the packets across: no CPU cost, no quality lost.
@@ -722,7 +966,7 @@ pub async fn record(
         .arg("pipe:1")
         .arg("-nostats")
         .arg("-y")
-        .arg(&output);
+        .arg(output);
 
     let task_key = format!("stream:{job_id}");
     if let Some(proxy) = proxies
@@ -751,29 +995,37 @@ pub async fn record(
     };
 
     let mut keyboard = child.stdin.take();
-    let mut stopping = false;
     let stdout = child.stdout.take().context("ffmpeg produced no stdout")?;
     let stderr = child.stderr.take().context("ffmpeg produced no stderr")?;
     let mut progress_lines = BufReader::new(stdout).lines();
     let mut error_lines = BufReader::new(stderr).lines();
 
-    let mut current = VideoProgress::default();
     let mut last_error: Option<String> = None;
     let (mut stdout_open, mut stderr_open) = (true, true);
     // ffmpeg reports how far through the media it is and how many bytes it
     // has written, but never a byte total -- for a live stream there is no
     // such number. The rate is worked out from the byte counter instead.
     let mut last_sample: Option<(std::time::Instant, u64)> = None;
+    // Bytes and media time already banked from earlier parts.
+    let banked_bytes = progress.downloaded;
+    let banked_time = *recorded;
+    let mut ending: Option<PartEnd> = None;
 
     // Both pipes drain at once. Reading one to the end first would block as
     // soon as the other filled, which for a long recording it certainly will.
     while stdout_open || stderr_open {
         tokio::select! {
-            // A dropped sender means the engine is going away, and is treated
-            // the same as an explicit stop: finish the file rather than lose it.
-            _ = &mut stop, if !stopping => {
-                stopping = true;
-                log::info!("stream job {job_id}: asking ffmpeg to finish");
+            // A stop after a pause request still counts as a stop: the more
+            // final answer wins. A dropped sender means the engine is going
+            // away, and is treated as a stop -- finish the file, do not lose it.
+            command = control.recv(), if ending != Some(PartEnd::Stopped) => {
+                let wanted = match command {
+                    Some(Control::Pause) => PartEnd::Paused,
+                    Some(Control::Stop) | None => PartEnd::Stopped,
+                    // Nothing to resume; it is already running.
+                    Some(Control::Resume) => continue,
+                };
+                ending = Some(wanted);
                 if let Some(mut pipe) = keyboard.take() {
                     // ffmpeg's own key for "stop cleanly". Closing the pipe
                     // afterwards is a second signal for the same thing.
@@ -795,13 +1047,16 @@ pub async fn record(
                             if let Some((then, before)) = last_sample {
                                 let seconds = now.duration_since(then).as_secs_f64();
                                 if seconds >= 0.5 && bytes > before {
-                                    current.speed = Some((bytes - before) as f64 / seconds);
+                                    progress.speed =
+                                        Some((bytes - before) as f64 / seconds);
                                     last_sample = Some((now, bytes));
                                 }
                             } else {
                                 last_sample = Some((now, bytes));
                             }
-                            current.downloaded = bytes;
+                            // Counts carry across a pause: the row must not
+                            // start again from zero when recording resumes.
+                            progress.downloaded = banked_bytes + bytes;
                         }
                         // How far into the media ffmpeg has got. `total` stays
                         // empty on purpose: it is a byte count everywhere else
@@ -809,7 +1064,8 @@ pub async fn record(
                         // it. The row pulses and says what has arrived, which
                         // is the truth for a stream that has not ended yet.
                         Field::OutTimeMicros(micros) => {
-                            current.eta_seconds = info
+                            *recorded = banked_time + Duration::from_micros(micros);
+                            progress.eta_seconds = info
                                 .duration
                                 .and_then(|total| {
                                     total.as_micros().checked_sub(u128::from(micros))
@@ -823,7 +1079,10 @@ pub async fn record(
                     }
                     if changed {
                         let _ = events
-                            .send(VideoEvent::Progress { job_id, progress: current.clone() })
+                            .send(VideoEvent::Progress {
+                                job_id,
+                                progress: progress.clone(),
+                            })
                             .await;
                     }
                 }
@@ -866,7 +1125,7 @@ pub async fn record(
         }
     }
 
-    Ok(output)
+    Ok(ending.unwrap_or(PartEnd::Source))
 }
 
 #[cfg(test)]
@@ -999,6 +1258,34 @@ mod tests {
             ]
         );
         assert_eq!(info.choose(Some(240)).and_then(|r| r.audio_index), Some(5));
+    }
+
+    #[test]
+    fn resuming_a_broadcast_rejoins_it_live_and_a_file_where_it_left_off() {
+        let live = probe_of(r#"{"streams":[{"codec_type":"video","height":720}],"format":{}}"#);
+        let vod = probe_of(
+            r#"{"streams":[{"codec_type":"video","height":720}],"format":{"duration":"600"}}"#,
+        );
+
+        // A broadcast carries on without us: what was missed is missed, and
+        // seeking into it is not a thing that can be done.
+        assert_eq!(resume_seek(&live, None, Duration::from_secs(90)), None);
+        assert_eq!(
+            resume_seek(&live, Some(Duration::from_secs(5)), Duration::ZERO),
+            None
+        );
+
+        // A file waits: carry on where the last stretch stopped, or the same
+        // minutes get recorded twice and play twice in the joined result.
+        assert_eq!(
+            resume_seek(&vod, None, Duration::from_secs(90)),
+            Some(Duration::from_secs(90))
+        );
+        // ...counted from wherever the recording was told to begin.
+        assert_eq!(
+            resume_seek(&vod, Some(Duration::from_secs(30)), Duration::from_secs(90)),
+            Some(Duration::from_secs(120))
+        );
     }
 
     #[test]
@@ -1145,18 +1432,50 @@ mod stop_tests {
                 };
                 let body = body.clone();
                 tokio::spawn(async move {
-                    // Enough of the request line to know one arrived.
                     let mut scratch = [0u8; 2048];
-                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
-                         Content-Length: {}\r\nAccept-Ranges: none\r\n\r\n",
-                        body.len()
-                    );
+                    let read = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch)
+                        .await
+                        .unwrap_or(0);
+                    let request = String::from_utf8_lossy(&scratch[..read]).into_owned();
+
+                    // Ranges are supported because real servers support them,
+                    // and because seeking is what resuming a recording does.
+                    let from = request
+                        .lines()
+                        .find_map(|line| {
+                            let value = line
+                                .strip_prefix("Range:")
+                                .or_else(|| line.strip_prefix("range:"))?;
+                            value
+                                .trim()
+                                .strip_prefix("bytes=")?
+                                .split('-')
+                                .next()?
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .filter(|from| *from < body.len());
+
+                    let head = match from {
+                        Some(from) => format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\n\
+                             Content-Length: {}\r\nAccept-Ranges: bytes\r\n\
+                             Content-Range: bytes {}-{}/{}\r\n\r\n",
+                            body.len() - from,
+                            from,
+                            body.len() - 1,
+                            body.len()
+                        ),
+                        None => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                             Content-Length: {}\r\nAccept-Ranges: bytes\r\n\r\n",
+                            body.len()
+                        ),
+                    };
                     if socket.write_all(head.as_bytes()).await.is_err() {
                         return;
                     }
-                    for chunk in body.chunks(32 * 1024) {
+                    for chunk in body[from.unwrap_or(0)..].chunks(32 * 1024) {
                         if socket.write_all(chunk).await.is_err() {
                             return;
                         }
@@ -1221,7 +1540,7 @@ mod stop_tests {
 
         let (events, mut seen) = mpsc::channel(64);
         tokio::spawn(async move { while seen.recv().await.is_some() {} });
-        let (_stopper, stop) = oneshot::channel();
+        let (_control, stop) = mpsc::channel(4);
 
         let job = Recording {
             name_hint: Some("segment".to_owned()),
@@ -1265,7 +1584,7 @@ mod stop_tests {
         std::fs::create_dir_all(&dir).expect("scratch directory");
 
         let (events, mut seen) = mpsc::channel(64);
-        let (stopper, stop) = oneshot::channel();
+        let (control, stop) = mpsc::channel(4);
         // An hour away, and an address nothing answers on: if the wait were
         // not honoured this would fail trying to reach it.
         let job = Recording {
@@ -1286,7 +1605,7 @@ mod stop_tests {
             other => panic!("expected a title, got {other:?}"),
         }
 
-        stopper.send(()).expect("still waiting");
+        control.send(Control::Stop).await.expect("still waiting");
         let outcome = tokio::time::timeout(Duration::from_secs(10), waiting)
             .await
             .expect("it gives up promptly once called off")
@@ -1305,6 +1624,93 @@ mod stop_tests {
                 .flatten()
                 .all(|entry| entry.file_name() != "never.mkv"),
             "a called-off recording left a file behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("the directory exists")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "proxies.json" && name != "clip.mp4")
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Pausing must close what has been recorded so far, and resuming must add
+    /// to it rather than replace it.
+    ///
+    /// The check that matters is made *during* the pause: the part on disk has
+    /// to be a finished, playable file at that moment. If pausing merely
+    /// suspended ffmpeg there would be an unfinished file there instead, and
+    /// ffprobe would refuse it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pausing_closes_a_playable_part_and_resuming_adds_to_it() {
+        if which("ffmpeg").is_none() || which("ffprobe").is_none() {
+            eprintln!("skipping: ffmpeg/ffprobe not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("snatch-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = build_clip(&dir, 30).await;
+        // Slowly, so there is a recording in progress to interrupt.
+        let port = serve_slowly(source).await;
+
+        let (events, mut seen) = mpsc::channel(64);
+        tokio::spawn(async move { while seen.recv().await.is_some() {} });
+        let (control, commands) = mpsc::channel(4);
+
+        let job = Recording {
+            name_hint: Some("pause test".to_owned()),
+            ..Recording::new(format!("http://127.0.0.1:{port}/clip.mp4"), dir.clone())
+        };
+        let proxies = ProxyManager::load(dir.join("proxies.json"));
+        let recording =
+            tokio::spawn(async move { record(4, &job, &proxies, commands, &events).await });
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        control.send(Control::Pause).await.expect("still recording");
+        // Long enough for ffmpeg to finish the part and close it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let during = files_in(&dir);
+        assert_eq!(
+            during,
+            ["pause test.part1.mp4"],
+            "unexpected files: {during:?}"
+        );
+        let first = crate::processor::probe_duration(&dir.join("pause test.part1.mp4"))
+            .await
+            .expect("ffprobe reads the paused part")
+            .expect("the paused part has a duration")
+            .as_secs_f64();
+        assert!(first > 0.5, "the paused part holds nothing: {first}s");
+
+        control.send(Control::Resume).await.expect("still paused");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        control.send(Control::Stop).await.expect("still recording");
+
+        let output = tokio::time::timeout(Duration::from_secs(40), recording)
+            .await
+            .expect("it finishes promptly once stopped")
+            .expect("the task did not panic")
+            .expect("the recording succeeded");
+
+        // One file, joined, with the parts cleaned up behind it.
+        assert_eq!(files_in(&dir), ["pause test.mp4"]);
+        assert_eq!(output, dir.join("pause test.mp4"));
+        let joined = crate::processor::probe_duration(&output)
+            .await
+            .expect("ffprobe reads the joined recording")
+            .expect("it has a duration")
+            .as_secs_f64();
+        // It has to hold more than the first stretch did, or resuming added
+        // nothing; and it cannot hold more than the source.
+        assert!(
+            joined > first + 0.5 && joined <= 31.0,
+            "expected more than the {first}s of part one, got {joined}s"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1330,7 +1736,7 @@ mod stop_tests {
         let source = build_clip(&dir, 30).await;
         let port = serve_slowly(source).await;
         let (events, mut seen) = mpsc::channel(64);
-        let (stopper, stop) = oneshot::channel();
+        let (control, stop) = mpsc::channel(4);
 
         let job = Recording {
             name_hint: Some("stop test".to_owned()),
@@ -1357,7 +1763,10 @@ mod stop_tests {
         // Long enough that ffmpeg is well into the file and nowhere near its
         // end, so stopping is genuinely interrupting a recording in progress.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        stopper.send(()).expect("the recorder is still listening");
+        control
+            .send(Control::Stop)
+            .await
+            .expect("the recorder is still listening");
 
         let output = tokio::time::timeout(Duration::from_secs(30), recording)
             .await

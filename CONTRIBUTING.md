@@ -142,6 +142,25 @@ it writes the trailer and exits 0. Killing it instead is what leaves a file
 with no trailer. So `stream.rs` gives ffmpeg a real stdin pipe and does **not**
 pass `-nostdin`.
 
+### Pausing writes a new part; it does not suspend ffmpeg
+
+A live stream carries on whether it is being recorded or not. Suspending
+ffmpeg would leave it not reading its socket while the broadcast ran on, and it
+would wake to a playlist that had moved past it.
+
+So a pause finishes the current part properly, and resuming starts a new one.
+The parts are joined with the concat demuxer when the recording ends, and are
+only deleted once the joined file exists — a join that removed its inputs first
+and then failed would lose the recording.
+
+Where the next part starts is the one thing that differs by source, and
+`resume_seek` is the whole rule:
+
+| Source | On resume |
+|---|---|
+| Live | No seek. The gap is the pause, which is what pausing a broadcast means. |
+| Anything with a duration | Seek to where it stopped, or the same minutes get recorded twice. |
+
 ### Each quality carries its own sound
 
 A master playlist is several variants, and ffprobe reports every one. Each has

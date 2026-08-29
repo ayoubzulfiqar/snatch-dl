@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.11.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.12.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.11.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.11.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.11.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.12.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.12.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.12.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -210,6 +210,15 @@ single file.
 **Record a live stream, and stop when you want.**
 Point at the player. Click the button. Pick the quality. Snatch writes the show
 to disk while it happens.
+
+**You can pause it.** Press pause and Snatch stops recording. Press it again
+and it starts again. Everything you kept ends up in one file.
+
+What happens while you are paused is not saved. That is what pausing a live
+show means — it keeps going without you.
+
+Watching a video that is not live? Pausing there loses nothing. Snatch carries
+on from the exact spot when you press play again.
 
 Press stop and it asks what you want:
 
