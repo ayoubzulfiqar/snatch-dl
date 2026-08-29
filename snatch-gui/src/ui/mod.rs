@@ -118,6 +118,10 @@ struct AddExtras {
     checksum: Option<String>,
     /// Unix time the download should start at.
     start_at: Option<i64>,
+    /// How long a recording should run. Ignored by every other kind.
+    record_seconds: Option<u64>,
+    /// The quality cap for a recording, by height.
+    height: Option<u32>,
 }
 
 impl AddExtras {
@@ -131,6 +135,12 @@ impl AddExtras {
         }
         if let Some(start_at) = self.start_at {
             request.start_at = Some(start_at);
+        }
+        if let Some(seconds) = self.record_seconds {
+            request.record_seconds = Some(seconds);
+        }
+        if let Some(height) = self.height {
+            request.height = Some(height);
         }
     }
 }
@@ -1074,9 +1084,7 @@ impl Ui {
             JobKind::Magnet => self.add_magnet(request.url),
             JobKind::Scrape => self.scraper.start(self, request.url),
             JobKind::Video => self.add_video(request.url),
-            // Recording a stream is started from the browser, which knows the
-            // address the player asked for. The window has no way to find one.
-            JobKind::Stream => self.toast("A stream is recorded from the browser button"),
+            JobKind::Stream => self.start_recording(&request),
             JobKind::Sniff => sniff::present(self, Some(request.url)),
             // A listing is answered on the socket and queues nothing, so it
             // never reaches the window. Saying so beats adding it silently to
@@ -1095,6 +1103,14 @@ impl Ui {
     pub fn enqueue_quiet(self: &Rc<Self>, request: DownloadRequest) {
         if let Err(error) = request.validate() {
             log::warn!("skipping {}: {error:#}", request.url);
+            return;
+        }
+
+        // Only a plain download has a fast path worth taking. Every other kind
+        // has an engine of its own, and handing a stream or a gallery page to
+        // aria2 fetches the page rather than what is on it.
+        if request.inferred_kind() != JobKind::Download {
+            self.enqueue(request);
             return;
         }
 
@@ -1343,6 +1359,31 @@ impl Ui {
         self.start_video(url, config);
     }
 
+    /// Begin recording one stream.
+    pub fn start_recording(self: &Rc<Self>, request: &DownloadRequest) {
+        let job = crate::stream::Recording::from_request(
+            request,
+            crate::ytdlp::destination_for(&self.backend.download_dir),
+        );
+
+        let weak = Rc::downgrade(self);
+        let backend = self.backend.clone();
+        glib::spawn_future_local(async move {
+            let engine = backend.video.clone();
+            let proxies = backend.proxies.clone();
+            let events = backend.video_events.clone();
+            let result = backend
+                .offload(async move { engine.start_stream(job, proxies, events).await })
+                .await;
+
+            let Some(ui) = weak.upgrade() else { return };
+            match result {
+                Ok(_) => ui.stack.set_visible_child_name(PAGE_DOWNLOADS),
+                Err(error) => ui.toast(&format!("Could not start the recording: {error:#}")),
+            }
+        });
+    }
+
     fn start_video(self: &Rc<Self>, url: String, config: crate::ytdlp::VideoConfig) {
         let weak = Rc::downgrade(self);
         let backend = self.backend.clone();
@@ -1455,6 +1496,7 @@ impl Ui {
             "Scrape gallery",
             "Extract video (yt-dlp)",
             "Find all media on the page",
+            "Record stream (ffmpeg)",
         ]);
         kinds.set_selected(0);
 
@@ -1543,6 +1585,53 @@ impl Ui {
             .child(&start_box)
             .build();
 
+        // Recording settings, shared by every address in the box. Recording a
+        // row of channels at eight for two hours is one dialog, not six.
+        let minutes = gtk::Entry::builder()
+            .placeholder_text("Minutes, or empty to record until stopped")
+            .build();
+        let quality = gtk::DropDown::from_strings(&[
+            "Best the stream offers",
+            "Up to 1080p",
+            "Up to 720p",
+            "Up to 480p",
+        ]);
+        let recording_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(4)
+            .build();
+        recording_box.append(&minutes);
+        recording_box.append(&quality);
+        recording_box.append(
+            &gtk::Label::builder()
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["snatch-hint"])
+                .label(
+                    "Used only by “Record stream”. A live stream is saved as it \
+                     happens, and you can pause it or stop it at any time.",
+                )
+                .build(),
+        );
+        let recording = gtk::Expander::builder()
+            .label("Recording length and quality")
+            .child(&recording_box)
+            .build();
+        // Meaningless for every other kind, so it says so by being unusable
+        // rather than by being ignored.
+        recording.set_sensitive(false);
+        kinds.connect_selected_notify({
+            let recording = recording.clone();
+            move |kinds| {
+                let is_recording = kinds.selected() == 6;
+                recording.set_sensitive(is_recording);
+                if is_recording {
+                    recording.set_expanded(true);
+                }
+            }
+        });
+
         // Say which day it lands on, since a time already past means tomorrow.
         start_time.connect_changed({
             let status = start_status.clone();
@@ -1594,6 +1683,7 @@ impl Ui {
         fields.append(&auth);
         fields.append(&integrity);
         fields.append(&timing);
+        fields.append(&recording);
 
         let dialog = adw::AlertDialog::builder()
             .heading("Add to Snatch")
@@ -1673,6 +1763,19 @@ impl Ui {
                 credentials: (!user.is_empty()).then(|| (user, password.text().to_string())),
                 checksum: (!digest.is_empty()).then_some(digest),
                 start_at,
+                record_seconds: minutes
+                    .text()
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .map(|value| value * 60),
+                height: match quality.selected() {
+                    1 => Some(1080),
+                    2 => Some(720),
+                    3 => Some(480),
+                    _ => None,
+                },
             };
             ui.add_from_text(&text, kinds.selected(), as_mirrors.is_active(), extras);
         });
@@ -1748,6 +1851,7 @@ impl Ui {
                 3 => DownloadRequest::scrape(url),
                 4 => DownloadRequest::video(url),
                 5 => DownloadRequest::sniff(url),
+                6 => DownloadRequest::stream(url),
                 // 0: let `inferred_kind` decide from the scheme.
                 _ => DownloadRequest::from_url(url),
             };
@@ -2202,12 +2306,32 @@ impl Ui {
             .css_classes(["card"])
             .build();
 
+        // Recordings are not downloads: each one runs for as long as it is
+        // left to, so a mistyped range costs far more.
+        let recording = kind_choice == 6;
+        if recording && let Err(error) = crate::stream::check_batch(urls.len()) {
+            self.toast(&format!("{error:#}"));
+            return;
+        }
+
         let dialog = adw::AlertDialog::builder()
-            .heading(format!("Add {} downloads?", urls.len()))
-            .body("Check the numbering before queueing these.")
+            .heading(if recording {
+                format!("Record {} streams?", urls.len())
+            } else {
+                format!("Add {} downloads?", urls.len())
+            })
+            .body(if recording {
+                "Every one of these records until you stop it, or until the \
+                 length you set runs out."
+            } else {
+                "Check the numbering before queueing these."
+            })
             .extra_child(&scroller)
             .build();
-        dialog.add_responses(&[("close", "Cancel"), ("add", "Add all")]);
+        dialog.add_responses(&[
+            ("close", "Cancel"),
+            ("add", if recording { "Record all" } else { "Add all" }),
+        ]);
         dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("add"));
         dialog.set_close_response("close");
@@ -2225,6 +2349,7 @@ impl Ui {
                     3 => DownloadRequest::scrape(url.clone()),
                     4 => DownloadRequest::video(url.clone()),
                     5 => DownloadRequest::sniff(url.clone()),
+                    6 => DownloadRequest::stream(url.clone()),
                     _ => DownloadRequest::from_url(url.clone()),
                 };
                 extras.apply(&mut request);

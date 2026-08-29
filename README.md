@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.12.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.13.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.12.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.12.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.12.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.13.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.13.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.13.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -230,6 +230,16 @@ Press stop and it asks what you want:
 
 Snatch always closes the file properly. A recording you stop halfway still
 opens and still plays.
+
+**Record a row of channels in one go.**
+Open **Add to Snatch**. Paste the addresses, one per line. Pick **Record
+stream**. Set the time and the length once, and they apply to all of them.
+
+Numbered addresses can be written once, the same as downloads:
+`https://example.com/channel[1-6].m3u8` means six recordings.
+
+Snatch records up to 16 at a time. Each one runs for as long as you leave it,
+so it shows you the list and asks first.
 
 **Watch a torrent while it downloads.**
 Add a magnet link. Press the sequential button. The pieces arrive in order, so

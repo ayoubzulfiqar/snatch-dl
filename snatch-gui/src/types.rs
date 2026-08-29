@@ -179,6 +179,14 @@ impl DownloadRequest {
         }
     }
 
+    /// A stream address for ffmpeg to record.
+    pub fn stream(url: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Stream,
+            ..Self::from_url(url)
+        }
+    }
+
     /// A page to scan for media.
     pub fn sniff(url: impl Into<String>) -> Self {
         Self {

@@ -585,12 +585,22 @@ mod tests {
                     };
                     let request = String::from_utf8_lossy(&buffer[..read]);
                     let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    // `Connection: close` because this handler serves one
+                    // request and then drops the socket. Without saying so it
+                    // is an HTTP/1.1 server by default, so the client keeps
+                    // the connection in its pool and sends the *second* wave
+                    // of candidates down a socket that has already gone --
+                    // which is why only the test needing a second wave was
+                    // ever flaky, and why load made it worse.
                     let response = match routes.iter().find(|(route, _)| *route == path) {
                         Some((_, body)) => format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{body}",
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\
+                             Connection: close\r\n\r\n{body}",
                             body.len()
                         ),
-                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                                 Connection: close\r\n\r\n"
+                            .to_owned(),
                     };
                     let _ = socket.write_all(response.as_bytes()).await;
                     let _ = socket.flush().await;

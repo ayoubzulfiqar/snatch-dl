@@ -55,6 +55,26 @@ use crate::ytdlp::{VideoEvent, VideoProgress};
 /// is the budget for all of them together rather than for each in turn.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many recordings one batch may start.
+///
+/// Far below the ten thousand a download pattern may expand to, and for a
+/// different reason: every recording is a live ffmpeg holding a connection
+/// open and writing to disk for as long as it runs. A mistyped range that
+/// queued two hundred downloads is a nuisance; two hundred recordings would
+/// saturate the link and fill the disk while nobody was watching.
+pub const MAX_BATCH: usize = 16;
+
+/// Refuse a batch of recordings too large to be meant.
+pub fn check_batch(count: usize) -> Result<()> {
+    if count > MAX_BATCH {
+        bail!(
+            "that is {count} recordings at once, and Snatch records at most {MAX_BATCH}; \
+             every one of them runs for as long as you leave it"
+        );
+    }
+    Ok(())
+}
+
 /// How many observed addresses are worth inspecting. A busy page fetches
 /// dozens; the player's own manifest is always among the first few.
 const MAX_CANDIDATES: usize = 4;
@@ -144,6 +164,27 @@ pub struct Recording {
 }
 
 impl Recording {
+    /// The recording a request describes.
+    ///
+    /// Both ways in build one of these -- the browser button through the
+    /// socket, and the Add dialog in the window -- so the fields are mapped
+    /// once here rather than twice, slightly differently.
+    pub fn from_request(request: &crate::types::DownloadRequest, directory: PathBuf) -> Self {
+        Self {
+            name_hint: request.filename.clone(),
+            headers: Headers {
+                referer: request.referer.clone(),
+                user_agent: request.user_agent.clone(),
+                cookies: request.cookies.clone(),
+            },
+            height: request.height,
+            start_at: request.start_at,
+            skip: request.skip_seconds.map(Duration::from_secs),
+            limit: request.record_seconds.map(Duration::from_secs),
+            ..Self::new(request.url.clone(), directory)
+        }
+    }
+
     /// A recording that starts now, takes the best quality, and runs until it
     /// is stopped.
     pub fn new(url: String, directory: PathBuf) -> Self {
@@ -1258,6 +1299,54 @@ mod tests {
             ]
         );
         assert_eq!(info.choose(Some(240)).and_then(|r| r.audio_index), Some(5));
+    }
+
+    #[test]
+    fn a_request_becomes_the_recording_it_describes() {
+        let mut request = crate::types::DownloadRequest::stream("https://live.example/a.m3u8");
+        request.filename = Some("The Nine O'Clock News".to_owned());
+        request.referer = Some("https://live.example/watch".to_owned());
+        request.cookies = Some("session=abc".to_owned());
+        request.height = Some(720);
+        request.start_at = Some(1_800_000_000);
+        request.record_seconds = Some(5400);
+        request.skip_seconds = Some(30);
+
+        let job = Recording::from_request(&request, PathBuf::from("/tmp/out"));
+        assert_eq!(job.url, "https://live.example/a.m3u8");
+        assert_eq!(job.name_hint.as_deref(), Some("The Nine O'Clock News"));
+        assert_eq!(job.directory, PathBuf::from("/tmp/out"));
+        assert_eq!(job.height, Some(720));
+        assert_eq!(job.start_at, Some(1_800_000_000));
+        assert_eq!(job.skip, Some(Duration::from_secs(30)));
+        assert_eq!(job.limit, Some(Duration::from_secs(5400)));
+        // The request the player made, so the manifest is not refused.
+        assert_eq!(
+            job.headers.as_field().as_deref(),
+            Some("Referer: https://live.example/watch\r\nCookie: session=abc\r\n")
+        );
+
+        // A bare address typed into the window carries none of that.
+        let plain = Recording::from_request(
+            &crate::types::DownloadRequest::stream("https://live.example/b.m3u8"),
+            PathBuf::from("/tmp/out"),
+        );
+        assert_eq!(plain.height, None);
+        assert_eq!(plain.limit, None);
+        assert_eq!(plain.headers.as_field(), None);
+    }
+
+    #[test]
+    fn a_batch_of_recordings_has_a_ceiling_a_batch_of_downloads_does_not() {
+        assert!(check_batch(1).is_ok());
+        assert!(check_batch(MAX_BATCH).is_ok());
+        // `ch[1-200].m3u8` is a plausible typo, and two hundred recordings
+        // would hold two hundred connections open and fill the disk.
+        let refused = check_batch(MAX_BATCH + 1).expect_err("too many to be meant");
+        assert!(
+            format!("{refused:#}").contains("at most"),
+            "unhelpful refusal: {refused:#}"
+        );
     }
 
     #[test]

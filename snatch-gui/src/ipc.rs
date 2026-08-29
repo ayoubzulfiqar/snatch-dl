@@ -178,18 +178,10 @@ async fn accept_request(
             .video
             .clone()
             .start_stream(
-                crate::stream::Recording {
-                    name_hint: request.filename.clone(),
-                    headers: stream_headers(&request),
-                    height: request.height,
-                    start_at: request.start_at,
-                    skip: request.skip_seconds.map(Duration::from_secs),
-                    limit: request.record_seconds.map(Duration::from_secs),
-                    ..crate::stream::Recording::new(
-                        request.url.clone(),
-                        crate::ytdlp::destination_for(&backend.download_dir),
-                    )
-                },
+                crate::stream::Recording::from_request(
+                    &request,
+                    crate::ytdlp::destination_for(&backend.download_dir),
+                ),
                 backend.proxies.clone(),
                 backend.video_events.clone(),
             )
