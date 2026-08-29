@@ -308,6 +308,9 @@ stage_extensions() {
   rm -rf "${FIREFOX_EXT_DIR}"
   mkdir -p "${FIREFOX_EXT_DIR}"
   install -Dm644 "${CHROMIUM_EXT_DIR}/background.js" "${FIREFOX_EXT_DIR}/background.js"
+  # The button that appears on a video. Without it Firefox loads an
+  # extension that captures downloads but draws nothing on a page.
+  install -Dm644 "${CHROMIUM_EXT_DIR}/content.js" "${FIREFOX_EXT_DIR}/content.js"
 
   # Without these the browser shows a letter placeholder instead of the icon.
   local icon

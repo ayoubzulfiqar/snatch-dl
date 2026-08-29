@@ -11,6 +11,11 @@
  *   2. `downloads.onCreated` performs the actual hand-off: the browser download
  *      is cancelled and erased, and the URL - with cookies, referer and user
  *      agent attached - is pushed to the native host `com.snatch.dl.nmh`.
+ *   3. `content.js` draws a button on every video and asks, through here, what
+ *      resolutions a page offers. That question and the download that follows
+ *      are the only things a content script may ask for: it has no native
+ *      messaging of its own, so everything it wants goes through `onMessage`
+ *      below, where the URL is checked before Snatch ever sees it.
  *
  * The cancel deliberately lives in `downloads.onCreated` rather than in
  * `webRequest.onBeforeRequest`: Manifest V3 removed blocking webRequest in
@@ -30,6 +35,7 @@ const MENU_DOWNLOAD = "snatch-download-with";
 const MENU_SCRAPE = "snatch-scrape-page";
 const MENU_VIDEO = "snatch-extract-video";
 const MENU_SNIFF = "snatch-sniff-page";
+const MENU_OVERLAY = "snatch-video-overlay";
 const HINT_TTL_MS = 90000;
 const HINT_LIMIT = 256;
 const BADGE_MS = 4000;
@@ -69,6 +75,9 @@ const passThrough = new Set();
 /** Cached copy of the enabled flag; `null` until first read. */
 let enabledCache = null;
 
+/** Cached copy of the video-button flag; `null` until first read. */
+let overlayCache = null;
+
 // ---------------------------------------------------------------------------
 // Enabled flag
 // ---------------------------------------------------------------------------
@@ -95,6 +104,70 @@ async function setEnabled(value) {
     console.warn("Snatch: could not persist settings", error);
   }
   await refreshAction();
+}
+
+/**
+ * Whether the button on videos is wanted.
+ *
+ * Separate from `enabled` because they answer different questions: pausing
+ * Snatch stops it taking downloads, while this only stops it drawing on pages.
+ * Someone who finds the pill intrusive should not have to give up capture.
+ */
+async function isOverlayEnabled() {
+  if (overlayCache !== null) {
+    return overlayCache;
+  }
+  try {
+    const stored = await api.storage.local.get({ overlay: true });
+    overlayCache = stored.overlay !== false;
+  } catch (error) {
+    console.warn("Snatch: could not read the video button setting", error);
+    overlayCache = true;
+  }
+  return overlayCache;
+}
+
+async function setOverlayEnabled(value) {
+  overlayCache = Boolean(value);
+  try {
+    await api.storage.local.set({ overlay: overlayCache });
+  } catch (error) {
+    console.warn("Snatch: could not persist the video button setting", error);
+  }
+  await broadcastOverlay();
+}
+
+/**
+ * Tell every open page whether to draw the button.
+ *
+ * Most tabs have no content script - a settings page, a PDF, a tab that was
+ * open before the extension was installed - so a rejection here is the normal
+ * case and not worth reporting.
+ */
+async function broadcastOverlay() {
+  const wanted = (await isEnabled()) && (await isOverlayEnabled());
+  let tabs = [];
+  try {
+    tabs = await api.tabs.query({});
+  } catch (error) {
+    return;
+  }
+  for (const tab of tabs) {
+    if (typeof tab.id !== "number") {
+      continue;
+    }
+    try {
+      const sent = api.tabs.sendMessage(tab.id, {
+        type: "snatch-overlay",
+        enabled: wanted
+      });
+      if (sent && typeof sent.catch === "function") {
+        sent.catch(() => {});
+      }
+    } catch (error) {
+      // No content script in that tab.
+    }
+  }
 }
 
 async function refreshAction() {
@@ -515,8 +588,88 @@ function countMediaLinks() {
 }
 
 // ---------------------------------------------------------------------------
+// Requests from the button on a video
+// ---------------------------------------------------------------------------
+
+/**
+ * Answer one request from `content.js`.
+ *
+ * A content script runs in a web page, so nothing it sends is trusted. Every
+ * URL is checked here against the same rule the context menu uses before it
+ * can reach the native host.
+ */
+async function handleContentMessage(message) {
+  if (!message || typeof message !== "object") {
+    throw new Error("empty request");
+  }
+
+  switch (message.type) {
+    case "state":
+      return {
+        ok: true,
+        enabled: (await isEnabled()) && (await isOverlayEnabled())
+      };
+
+    case "formats": {
+      // The listing is a question. It queues nothing, so it is safe to ask
+      // whenever the user opens the panel.
+      const reply = await sendNative({ url: requireUrl(message.url), kind: "formats" });
+      return {
+        ok: true,
+        title: reply.title,
+        duration: reply.duration,
+        formats: Array.isArray(reply.formats) ? reply.formats : []
+      };
+    }
+
+    case "video": {
+      const payload = { url: requireUrl(message.url), kind: "video" };
+      if (typeof message.format_id === "string" && message.format_id) {
+        payload.format_id = message.format_id;
+      }
+      await sendNative(payload);
+      flashBadge("ok", "#3584e4");
+      return { ok: true };
+    }
+
+    case "direct":
+      // A plain file: the ordinary hand-off, with cookies and referer, so a
+      // link that only works while signed in still works.
+      await handOff({
+        url: requireUrl(message.url),
+        filename: nameFromUrl(message.url),
+        referer: typeof message.referer === "string" ? message.referer : undefined
+      });
+      flashBadge("ok", "#3584e4");
+      return { ok: true };
+
+    default:
+      throw new Error("unknown request");
+  }
+}
+
+function requireUrl(url) {
+  if (!isHijackable(url)) {
+    throw new Error("Snatch cannot download that address");
+  }
+  return url;
+}
+
+// ---------------------------------------------------------------------------
 // Listeners
 // ---------------------------------------------------------------------------
+
+api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handleContentMessage(message)
+    .then(sendResponse)
+    .catch((error) => {
+      console.warn("Snatch: could not answer the page", error);
+      sendResponse({ ok: false, error: String((error && error.message) || error) });
+    });
+  // Keeps the channel open for the async answer above. Without it the page
+  // sees the port close before the native host has replied.
+  return true;
+});
 
 api.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -586,6 +739,11 @@ api.action.onClicked.addListener(() => {
 
 api.contextMenus.onClicked.addListener((info, tab) => {
   switch (info.menuItemId) {
+    case MENU_OVERLAY:
+      setOverlayEnabled(info.checked === true).catch((error) =>
+        console.error("Snatch: could not change the video button setting", error)
+      );
+      return;
     case MENU_SCRAPE:
       scrapePage(tab).catch((error) =>
         console.error("Snatch: page scrape failed", error)
@@ -628,9 +786,18 @@ api.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 api.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && "enabled" in changes) {
+  if (area !== "local") {
+    return;
+  }
+  if ("enabled" in changes) {
     enabledCache = changes.enabled.newValue !== false;
     void refreshAction();
+    // Pausing Snatch takes the button off every page too.
+    void broadcastOverlay();
+  }
+  if ("overlay" in changes) {
+    overlayCache = changes.overlay.newValue !== false;
+    void broadcastOverlay();
   }
 });
 
@@ -672,6 +839,20 @@ async function installContextMenu() {
     });
   } catch (error) {
     console.error("Snatch: could not create the context menu entries", error);
+  }
+
+  // Kept in its own try: the "action" context is newer than the rest, and a
+  // browser that rejects it must not take the download entries down with it.
+  try {
+    api.contextMenus.create({
+      id: MENU_OVERLAY,
+      title: "Show the button on videos",
+      type: "checkbox",
+      checked: await isOverlayEnabled(),
+      contexts: ["action"]
+    });
+  } catch (error) {
+    console.warn("Snatch: could not add the video button toggle", error);
   }
 }
 

@@ -50,6 +50,7 @@ jobs:
       - name: Extension
         run: |
           node --check extension/background.js
+          node --check extension/content.js
           python3 - <<'CHECK'
           import base64, hashlib, json, pathlib, re, sys
 
@@ -84,6 +85,32 @@ jobs:
           version = re.search(r'^version = "([^"]+)"', pathlib.Path("Cargo.toml").read_text(), re.M)
           if version and manifest.get("version") != version.group(1):
               problems.append(f"version {manifest.get('version')} != Cargo.toml {version.group(1)}")
+
+          # Every file the manifest names must exist. A manifest pointing at a
+          # missing script still installs and still shows as enabled; it just
+          # does nothing, which is the hardest breakage to notice.
+          named = set(manifest.get("icons", {}).values())
+          named.update(manifest.get("action", {}).get("default_icon", {}).values())
+          named.update(manifest["background"]["service_worker"] for _ in [0])
+          for group in manifest.get("content_scripts", []):
+              named.update(group.get("js", []))
+          for group in manifest.get("web_accessible_resources", []):
+              named.update(group.get("resources", []))
+          absent = sorted(n for n in named if not (pathlib.Path("extension") / n).is_file())
+          if absent:
+              problems.append("names files that do not exist: " + ", ".join(absent))
+
+          # ...and every script must be installed by every packaging path. The
+          # icons were once added to the manifest but to only some of the
+          # packages, so half the installs showed a letter placeholder.
+          scripts = {manifest["background"]["service_worker"]}
+          for group in manifest.get("content_scripts", []):
+              scripts.update(group.get("js", []))
+          for name in sorted(scripts):
+              for packaging in ("snatch-gui/Cargo.toml", "packaging/PKGBUILD",
+                                ".github/workflows/release.yml", "install.sh", "get.sh"):
+                  if name not in pathlib.Path(packaging).read_text():
+                      problems.append(f"{packaging} does not install extension/{name}")
 
           if problems:
               sys.exit("extension/manifest.json: " + "; ".join(problems))

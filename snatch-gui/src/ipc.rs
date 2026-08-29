@@ -97,7 +97,7 @@ async fn handle(stream: UnixStream, backend: Backend, events: Sender<UiEvent>) -
 
     let outcome = accept_request(&line, &backend, &events).await;
     let response = match &outcome {
-        Ok(gid) => IpcResponse::accepted(gid.clone()),
+        Ok(response) => response.clone(),
         Err(error) => IpcResponse::rejected(format!("{error:#}")),
     };
 
@@ -117,9 +117,15 @@ async fn handle(stream: UnixStream, backend: Backend, events: Sender<UiEvent>) -
 
 /// Validate, hand to the right engine, and tell the UI about it.
 ///
-/// The returned id is engine-specific — an aria2 GID, a torrent id or a scrape
-/// batch id — and is echoed to the browser so the extension can report it.
-async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>) -> Result<String> {
+/// The reply carries an engine-specific id — an aria2 GID, a torrent id or a
+/// scrape batch id — which is echoed to the browser so the extension can
+/// report it. A format listing answers with the list instead, having queued
+/// nothing.
+async fn accept_request(
+    line: &str,
+    backend: &Backend,
+    events: &Sender<UiEvent>,
+) -> Result<IpcResponse> {
     let request: DownloadRequest = serde_json::from_str(line.trim())
         .context("the request was not a valid Snatch download request")?;
     request.validate()?;
@@ -127,7 +133,16 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
     let name = request.display_name();
     let kind = request.inferred_kind();
 
-    // A sniff has nothing to queue: it opens the picker in the window.
+    // A listing is a question, not a job. Answer it and queue nothing: the
+    // button on a video asks this before the user has picked a resolution, so
+    // it must not put anything in the window.
+    if kind == JobKind::Formats {
+        let probe = crate::ytdlp::probe(&request.url, backend.proxies.as_ref()).await?;
+        log::info!("listed {} formats for {name}", probe.formats.len());
+        return Ok(IpcResponse::listing(probe));
+    }
+
+    // A sniff has nothing to queue either: it opens the picker in the window.
     if kind == JobKind::Sniff {
         events
             .send(UiEvent::SniffRequested {
@@ -136,7 +151,7 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
             .await
             .ok()
             .context("the window is not available to show the picker")?;
-        return Ok("sniff".to_owned());
+        return Ok(IpcResponse::accepted("sniff".to_owned()));
     }
 
     let id = match kind {
@@ -178,7 +193,11 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
         }
         JobKind::Video => {
             let destination = crate::ytdlp::destination_for(&backend.download_dir);
-            let config = crate::ytdlp::VideoConfig::new(destination);
+            let mut config = crate::ytdlp::VideoConfig::new(destination);
+            // The resolution the user picked in the browser. Without one,
+            // yt-dlp is left to choose, which is what every other entry point
+            // does.
+            config.format = request.format_id.clone();
             backend
                 .video
                 .clone()
@@ -191,10 +210,11 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
                 .await?
                 .to_string()
         }
-        // The early return above handles this. Returning an error rather
+        // The early returns above handle these. Returning an error rather
         // than `unreachable!` keeps the no-panic rule intact even if the
-        // guard above is ever refactored away.
+        // guards above are ever refactored away.
         JobKind::Sniff => bail!("a sniff has nothing to queue"),
+        JobKind::Formats => bail!("a format listing has nothing to queue"),
         JobKind::Scrape => {
             let base = backend.download_dir.join("Snatch Galleries");
             let config = GalleryConfig::new(destination_for(&base, &request.url));
@@ -216,5 +236,5 @@ async fn accept_request(line: &str, backend: &Backend, events: &Sender<UiEvent>)
 
     // A closed channel just means the window went away first.
     let _ = events.send(UiEvent::Added { name, kind }).await;
-    Ok(id)
+    Ok(IpcResponse::accepted(id))
 }

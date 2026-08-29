@@ -1,6 +1,6 @@
 # Maintainer: Ayoub Zulfiqar <contact@ayoubzulfiqar.com>
 pkgname=snatch-dl
-pkgver=2.7.3
+pkgver=2.8.0
 pkgrel=1
 pkgdesc="Download manager for Linux: aria2, BitTorrent, yt-dlp and gallery-dl behind one GTK4 window"
 arch=('x86_64')
@@ -64,6 +64,8 @@ package() {
     "${pkgdir}/usr/share/${pkgname}/extension/manifest.json"
   install -Dm644 "extension/background.js" \
     "${pkgdir}/usr/share/${pkgname}/extension/background.js"
+  install -Dm644 "extension/content.js" \
+    "${pkgdir}/usr/share/${pkgname}/extension/content.js"
 
   # Native messaging, registered for every user on the machine. The extension
   # id is pinned by the committed key, so these are static files.
@@ -79,6 +81,8 @@ package() {
     "${pkgdir}/usr/share/${pkgname}/extension-firefox/manifest.json"
   install -Dm644 "extension/background.js" \
     "${pkgdir}/usr/share/${pkgname}/extension-firefox/background.js"
+  install -Dm644 "extension/content.js" \
+    "${pkgdir}/usr/share/${pkgname}/extension-firefox/content.js"
 
   # Without these the browser shows a letter placeholder instead of the icon.
   local icon

@@ -214,6 +214,8 @@ case "${FAMILY}" in
       /usr/share/snatch-dl/extension/manifest.json
     ${SUDO} install -Dm644 "${ROOT}/extension/background.js" \
       /usr/share/snatch-dl/extension/background.js
+    ${SUDO} install -Dm644 "${ROOT}/extension/content.js" \
+      /usr/share/snatch-dl/extension/content.js
     if [ -d "${ROOT}/packaging/native-messaging" ]; then
       ${SUDO} install -Dm644 "${ROOT}/packaging/native-messaging/chromium.json" \
         /etc/opt/chrome/native-messaging-hosts/com.snatch.dl.nmh.json

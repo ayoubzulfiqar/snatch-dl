@@ -89,6 +89,7 @@ assets = [
   ["../assets/icons/com.snatch.dl-512.png", "usr/share/icons/hicolor/512x512/apps/com.snatch.dl.png", "644"],
   ["../extension/manifest.json", "usr/share/snatch-dl/extension/", "644"],
   ["../extension/background.js", "usr/share/snatch-dl/extension/", "644"],
+  ["../extension/content.js", "usr/share/snatch-dl/extension/", "644"],
   # Registered for every user on the machine. The extension id is pinned by
   # the committed key, so these are static files rather than something an
   # install script has to generate.
@@ -102,6 +103,7 @@ assets = [
   # who still has one.
   ["../LICENSE-GPL-3.0.txt", "usr/share/doc/snatch-dl/LICENSE-GPL-3.0.txt", "644"],
   ["../extension/background.js", "usr/share/snatch-dl/extension-firefox/", "644"],
+  ["../extension/content.js", "usr/share/snatch-dl/extension-firefox/", "644"],
   # The browser shows a letter placeholder without these.
   ["../extension/icons/icon-16.png", "usr/share/snatch-dl/extension/icons/", "644"],
   ["../extension/icons/icon-24.png", "usr/share/snatch-dl/extension/icons/", "644"],
@@ -139,11 +141,13 @@ assets = [
   { source = "../assets/icons/com.snatch.dl-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/com.snatch.dl.png", mode = "644" },
   { source = "../extension/manifest.json", dest = "/usr/share/snatch-dl/extension/manifest.json", mode = "644" },
   { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension/background.js", mode = "644" },
+  { source = "../extension/content.js", dest = "/usr/share/snatch-dl/extension/content.js", mode = "644" },
   { source = "../packaging/native-messaging/chromium.json", dest = "/etc/opt/chrome/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
   { source = "../packaging/native-messaging/chromium.json", dest = "/etc/chromium/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
   { source = "../packaging/native-messaging/firefox.json", dest = "/usr/lib/mozilla/native-messaging-hosts/com.snatch.dl.nmh.json", mode = "644" },
   { source = "../packaging/extension-firefox/manifest.json", dest = "/usr/share/snatch-dl/extension-firefox/manifest.json", mode = "644" },
   { source = "../extension/background.js", dest = "/usr/share/snatch-dl/extension-firefox/background.js", mode = "644" },
+  { source = "../extension/content.js", dest = "/usr/share/snatch-dl/extension-firefox/content.js", mode = "644" },
   { source = "../extension/icons/icon-16.png", dest = "/usr/share/snatch-dl/extension/icons/icon-16.png", mode = "644" },
   { source = "../extension/icons/icon-24.png", dest = "/usr/share/snatch-dl/extension/icons/icon-24.png", mode = "644" },
   { source = "../extension/icons/icon-32.png", dest = "/usr/share/snatch-dl/extension/icons/icon-32.png", mode = "644" },

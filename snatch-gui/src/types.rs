@@ -30,6 +30,10 @@ pub enum JobKind {
     Video,
     /// A page to scan for media, presenting a picker rather than downloading.
     Sniff,
+    /// A question, not a job: what resolutions does this page offer? The
+    /// answer comes back in the reply, and nothing is queued. This is what the
+    /// button on a video asks before the user has picked anything.
+    Formats,
 }
 
 impl JobKind {
@@ -40,6 +44,7 @@ impl JobKind {
             JobKind::Scrape => "scrape",
             JobKind::Video => "video",
             JobKind::Sniff => "sniff",
+            JobKind::Formats => "format listing",
         }
     }
 }
@@ -74,6 +79,10 @@ pub struct DownloadRequest {
     /// of use, so the wire format stays whatever the sender had to hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    /// The exact yt-dlp format the user picked from the list a
+    /// [`JobKind::Formats`] request returned. Ignored by every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_id: Option<String>,
     /// Unix time this download should start at. Until then it is added
     /// paused, so it holds its place in the queue without using bandwidth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +178,7 @@ impl DownloadRequest {
             username: None,
             password: None,
             checksum: None,
+            format_id: None,
             start_at: None,
             mime: None,
             size: None,
@@ -211,6 +221,9 @@ impl DownloadRequest {
         }
         if rest.is_empty() {
             bail!("the URL has no host");
+        }
+        if let Some(format) = self.format_id.as_deref() {
+            crate::ytdlp::validate_format(format)?;
         }
         Ok(())
     }
@@ -324,6 +337,16 @@ pub struct IpcResponse {
     pub gid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The page's title, when a [`JobKind::Formats`] request asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Its length in seconds, so the picker can show which video it read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+    /// What the page offers, best first. Empty for every other kind, and
+    /// omitted from the wire entirely so an ordinary hand-off is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<crate::ytdlp::MediaFormat>,
 }
 
 impl IpcResponse {
@@ -332,6 +355,9 @@ impl IpcResponse {
             ok: true,
             gid: Some(gid),
             error: None,
+            title: None,
+            duration: None,
+            formats: Vec::new(),
         }
     }
 
@@ -340,6 +366,21 @@ impl IpcResponse {
             ok: false,
             gid: None,
             error: Some(error),
+            title: None,
+            duration: None,
+            formats: Vec::new(),
+        }
+    }
+
+    /// The answer to "what resolutions does this page have?".
+    pub fn listing(probe: crate::ytdlp::MediaProbe) -> Self {
+        Self {
+            ok: true,
+            gid: None,
+            error: None,
+            title: probe.title,
+            duration: probe.duration,
+            formats: probe.formats,
         }
     }
 }

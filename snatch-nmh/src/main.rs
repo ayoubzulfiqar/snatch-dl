@@ -8,20 +8,22 @@
 //! It is deliberately tiny and stateless: the browser owns its lifetime, so the
 //! only durable state lives in the GUI on the other side of the socket.
 //!
-//! The payload is forwarded **losslessly**. An earlier version deserialised it
-//! into a local struct and re-serialised that, which silently dropped any field
-//! the host did not know about — when the extension gained a `kind` field for
-//! magnets and scrapes, every scrape arrived at the GUI as a plain download of
-//! the page's HTML. Parsing to a `serde_json::Value` keeps unknown fields, so
-//! the extension and the GUI can gain fields without touching this binary.
+//! Both directions are forwarded **losslessly**. An earlier version
+//! deserialised the request into a local struct and re-serialised that, which
+//! silently dropped any field the host did not know about — when the extension
+//! gained a `kind` field for magnets and scrapes, every scrape arrived at the
+//! GUI as a plain download of the page's HTML. The reply had the same flaw and
+//! the same fix: it is a `serde_json::Value` on the way back too, so when the
+//! GUI began answering a format listing with the list, this binary did not
+//! need to learn what a format was.
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep, timeout};
@@ -45,25 +47,13 @@ const GUI_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// untouched, so this host never needs to know the full schema.
 const REQUIRED_FIELD: &str = "url";
 
-/// The reply shape used both by the GUI (over the socket) and by us (to the
-/// browser). Keeping them identical means a GUI answer can be forwarded as-is.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Reply {
-    pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
+/// The one thing every reply must carry, in both directions. The extension
+/// checks it before reading anything else.
+const OK_FIELD: &str = "ok";
 
-impl Reply {
-    fn failure(error: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            gid: None,
-            error: Some(error.into()),
-        }
-    }
+/// A reply this host generated itself, because the GUI never got the chance.
+fn failure(error: impl Into<String>) -> Value {
+    json!({ "ok": false, "error": error.into() })
 }
 
 fn main() -> ExitCode {
@@ -103,7 +93,7 @@ async fn pump() -> Result<()> {
             Ok(reply) => reply,
             Err(error) => {
                 eprintln!("snatch-nmh: hand-off failed: {error:#}");
-                Reply::failure(format!("{error:#}"))
+                failure(format!("{error:#}"))
             }
         };
 
@@ -112,7 +102,7 @@ async fn pump() -> Result<()> {
 }
 
 /// Parse one native message and hand it to the GUI.
-async fn dispatch(socket: &Path, raw: &[u8]) -> Result<Reply> {
+async fn dispatch(socket: &Path, raw: &[u8]) -> Result<Value> {
     // A `Value` round-trips every field, known or not.
     let request: Value = serde_json::from_slice(raw).context("payload is not valid JSON")?;
 
@@ -155,7 +145,16 @@ async fn dispatch(socket: &Path, raw: &[u8]) -> Result<Reply> {
         bail!("the Snatch GUI closed the connection without answering");
     }
 
-    serde_json::from_str(answer.trim()).context("the Snatch GUI sent a malformed reply")
+    // A `Value` round-trips whatever the GUI chose to include. Only the one
+    // field the extension relies on is checked here; everything beside it is
+    // carried through untouched.
+    let reply: Value =
+        serde_json::from_str(answer.trim()).context("the Snatch GUI sent a malformed reply")?;
+    match reply.get(OK_FIELD) {
+        Some(Value::Bool(_)) => Ok(reply),
+        Some(_) => bail!("the Snatch GUI sent a reply whose '{OK_FIELD}' was not true or false"),
+        None => bail!("the Snatch GUI sent a reply with no '{OK_FIELD}' field"),
+    }
 }
 
 /// Connect to the GUI, starting it on demand if it is not running yet.

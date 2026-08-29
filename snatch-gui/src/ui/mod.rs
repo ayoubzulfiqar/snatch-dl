@@ -950,7 +950,9 @@ impl Ui {
                     JobKind::Scrape => PAGE_SCRAPER,
                     // A yt-dlp extraction produces a file, so it belongs with
                     // the downloads rather than on a page of its own.
-                    JobKind::Download | JobKind::Video | JobKind::Sniff => PAGE_DOWNLOADS,
+                    JobKind::Download | JobKind::Video | JobKind::Sniff | JobKind::Formats => {
+                        PAGE_DOWNLOADS
+                    }
                 });
                 self.raise_if_hidden();
             }
@@ -1071,6 +1073,10 @@ impl Ui {
             JobKind::Scrape => self.scraper.start(self, request.url),
             JobKind::Video => self.add_video(request.url),
             JobKind::Sniff => sniff::present(self, Some(request.url)),
+            // A listing is answered on the socket and queues nothing, so it
+            // never reaches the window. Saying so beats adding it silently to
+            // a page it does not belong on.
+            JobKind::Formats => self.toast("A format listing is not something to download"),
             JobKind::Download => self.add_download(request),
         }
     }

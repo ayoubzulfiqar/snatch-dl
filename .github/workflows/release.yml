@@ -92,7 +92,8 @@ jobs:
           mkdir -p "dist/${STAGE}/packaging"
           cp -r packaging/native-messaging packaging/extension-firefox \
             "dist/${STAGE}/packaging/"
-          cp extension/background.js "dist/${STAGE}/packaging/extension-firefox/"
+          cp extension/background.js extension/content.js \
+            "dist/${STAGE}/packaging/extension-firefox/"
           cp -r extension/icons "dist/${STAGE}/packaging/extension-firefox/"
           tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           rm -rf "dist/${STAGE}"
@@ -155,10 +156,10 @@ jobs:
           fi
           mkdir -p dist/chromium dist/firefox
 
-          cp extension/manifest.json extension/background.js dist/chromium/
+          cp extension/manifest.json extension/background.js extension/content.js dist/chromium/
           cp -r extension/icons dist/chromium/
           cp packaging/extension-firefox/manifest.json dist/firefox/
-          cp extension/background.js dist/firefox/
+          cp extension/background.js extension/content.js dist/firefox/
           cp -r extension/icons dist/firefox/
 
           # Zipped from inside the directory so the manifest sits at the root

@@ -16,6 +16,9 @@ It also does torrents, videos, and whole image galleries. All in one window.
 A browser add-on catches your downloads. Click a link, and Snatch takes it
 instead of your browser.
 
+Point at any video and a **Download with Snatch** button appears on it. Click
+the button and pick the size you want.
+
 ![Downloads](docs/downloads.png)
 
 Give it a page. It finds every file on it. You pick what you want:
@@ -51,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.7.3</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.8.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -62,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.7.3-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.7.3-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.7.3-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.8.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.8.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.8.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -133,6 +136,21 @@ Pick the **folder**. Not a file inside it.
 
 ### What it gives you
 
+**A button on every video.**
+
+Point at a video on any site. A small **Download with Snatch** button shows up
+in the corner. Click it.
+
+Snatch lists the sizes that video comes in — 2160p, 1080p, 720p, and so on. It
+shows how big each one is. Pick one and it downloads. There is an **Audio only**
+row too, if you just want the sound.
+
+Snatch only looks when you click the button. It does not read the pages you are
+just visiting.
+
+Do not want the button? Right-click the Snatch icon in your toolbar and untick
+**Show the button on videos**.
+
 Right-click anything in your browser:
 
 - **Download with Snatch**
@@ -153,6 +171,11 @@ goes to the torrent engine, not the downloader.
 **Download a big file and walk away.**
 Click a link in your browser. Snatch takes it. It pulls the file in 16 pieces
 at once. If your internet drops, it carries on later.
+
+**Get a video at the size you want.**
+Point at the video. Click the button on it. Pick 1080p, or 480p, or just the
+sound. Snatch fetches that one and joins the picture and the sound into a
+single file.
 
 **Watch a torrent while it downloads.**
 Add a magnet link. Press the sequential button. The pieces arrive in order, so

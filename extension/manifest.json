@@ -5,7 +5,7 @@
   },
   "manifest_version": 3,
   "name": "Snatch Download Manager",
-  "version": "2.7.3",
+  "version": "2.8.0",
   "description": "Hands browser downloads to Snatch, the aria2-powered download manager for Linux.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -24,6 +24,20 @@
   ],
   "host_permissions": [
     "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/icon-32.png"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
   ],
   "action": {
     "default_title": "Snatch is capturing downloads",

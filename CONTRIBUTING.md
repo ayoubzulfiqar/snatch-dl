@@ -69,7 +69,7 @@ Check your work with the same four commands CI runs:
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-node --check extension/background.js
+node --check extension/background.js extension/content.js
 ```
 
 Clippy fails on any warning. CI uses the newest stable Rust, so run
@@ -122,6 +122,22 @@ Read stdout to the end before touching stderr and the program hangs. The other
 pipe fills up and the program stops, waiting for space.
 
 Use `tokio::select!` over both, or one reader task each.
+
+### The button on a video is a hit test, not a search
+
+Nothing scans the page for `<video>`. Every serious player buries its video
+under a stack of overlays, so `event.target` is never the video and
+`closest("video")` never matches.
+
+`document.elementsFromPoint` looks through the whole stack instead. It costs
+nothing on a page with no video, and needs no rescan when a single-page site
+swaps its player out.
+
+Those listeners are on `document` and use **capture**. Players call
+`stopPropagation` freely, and a bubbling listener never runs.
+
+The overlay is drawn in a closed shadow root. Page CSS is hostile — `* {
+position: static !important }` is a real thing people write.
 
 ### Nothing from a web page is trusted
 
