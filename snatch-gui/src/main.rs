@@ -31,6 +31,7 @@ mod paths;
 mod processor;
 mod settings;
 mod sniff;
+mod stream;
 mod torrent;
 mod types;
 mod ui;

@@ -123,6 +123,20 @@ pipe fills up and the program stops, waiting for space.
 
 Use `tokio::select!` over both, or one reader task each.
 
+### A live recording goes to Matroska, never MP4
+
+An MP4 keeps its index in a `moov` atom written when the file is closed. The
+only way a live recording ever ends is by being stopped, so there is no `moov`,
+so the file will not open at all.
+
+Matroska writes as it goes. Stop it whenever you like and what you have still
+plays. `stream.rs` picks the container from whether ffprobe found a duration.
+
+Streams are copied with `-c copy`, never re-encoded, and the rendition is
+picked with an explicit `-map`. A master playlist lists every quality, and
+ffmpeg left to itself takes the first one — so the row would promise 1080p and
+record 480p.
+
 ### The button on a video is a hit test, not a search
 
 Nothing scans the page for `<video>`. Every serious player buries its video

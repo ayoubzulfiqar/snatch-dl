@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.8.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.9.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.8.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.8.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.8.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.9.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.9.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.9.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -145,11 +145,21 @@ Snatch lists the sizes that video comes in — 2160p, 1080p, 720p, and so on. It
 shows how big each one is. Pick one and it downloads. There is an **Audio only**
 row too, if you just want the sound.
 
+**Live streams work too.** So do sites Snatch has never heard of. If it cannot
+name the sizes, it watches what the player is loading and offers to record
+that instead. Live shows are saved as you watch. Stop any time — the file
+still plays.
+
+If the button says it found nothing, press play first and click it again.
+Snatch can only see a stream once the player asks for it.
+
 Snatch only looks when you click the button. It does not read the pages you are
 just visiting.
 
-Do not want the button? Right-click the Snatch icon in your toolbar and untick
-**Show the button on videos**.
+**Do not want the button on a site?** Click the **×** on it. It goes away on
+that site and stays away. To bring it back everywhere, right-click the Snatch
+icon in your toolbar and tick **Show the button on videos**. Untick that to
+turn it off on every site at once.
 
 Right-click anything in your browser:
 
@@ -176,6 +186,10 @@ at once. If your internet drops, it carries on later.
 Point at the video. Click the button on it. Pick 1080p, or 480p, or just the
 sound. Snatch fetches that one and joins the picture and the sound into a
 single file.
+
+**Record a live stream.**
+Point at the player. Click the button. Pick the quality. Snatch writes the show
+to disk while it happens. Stop when you like and the file still opens.
 
 **Watch a torrent while it downloads.**
 Add a magnet link. Press the sequential button. The pieces arrive in order, so
@@ -361,6 +375,7 @@ good at it.
 | Files | **aria2** | 16 pieces at once, resume, good retries |
 | Torrents | **librqbit** | DHT, peer exchange, play while downloading |
 | Site video | **yt-dlp** | Knows thousands of sites |
+| Live and odd streams | **ffmpeg** | Reads what the player reads |
 | Galleries | **gallery-dl** | Knows hundreds of gallery sites |
 | Converting | **ffmpeg** | The standard tool for it |
 | Whole sites | **Wget2** | Follows links and filters what it keeps |

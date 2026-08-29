@@ -34,6 +34,9 @@ pub enum JobKind {
     /// answer comes back in the reply, and nothing is queued. This is what the
     /// button on a video asks before the user has picked anything.
     Formats,
+    /// A stream address for ffmpeg to record, for the pages yt-dlp cannot
+    /// read. Its scheme may be `rtmp:` or `rtsp:` as well as `http:`.
+    Stream,
 }
 
 impl JobKind {
@@ -45,6 +48,7 @@ impl JobKind {
             JobKind::Video => "video",
             JobKind::Sniff => "sniff",
             JobKind::Formats => "format listing",
+            JobKind::Stream => "stream",
         }
     }
 }
@@ -91,6 +95,14 @@ pub struct DownloadRequest {
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Manifest addresses the browser watched this page's player fetch.
+    ///
+    /// Only consulted when yt-dlp cannot read the page. They are what makes
+    /// the long tail work: a site yt-dlp has never heard of still has a player
+    /// asking for an HLS or DASH manifest, and ffmpeg can read one of those
+    /// without knowing anything about the site.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<String>,
     /// Additional sources for the *same* file. aria2 spreads its connections
     /// across every mirror and fails over between them, so a slow or flaky
     /// primary does not decide the speed.
@@ -182,6 +194,7 @@ impl DownloadRequest {
             start_at: None,
             mime: None,
             size: None,
+            streams: Vec::new(),
             mirrors: Vec::new(),
         }
     }
@@ -201,6 +214,11 @@ impl DownloadRequest {
                 bail!("the magnet link is malformed");
             }
             return Ok(());
+        }
+        if self.inferred_kind() == JobKind::Stream {
+            // rtmp: and rtsp: are streams too, so the http-only rule below
+            // would refuse addresses ffmpeg reads perfectly well.
+            return crate::stream::validate_url(url);
         }
         if url.len() > 8192 {
             bail!("the URL is unreasonably long ({} bytes)", url.len());

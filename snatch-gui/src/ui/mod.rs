@@ -950,9 +950,11 @@ impl Ui {
                     JobKind::Scrape => PAGE_SCRAPER,
                     // A yt-dlp extraction produces a file, so it belongs with
                     // the downloads rather than on a page of its own.
-                    JobKind::Download | JobKind::Video | JobKind::Sniff | JobKind::Formats => {
-                        PAGE_DOWNLOADS
-                    }
+                    JobKind::Download
+                    | JobKind::Video
+                    | JobKind::Sniff
+                    | JobKind::Formats
+                    | JobKind::Stream => PAGE_DOWNLOADS,
                 });
                 self.raise_if_hidden();
             }
@@ -1072,6 +1074,9 @@ impl Ui {
             JobKind::Magnet => self.add_magnet(request.url),
             JobKind::Scrape => self.scraper.start(self, request.url),
             JobKind::Video => self.add_video(request.url),
+            // Recording a stream is started from the browser, which knows the
+            // address the player asked for. The window has no way to find one.
+            JobKind::Stream => self.toast("A stream is recorded from the browser button"),
             JobKind::Sniff => sniff::present(self, Some(request.url)),
             // A listing is answered on the socket and queues nothing, so it
             // never reaches the window. Saying so beats adding it silently to

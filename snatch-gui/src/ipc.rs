@@ -137,9 +137,25 @@ async fn accept_request(
     // button on a video asks this before the user has picked a resolution, so
     // it must not put anything in the window.
     if kind == JobKind::Formats {
-        let probe = crate::ytdlp::probe(&request.url, backend.proxies.as_ref()).await?;
-        log::info!("listed {} formats for {name}", probe.formats.len());
-        return Ok(IpcResponse::listing(probe));
+        match crate::ytdlp::probe(&request.url, backend.proxies.as_ref()).await {
+            Ok(probe) => {
+                log::info!("listed {} formats for {name}", probe.formats.len());
+                return Ok(IpcResponse::listing(probe));
+            }
+            // yt-dlp does not know this site. The browser watched the page's
+            // player fetch its manifests, so ffmpeg can be pointed at one of
+            // those instead -- it needs to know nothing about the site.
+            Err(error) if !request.streams.is_empty() => {
+                log::info!("yt-dlp could not read {name} ({error:#}); trying the streams");
+                let probe = stream_listing(&request).await;
+                if probe.formats.is_empty() {
+                    return Err(error);
+                }
+                log::info!("found {} stream(s) on {name}", probe.formats.len());
+                return Ok(IpcResponse::listing(probe));
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     // A sniff has nothing to queue either: it opens the picker in the window.
@@ -155,6 +171,19 @@ async fn accept_request(
     }
 
     let id = match kind {
+        JobKind::Stream => backend
+            .video
+            .clone()
+            .start_stream(
+                request.url.clone(),
+                request.filename.clone(),
+                crate::ytdlp::destination_for(&backend.download_dir),
+                stream_headers(&request),
+                backend.proxies.clone(),
+                backend.video_events.clone(),
+            )
+            .await?
+            .to_string(),
         // Honour the configured engine here too: this is the path every
         // browser hand-off takes, so routing only the UI through the setting
         // would leave it looking broken.
@@ -237,4 +266,54 @@ async fn accept_request(
     // A closed channel just means the window went away first.
     let _ = events.send(UiEvent::Added { name, kind }).await;
     Ok(IpcResponse::accepted(id))
+}
+
+/// The request headers a page's player would have sent. A manifest is very
+/// often refused without them.
+fn stream_headers(request: &DownloadRequest) -> crate::stream::Headers {
+    crate::stream::Headers {
+        referer: request.referer.clone(),
+        user_agent: request.user_agent.clone(),
+        cookies: request.cookies.clone(),
+    }
+}
+
+/// Describe every stream the browser saw, as rows the picker can show.
+async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
+    let headers = stream_headers(request);
+    let mut found = crate::stream::describe_all(&request.streams, &headers).await;
+
+    // Best first, and only one row per description. A player fetches its
+    // master playlist and then the rendition inside it, which come back as
+    // two rows saying exactly the same thing.
+    found.sort_by_key(|(_, info)| std::cmp::Reverse(info.height));
+    let mut seen: Vec<String> = Vec::new();
+    found.retain(|(_, info)| {
+        let label = info.label();
+        if seen.contains(&label) {
+            return false;
+        }
+        seen.push(label);
+        true
+    });
+
+    crate::ytdlp::MediaProbe {
+        title: request.filename.clone(),
+        duration: None,
+        formats: found
+            .into_iter()
+            .map(|(url, info)| crate::ytdlp::MediaFormat {
+                id: String::new(),
+                label: info.label(),
+                ext: info.container().to_owned(),
+                size: None,
+                estimated: false,
+                height: info.height,
+                audio_only: !info.has_video(),
+                // Having an address is what marks this a row for ffmpeg
+                // rather than a yt-dlp format selector.
+                url: Some(url),
+            })
+            .collect(),
+    }
 }

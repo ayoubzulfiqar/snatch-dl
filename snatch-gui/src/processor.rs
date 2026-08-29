@@ -190,8 +190,11 @@ pub enum MediaEvent {
 }
 
 /// One `key=value` pair from ffmpeg's progress stream.
+///
+/// Shared with [`crate::stream`], which drives ffmpeg too and must read
+/// `out_time_ms` with the same care -- see the module docs above.
 #[derive(Debug, PartialEq)]
-enum Field {
+pub(crate) enum Field {
     /// Output position, always in microseconds regardless of the key name.
     OutTimeMicros(u64),
     Speed(f64),
@@ -200,7 +203,7 @@ enum Field {
     Ignored,
 }
 
-fn parse_progress_line(line: &str) -> Field {
+pub(crate) fn parse_progress_line(line: &str) -> Field {
     let Some((key, value)) = line.split_once('=') else {
         return Field::Ignored;
     };

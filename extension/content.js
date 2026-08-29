@@ -245,6 +245,18 @@
   user-select: none;
 }
 .pill:hover { background: #3584e4; border-color: #3584e4; }
+.pill .dismiss {
+  flex: 0 0 auto;
+  margin-left: 3px;
+  padding: 1px 3px 3px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font: 15px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+.pill .dismiss:hover { color: #ffffff; background: rgba(0, 0, 0, 0.4); }
 .pill .mark {
   width: 18px;
   height: 18px;
@@ -378,6 +390,22 @@
     const caption = document.createElement("span");
     caption.textContent = "Download with Snatch";
     pill.appendChild(caption);
+
+    const dismiss = document.createElement("button");
+    dismiss.className = "dismiss";
+    dismiss.textContent = "×";
+    dismiss.title = "Hide the button on this site";
+    dismiss.setAttribute("aria-label", "Hide the button on this site");
+    dismiss.addEventListener("click", (event) => {
+      // Without this the click reaches the pill behind it and opens the panel
+      // the user was trying to get rid of.
+      event.preventDefault();
+      event.stopPropagation();
+      enabled = false;
+      hide(true);
+      void send({ type: "hide-site" });
+    });
+    pill.appendChild(dismiss);
 
     panel = document.createElement("div");
     panel.className = "panel";
@@ -637,8 +665,16 @@
       if (!format || typeof format.id !== "string") {
         continue;
       }
+      // A row carrying an address is a stream for ffmpeg to record; one
+      // carrying a selector is a format for yt-dlp to fetch.
+      if (typeof format.url === "string" && format.url) {
+        addRow(String(format.label || "Stream"), detailOf(format), () =>
+          pick("stream", { url: format.url, title: document.title }, format.label)
+        );
+        continue;
+      }
       addRow(String(format.label || "Download"), detailOf(format), () =>
-        pick({ url: target, format_id: format.id }, format.label)
+        pick("video", { url: target, format_id: format.id }, format.label)
       );
     }
     status("Pick a quality");
@@ -652,22 +688,26 @@
     clear(panelBody);
     if (fallback) {
       addRow("Download the video file", "direct", () =>
-        pick({ url: fallback, referer: target }, "the file")
+        pick("direct", { url: fallback, referer: target }, "the file")
       );
       status(error || "No quality list for this page");
       return;
     }
     addRow("Let Snatch try anyway", "best quality", () =>
-      pick({ url: target }, "the video")
+      pick("video", { url: target }, "the video")
     );
-    note(error || "Snatch could not list the qualities on this page.");
+    // Streams are only noticed once the player asks for them, so a panel
+    // opened before anything has started has nothing to go on yet.
+    note(
+      (error || "Snatch could not list the qualities on this page.") +
+        " If the video has not started, press play and try again."
+    );
     status("");
   }
 
-  function pick(request, what) {
-    const direct = typeof request.format_id !== "string" && request.referer !== undefined;
+  function pick(type, request, what) {
     status("Sending to Snatch…");
-    send({ type: direct ? "direct" : "video", ...request }).then((reply) => {
+    send({ type: type, ...request }).then((reply) => {
       if (!panelOpen) {
         return;
       }

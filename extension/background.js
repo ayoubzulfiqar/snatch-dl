@@ -11,7 +11,12 @@
  *   2. `downloads.onCreated` performs the actual hand-off: the browser download
  *      is cancelled and erased, and the URL - with cookies, referer and user
  *      agent attached - is pushed to the native host `com.snatch.dl.nmh`.
- *   3. `content.js` draws a button on every video and asks, through here, what
+ *   3. `webRequest` also watches for the HLS and DASH manifests a page's
+ *      player fetches, and remembers them per tab. They are the fallback for
+ *      the sites yt-dlp has never heard of: it cannot read the page, but the
+ *      player still had to ask for a manifest, and ffmpeg can read one of
+ *      those without knowing anything about the site.
+ *   4. `content.js` draws a button on every video and asks, through here, what
  *      resolutions a page offers. That question and the download that follows
  *      are the only things a content script may ask for: it has no native
  *      messaging of its own, so everything it wants goes through `onMessage`
@@ -54,6 +59,23 @@ const DOWNLOAD_EXTENSIONS = new Set([
   "wmv", "xls", "xlsx", "xz", "zip", "zst"
 ]);
 
+/** Playlist and manifest types, by file extension. */
+const MANIFEST_EXTENSIONS = new Set(["m3u8", "m3u", "mpd", "ism", "f4m"]);
+
+/** ...and by what the server says they are, for the ones with no extension. */
+const MANIFEST_TYPES = new Set([
+  "application/vnd.apple.mpegurl",
+  "application/x-mpegurl",
+  "audio/mpegurl",
+  "audio/x-mpegurl",
+  "application/dash+xml",
+  "video/vnd.mpeg.dash.mpd"
+]);
+
+/** Most manifests worth remembering for one tab. */
+const STREAM_LIMIT = 24;
+const STREAM_TTL_MS = 15 * 60 * 1000;
+
 const WEB_REQUEST_FILTER = { urls: ["http://*/*", "https://*/*"] };
 const WEB_REQUEST_TYPES = [
   "main_frame", "sub_frame", "xmlhttprequest", "object", "media", "other"
@@ -71,6 +93,19 @@ const hints = new Map();
 
 /** URLs we deliberately let the browser handle once (hand-off fallback). */
 const passThrough = new Set();
+
+/**
+ * Manifests each tab's player has fetched, newest last.
+ *
+ * Like `hints` this is lost if Chromium evicts the service worker, and for the
+ * same reason it rarely matters: a live playlist is re-fetched every few
+ * seconds, which is exactly the traffic that keeps the worker awake. A page
+ * quiet enough for the worker to be evicted is one with nothing playing.
+ */
+const streams = new Map();
+
+/** Hostnames the user has told the button to leave alone. */
+let hiddenSitesCache = null;
 
 /** Cached copy of the enabled flag; `null` until first read. */
 let enabledCache = null;
@@ -131,10 +166,66 @@ async function setOverlayEnabled(value) {
   overlayCache = Boolean(value);
   try {
     await api.storage.local.set({ overlay: overlayCache });
+    // Turning it back on means "show it again", including on the sites it was
+    // dismissed on one at a time. Without this the toggle would look broken:
+    // ticked, and still nothing on the site you last hid it from.
+    if (overlayCache) {
+      hiddenSitesCache = [];
+      await api.storage.local.set({ hiddenSites: [] });
+    }
   } catch (error) {
     console.warn("Snatch: could not persist the video button setting", error);
   }
   await broadcastOverlay();
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (error) {
+    return "";
+  }
+}
+
+/** Sites the user dismissed the button on, with the × on the pill. */
+async function hiddenSites() {
+  if (hiddenSitesCache !== null) {
+    return hiddenSitesCache;
+  }
+  try {
+    const stored = await api.storage.local.get({ hiddenSites: [] });
+    hiddenSitesCache = Array.isArray(stored.hiddenSites) ? stored.hiddenSites : [];
+  } catch (error) {
+    console.warn("Snatch: could not read the hidden sites", error);
+    hiddenSitesCache = [];
+  }
+  return hiddenSitesCache;
+}
+
+async function hideSite(url) {
+  const host = hostOf(url);
+  if (!host) {
+    return false;
+  }
+  const sites = await hiddenSites();
+  if (!sites.includes(host)) {
+    hiddenSitesCache = sites.concat(host);
+    try {
+      await api.storage.local.set({ hiddenSites: hiddenSitesCache });
+    } catch (error) {
+      console.warn("Snatch: could not persist the hidden sites", error);
+    }
+  }
+  return true;
+}
+
+/** Whether the button belongs on this particular page. */
+async function isOverlayWanted(pageUrl) {
+  if (!(await isEnabled()) || !(await isOverlayEnabled())) {
+    return false;
+  }
+  const host = hostOf(pageUrl);
+  return host === "" || !(await hiddenSites()).includes(host);
 }
 
 /**
@@ -145,7 +236,8 @@ async function setOverlayEnabled(value) {
  * case and not worth reporting.
  */
 async function broadcastOverlay() {
-  const wanted = (await isEnabled()) && (await isOverlayEnabled());
+  const globallyOn = (await isEnabled()) && (await isOverlayEnabled());
+  const hidden = globallyOn ? await hiddenSites() : [];
   let tabs = [];
   try {
     tabs = await api.tabs.query({});
@@ -156,6 +248,7 @@ async function broadcastOverlay() {
     if (typeof tab.id !== "number") {
       continue;
     }
+    const wanted = globallyOn && !hidden.includes(hostOf(tab.url));
     try {
       const sent = api.tabs.sendMessage(tab.id, {
         type: "snatch-overlay",
@@ -193,6 +286,53 @@ function flashBadge(text, color) {
   } catch (error) {
     console.warn("Snatch: could not flash the toolbar button", error);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Stream cache
+// ---------------------------------------------------------------------------
+
+function isManifestUrl(url) {
+  try {
+    const path = new URL(url).pathname;
+    const dot = path.lastIndexOf(".");
+    if (dot < 0 || dot === path.length - 1) {
+      return false;
+    }
+    return MANIFEST_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+  } catch (error) {
+    return false;
+  }
+}
+
+function rememberStream(tabId, url) {
+  if (typeof tabId !== "number" || tabId < 0 || !isHijackable(url)) {
+    return;
+  }
+  const now = Date.now();
+  const kept = (streams.get(tabId) ?? []).filter(
+    (entry) => entry.url !== url && now - entry.at < STREAM_TTL_MS
+  );
+  kept.push({ url: url, at: now });
+  // Newest last, oldest dropped: a page that re-fetches one playlist forever
+  // must not push the others out.
+  streams.set(tabId, kept.slice(-STREAM_LIMIT));
+}
+
+/**
+ * The manifests worth offering for this tab, freshest first.
+ *
+ * Freshest first because the last thing a player asked for is the thing it is
+ * playing now. Only a handful are ever inspected on the Snatch side.
+ */
+function recentStreams(tabId) {
+  if (typeof tabId !== "number") {
+    return [];
+  }
+  const now = Date.now();
+  const kept = (streams.get(tabId) ?? []).filter((entry) => now - entry.at < STREAM_TTL_MS);
+  streams.set(tabId, kept);
+  return kept.map((entry) => entry.url).reverse();
 }
 
 // ---------------------------------------------------------------------------
@@ -598,22 +738,51 @@ function countMediaLinks() {
  * URL is checked here against the same rule the context menu uses before it
  * can reach the native host.
  */
-async function handleContentMessage(message) {
+async function handleContentMessage(message, sender) {
   if (!message || typeof message !== "object") {
     throw new Error("empty request");
   }
+  const tabId = sender && sender.tab ? sender.tab.id : undefined;
+  // The frame's own address, which for an embedded player is the embed rather
+  // than the page around it. That is the one whose player made the requests.
+  const page = (sender && sender.url) || (sender && sender.tab && sender.tab.url);
 
   switch (message.type) {
     case "state":
-      return {
-        ok: true,
-        enabled: (await isEnabled()) && (await isOverlayEnabled())
-      };
+      return { ok: true, enabled: await isOverlayWanted(page) };
+
+    case "hide-site":
+      // The × on the pill. Hiding the whole site rather than this one page is
+      // what people mean by it, and it is undone from the toolbar menu.
+      if (!(await hideSite(page))) {
+        return { ok: false, error: "that page has no site to hide" };
+      }
+      await broadcastOverlay();
+      return { ok: true };
 
     case "formats": {
       // The listing is a question. It queues nothing, so it is safe to ask
       // whenever the user opens the panel.
-      const reply = await sendNative({ url: requireUrl(message.url), kind: "formats" });
+      const url = requireUrl(message.url);
+      const payload = { url: url, kind: "formats" };
+      // What the page's player fetched, for the sites yt-dlp cannot read.
+      // Snatch only looks at these if yt-dlp comes back with nothing.
+      const observed = recentStreams(tabId);
+      if (observed.length > 0) {
+        payload.streams = observed;
+        // A manifest is very often refused without the request looking like
+        // the player's, so the same three go with it.
+        payload.referer = url;
+        const agent = globalThis.navigator && globalThis.navigator.userAgent;
+        if (agent) {
+          payload.user_agent = agent;
+        }
+        const cookies = await cookieHeader(url);
+        if (cookies) {
+          payload.cookies = cookies;
+        }
+      }
+      const reply = await sendNative(payload);
       return {
         ok: true,
         title: reply.title,
@@ -621,6 +790,18 @@ async function handleContentMessage(message) {
         formats: Array.isArray(reply.formats) ? reply.formats : []
       };
     }
+
+    case "stream":
+      // A manifest ffmpeg records. The cookies are read for the manifest's own
+      // address, not the page's, because that is the request ffmpeg makes.
+      await handOff({
+        url: requireUrl(message.url),
+        kind: "stream",
+        filename: sanitiseName(message.title),
+        referer: page
+      });
+      flashBadge("ok", "#3584e4");
+      return { ok: true };
 
     case "video": {
       const payload = { url: requireUrl(message.url), kind: "video" };
@@ -660,7 +841,7 @@ function requireUrl(url) {
 // ---------------------------------------------------------------------------
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handleContentMessage(message)
+  handleContentMessage(message, sender)
     .then(sendResponse)
     .catch((error) => {
       console.warn("Snatch: could not answer the page", error);
@@ -673,6 +854,14 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 api.webRequest.onBeforeRequest.addListener(
   (details) => {
+    // A new page in this tab: the old page's manifests belong to it, not this
+    // one, and offering them here would record the wrong programme.
+    if (details.type === "main_frame") {
+      streams.delete(details.tabId);
+    }
+    if (isManifestUrl(details.url)) {
+      rememberStream(details.tabId, details.url);
+    }
     if (looksLikeDownload(details.url)) {
       rememberHint(details.url, {
         referer: details.originUrl || details.initiator,
@@ -699,6 +888,13 @@ api.webRequest.onSendHeaders.addListener(
 
 api.webRequest.onHeadersReceived.addListener(
   (details) => {
+    // Plenty of manifests have no extension to recognise -- a signed CDN URL
+    // ending in a token, say -- so the server's own answer is checked too.
+    const declared = headerValue(details.responseHeaders, "content-type");
+    if (declared && MANIFEST_TYPES.has(declared.split(";")[0].trim().toLowerCase())) {
+      rememberStream(details.tabId, details.url);
+    }
+
     const disposition = headerValue(details.responseHeaders, "content-disposition");
     const isAttachment = typeof disposition === "string" && /^\s*attachment/i.test(disposition);
     if (!isAttachment && !looksLikeDownload(details.url)) {
@@ -726,6 +922,10 @@ api.webRequest.onHeadersReceived.addListener(
 // http, https, ws, wss, ftp and file. A magnet link is handed to an external
 // protocol handler and never becomes a web request at all, so no filter can
 // catch one. Magnets are sent to Snatch from the context menu instead.
+
+api.tabs.onRemoved.addListener((tabId) => {
+  streams.delete(tabId);
+});
 
 api.downloads.onCreated.addListener((item) => {
   hijack(item).catch((error) => console.error("Snatch: capture failed", error));
@@ -798,6 +998,11 @@ api.storage.onChanged.addListener((changes, area) => {
   if ("overlay" in changes) {
     overlayCache = changes.overlay.newValue !== false;
     void broadcastOverlay();
+  }
+  if ("hiddenSites" in changes) {
+    hiddenSitesCache = Array.isArray(changes.hiddenSites.newValue)
+      ? changes.hiddenSites.newValue
+      : [];
   }
 });
 

@@ -364,6 +364,88 @@ impl VideoEngine {
         Ok(job_id)
     }
 
+    /// Record a stream with ffmpeg instead of extracting it with yt-dlp.
+    ///
+    /// This lives on the same engine on purpose. The window cancels a job by
+    /// id through `VideoEngine::cancel`, counts running work through
+    /// `running_count`, and draws rows from `VideoEvent`. A separate engine
+    /// would have needed all three taught about it; sharing the job table
+    /// means a recording behaves like every other video job for free.
+    pub async fn start_stream(
+        self: &Arc<Self>,
+        url: String,
+        title: Option<String>,
+        directory: PathBuf,
+        headers: crate::stream::Headers,
+        proxies: Arc<ProxyManager>,
+        events: mpsc::Sender<VideoEvent>,
+    ) -> Result<i64> {
+        let url = url.trim().to_owned();
+        crate::stream::validate_url(&url)?;
+
+        let job_id = self
+            .db
+            .create_media_job(
+                PathBuf::from(&url),
+                directory.clone(),
+                "record-stream".to_owned(),
+            )
+            .await
+            .context("could not record the stream job")?;
+
+        let _ = events
+            .send(VideoEvent::Started {
+                job_id,
+                url: url.clone(),
+            })
+            .await;
+
+        let engine = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let outcome = crate::stream::record(
+                job_id,
+                &url,
+                title.as_deref(),
+                &directory,
+                &headers,
+                proxies.as_ref(),
+                &events,
+            )
+            .await;
+
+            let (state, error) = match outcome {
+                Ok(output) => {
+                    let _ = events
+                        .send(VideoEvent::Finished {
+                            job_id,
+                            output: Some(output),
+                        })
+                        .await;
+                    (JobState::Complete, None)
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    log::warn!("stream job {job_id} failed: {message}");
+                    let _ = events
+                        .send(VideoEvent::Failed {
+                            job_id,
+                            error: message.clone(),
+                        })
+                        .await;
+                    (JobState::Failed, Some(message))
+                }
+            };
+
+            if let Err(error) = engine.db.finish_media_job(job_id, state, error).await {
+                log::warn!("could not close stream job {job_id}: {error:#}");
+            }
+            engine.jobs().remove(&job_id);
+        });
+
+        self.jobs().insert(job_id, task);
+        Ok(job_id)
+    }
+
     async fn run(
         &self,
         job_id: i64,
@@ -612,6 +694,11 @@ pub struct MediaFormat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     pub audio_only: bool,
+    /// Set only on a row that ffmpeg records rather than yt-dlp extracts: the
+    /// stream's own address, to be sent back as a [`crate::types::JobKind::Stream`]
+    /// request. Its presence is what tells the two rows apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// What one page offers.
@@ -897,6 +984,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
             estimated,
             height: Some(height),
             audio_only: false,
+            url: None,
         });
     }
 
@@ -911,6 +999,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
             estimated: false,
             height: None,
             audio_only: false,
+            url: None,
         });
     }
 
@@ -925,6 +1014,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
             estimated: audio_estimated,
             height: None,
             audio_only: true,
+            url: None,
         });
     }
 
