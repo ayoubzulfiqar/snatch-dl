@@ -155,6 +155,9 @@ pub enum VideoEvent {
     Started {
         job_id: i64,
         url: String,
+        /// A live recording, which the window offers to finish rather than
+        /// discard. An extraction has no half-written file to rescue.
+        recording: bool,
     },
     /// yt-dlp resolved a title, which is a better row label than the URL.
     Title {
@@ -271,6 +274,12 @@ fn parse_line(line: &str) -> Line {
 pub struct VideoEngine {
     db: Database,
     jobs: Mutex<HashMap<i64, JoinHandle<()>>>,
+    /// The graceful way out of a recording, one per running stream job.
+    ///
+    /// Aborting the task kills ffmpeg mid-write. A live recording ends by
+    /// being stopped -- that is the only way one ever ends -- so stopping has
+    /// to close the file properly rather than leave a stump behind.
+    stoppers: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl VideoEngine {
@@ -278,6 +287,7 @@ impl VideoEngine {
         Arc::new(Self {
             db,
             jobs: Mutex::new(HashMap::new()),
+            stoppers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -285,6 +295,37 @@ impl VideoEngine {
         self.jobs
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn stoppers(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<i64, tokio::sync::oneshot::Sender<()>>> {
+        self.stoppers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether this job is a recording that can be finished on request.
+    pub fn is_recording(&self, job_id: i64) -> bool {
+        self.stoppers().contains_key(&job_id)
+    }
+
+    /// Ask a recording to finish and close its file properly.
+    ///
+    /// Returns `false` when there was nothing to stop, which for a yt-dlp
+    /// extraction is always: it has no half-written container to rescue, so
+    /// the caller falls back to [`VideoEngine::cancel`].
+    pub fn stop(&self, job_id: i64) -> bool {
+        match self.stoppers().remove(&job_id) {
+            Some(stopper) => {
+                // An error means the recording finished on its own between the
+                // click and here, which needs no rescuing either.
+                let _ = stopper.send(());
+                log::info!("asked recording {job_id} to finish");
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn running_count(&self) -> usize {
@@ -296,6 +337,10 @@ impl VideoEngine {
 
     /// Abort a job. `kill_on_drop` turns the abort into a killed subprocess.
     pub fn cancel(&self, job_id: i64) {
+        // Dropping the stopper without sending is the same as sending: the
+        // recording is ending either way, and the task abort below is what
+        // makes this the abrupt version.
+        self.stoppers().remove(&job_id);
         if let Some(task) = self.jobs().remove(&job_id) {
             task.abort();
             log::info!("cancelled video job {job_id}");
@@ -327,6 +372,7 @@ impl VideoEngine {
             .send(VideoEvent::Started {
                 job_id,
                 url: url.clone(),
+                recording: false,
             })
             .await;
 
@@ -373,21 +419,19 @@ impl VideoEngine {
     /// means a recording behaves like every other video job for free.
     pub async fn start_stream(
         self: &Arc<Self>,
-        url: String,
-        title: Option<String>,
-        directory: PathBuf,
-        headers: crate::stream::Headers,
+        job: crate::stream::Recording,
         proxies: Arc<ProxyManager>,
         events: mpsc::Sender<VideoEvent>,
     ) -> Result<i64> {
-        let url = url.trim().to_owned();
-        crate::stream::validate_url(&url)?;
+        let mut job = job;
+        job.url = job.url.trim().to_owned();
+        crate::stream::validate_url(&job.url)?;
 
         let job_id = self
             .db
             .create_media_job(
-                PathBuf::from(&url),
-                directory.clone(),
+                PathBuf::from(&job.url),
+                job.directory.clone(),
                 "record-stream".to_owned(),
             )
             .await
@@ -396,22 +440,18 @@ impl VideoEngine {
         let _ = events
             .send(VideoEvent::Started {
                 job_id,
-                url: url.clone(),
+                url: job.url.clone(),
+                recording: true,
             })
             .await;
 
+        let (stopper, stop) = tokio::sync::oneshot::channel();
+        self.stoppers().insert(job_id, stopper);
+
         let engine = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let outcome = crate::stream::record(
-                job_id,
-                &url,
-                title.as_deref(),
-                &directory,
-                &headers,
-                proxies.as_ref(),
-                &events,
-            )
-            .await;
+            let outcome =
+                crate::stream::record(job_id, &job, proxies.as_ref(), stop, &events).await;
 
             let (state, error) = match outcome {
                 Ok(output) => {
@@ -439,6 +479,7 @@ impl VideoEngine {
             if let Err(error) = engine.db.finish_media_job(job_id, state, error).await {
                 log::warn!("could not close stream job {job_id}: {error:#}");
             }
+            engine.stoppers().remove(&job_id);
             engine.jobs().remove(&job_id);
         });
 
@@ -675,6 +716,24 @@ const MAX_PROBE_BYTES: usize = 32 * 1024 * 1024;
 /// Most resolutions a menu can be asked to show.
 const MAX_FORMATS: usize = 12;
 
+/// Which engine takes a row the picker offers.
+///
+/// The three are genuinely different jobs, not three flavours of one: yt-dlp
+/// extracts, ffmpeg records, and the ordinary downloader fetches a file in
+/// sixteen pieces with resume. Sending a plain `.mp4` to ffmpeg would work and
+/// would be much slower, so the row says which is which.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FormatSource {
+    /// A yt-dlp format selector, for a site it knows.
+    #[default]
+    Format,
+    /// A manifest for ffmpeg to record.
+    Stream,
+    /// A plain media file for the downloader.
+    File,
+}
+
 /// One entry in the quality list, ready for the browser to render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaFormat {
@@ -694,9 +753,12 @@ pub struct MediaFormat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     pub audio_only: bool,
-    /// Set only on a row that ffmpeg records rather than yt-dlp extracts: the
-    /// stream's own address, to be sent back as a [`crate::types::JobKind::Stream`]
-    /// request. Its presence is what tells the two rows apart.
+    /// Which engine this row belongs to.
+    #[serde(default)]
+    pub source: FormatSource,
+    /// The address to send back, for a row that is not a yt-dlp format: the
+    /// manifest to record, or the file to fetch. `id` carries the selector
+    /// instead when [`MediaFormat::source`] is [`FormatSource::Format`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -984,6 +1046,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
             estimated,
             height: Some(height),
             audio_only: false,
+            source: FormatSource::Format,
             url: None,
         });
     }
@@ -999,6 +1062,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
             estimated: false,
             height: None,
             audio_only: false,
+            source: FormatSource::Format,
             url: None,
         });
     }
@@ -1014,6 +1078,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
             estimated: audio_estimated,
             height: None,
             audio_only: true,
+            source: FormatSource::Format,
             url: None,
         });
     }

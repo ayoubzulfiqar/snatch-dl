@@ -26,6 +26,12 @@
 //!   * **Streams are copied, never re-encoded.** `-c copy` moves the packets
 //!     across untouched, so recording a 4K stream costs no CPU and loses no
 //!     quality. Re-encoding would do both.
+//!
+//! Stopping a live recording is the normal way one ends, so it is a first
+//! class operation rather than a kill. ffmpeg is given a pipe for stdin and
+//! sent `q`, which is its own "stop cleanly" key: it finishes the packet it is
+//! on, writes the trailer, and exits successfully. Killing it instead leaves a
+//! file with no trailer -- survivable in Matroska, and not in MP4.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,9 +39,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::network::{Engine, ProxyManager};
@@ -111,6 +117,16 @@ fn clean(value: Option<&str>) -> Option<&str> {
     Some(value)
 }
 
+/// One recording to make: what to read, and where to put it.
+#[derive(Debug, Clone)]
+pub struct Recording {
+    pub url: String,
+    /// What to call the file. The page's title, when the browser knew one.
+    pub name_hint: Option<String>,
+    pub directory: PathBuf,
+    pub headers: Headers,
+}
+
 /// What ffprobe could work out about a stream.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamInfo {
@@ -127,6 +143,8 @@ pub struct StreamInfo {
     /// 480p. These say which one it must actually take.
     pub video_index: Option<u32>,
     pub audio_index: Option<u32>,
+    /// Bytes, when the address is one file rather than a playlist.
+    pub size: Option<u64>,
 }
 
 impl StreamInfo {
@@ -181,6 +199,10 @@ struct RawFormat {
     /// ffprobe prints this as a string, and omits it for a live stream.
     #[serde(default)]
     duration: Option<String>,
+    /// Bytes, also as a string. Meaningful for a plain file; for a playlist
+    /// it is the size of the playlist itself, which is not worth showing.
+    #[serde(default)]
+    size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,8 +300,16 @@ fn distil(raw: &RawProbe) -> StreamInfo {
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .map(Duration::from_secs_f64);
 
+    let size = raw
+        .format
+        .as_ref()
+        .and_then(|format| format.size.as_deref())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0);
+
     let mut info = StreamInfo {
         duration,
+        size,
         ..StreamInfo::default()
     };
     for (position, stream) in raw.streams.iter().enumerate() {
@@ -381,6 +411,26 @@ pub fn output_name(hint: Option<&str>, url: &str) -> String {
     }
 }
 
+/// The file's own extension, for a row that downloads it as it is rather than
+/// remuxing it. `None` when the address does not end in a plausible one.
+pub fn extension_of(url: &str) -> Option<String> {
+    let path = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['?', '#'])
+        .next()?;
+    let last = path.rsplit('/').next()?;
+    let extension = last.rsplit_once('.')?.1;
+    if extension.is_empty()
+        || extension.len() > 5
+        || !extension.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(extension.to_ascii_lowercase())
+}
+
 fn sanitize(value: &str) -> String {
     let cleaned: String = value
         .chars()
@@ -420,26 +470,32 @@ pub fn unique_path(directory: &Path, name: &str, extension: &str) -> PathBuf {
     ))
 }
 
-/// Record `url` until it ends, or until the job is cancelled.
+/// Record `url` until it ends, or until `stop` fires.
 ///
-/// Cancelling aborts the task, which kills ffmpeg, which is why a live
-/// recording is written to Matroska: the file has to survive being stopped
-/// mid-write, and that is the whole point of the container.
+/// `stop` is the graceful path and the one a live recording normally takes:
+/// ffmpeg is asked to finish, so the file is closed properly and plays. The
+/// task can still be aborted outright, which kills ffmpeg mid-write -- which
+/// is the other reason a live recording goes to Matroska.
 pub async fn record(
     job_id: i64,
-    url: &str,
-    hint: Option<&str>,
-    directory: &Path,
-    headers: &Headers,
+    job: &Recording,
     proxies: &ProxyManager,
+    stop: oneshot::Receiver<()>,
     events: &mpsc::Sender<VideoEvent>,
 ) -> Result<PathBuf> {
+    let Recording {
+        url,
+        name_hint,
+        directory,
+        headers,
+    } = job;
+    let url = url.as_str();
     validate_url(url)?;
 
     // Probing first is what decides the container, and it turns the row in the
     // window from "stream" into "1080p live" before a byte is written.
     let info = probe(url, headers).await?;
-    let name = output_name(hint, url);
+    let name = output_name(name_hint.as_deref(), url);
     let _ = events
         .send(VideoEvent::Title {
             job_id,
@@ -449,16 +505,14 @@ pub async fn record(
 
     std::fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
-    let output = unique_path(directory, &name, info.container());
+    let output = unique_path(directory.as_path(), &name, info.container());
 
     let binary = ffmpeg_binary();
     let mut command = Command::new(&binary);
-    command
-        .arg("-hide_banner")
-        // Never let ffmpeg try to read the terminal; it is not attached to one.
-        .arg("-nostdin")
-        .arg("-loglevel")
-        .arg("error");
+    // No `-nostdin`: ffmpeg is given a pipe of its own and read from it is how
+    // it is asked to stop. It is not attached to a terminal, so there is
+    // nothing for it to steal.
+    command.arg("-hide_banner").arg("-loglevel").arg("error");
     apply_headers(&mut command, headers);
     command.arg("-i").arg(url);
     // Take the rendition the row promised, not whichever ffmpeg would have
@@ -494,7 +548,7 @@ pub async fn record(
     }
 
     command
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -507,6 +561,9 @@ pub async fn record(
         Err(error) => return Err(error).context("could not start ffmpeg"),
     };
 
+    let mut keyboard = child.stdin.take();
+    let mut stop = stop;
+    let mut stopping = false;
     let stdout = child.stdout.take().context("ffmpeg produced no stdout")?;
     let stderr = child.stderr.take().context("ffmpeg produced no stderr")?;
     let mut progress_lines = BufReader::new(stdout).lines();
@@ -524,8 +581,26 @@ pub async fn record(
     // soon as the other filled, which for a long recording it certainly will.
     while stdout_open || stderr_open {
         tokio::select! {
+            // A dropped sender means the engine is going away, and is treated
+            // the same as an explicit stop: finish the file rather than lose it.
+            _ = &mut stop, if !stopping => {
+                stopping = true;
+                log::info!("stream job {job_id}: asking ffmpeg to finish");
+                if let Some(mut pipe) = keyboard.take() {
+                    // ffmpeg's own key for "stop cleanly". Closing the pipe
+                    // afterwards is a second signal for the same thing.
+                    let _ = pipe.write_all(b"q").await;
+                    let _ = pipe.flush().await;
+                }
+            },
             line = progress_lines.next_line(), if stdout_open => match line {
                 Ok(Some(line)) => {
+                    // ffmpeg writes a dozen lines per tick. Publishing each one
+                    // sends twelve near-identical events, and a consumer that
+                    // falls behind stops this loop reading -- which fills
+                    // ffmpeg's stdout pipe and stalls the recording itself.
+                    // So the fields accumulate and one event goes out per tick.
+                    let mut changed = false;
                     match parse_progress_line(&line) {
                         Field::TotalSize(bytes) => {
                             let now = std::time::Instant::now();
@@ -552,12 +627,17 @@ pub async fn record(
                                     total.as_micros().checked_sub(u128::from(micros))
                                 })
                                 .map(|left| (left / 1_000_000) as u64);
+                            changed = true;
                         }
-                        Field::Speed(_) | Field::Done | Field::Ignored => {}
+                        // A block ends with `progress=continue|end`.
+                        Field::Done => changed = true,
+                        Field::Speed(_) | Field::Ignored => {}
                     }
-                    let _ = events
-                        .send(VideoEvent::Progress { job_id, progress: current.clone() })
-                        .await;
+                    if changed {
+                        let _ = events
+                            .send(VideoEvent::Progress { job_id, progress: current.clone() })
+                            .await;
+                    }
                 }
                 Ok(None) => stdout_open = false,
                 Err(error) => {
@@ -578,6 +658,10 @@ pub async fn record(
             },
         }
     }
+
+    // Dropping the pipe if it was never used closes ffmpeg's stdin, which it
+    // is content to ignore while it still has an input to read.
+    drop(keyboard);
 
     let status = child
         .wait()
@@ -618,6 +702,32 @@ mod tests {
         // An MP4 written without a moov atom will not open, and stopping the
         // recording is the only way a live one ever ends.
         assert_eq!(info.container(), "mkv");
+    }
+
+    #[test]
+    fn a_plain_file_reports_its_size() {
+        let info = probe_of(
+            r#"{"streams":[{"codec_type":"video","codec_name":"h264","height":720}],
+                "format":{"duration":"225.0","size":"47185920"}}"#,
+        );
+        assert_eq!(info.size, Some(47_185_920));
+        assert_eq!(info.label(), "720p · 3:45");
+    }
+
+    #[test]
+    fn a_files_own_extension_is_read_from_its_address() {
+        assert_eq!(
+            extension_of("https://cdn.example/a/clip.mp4").as_deref(),
+            Some("mp4")
+        );
+        // A signed URL keeps its extension in front of the query.
+        assert_eq!(
+            extension_of("https://cdn.example/clip.webm?token=abc&x=1").as_deref(),
+            Some("webm")
+        );
+        assert_eq!(extension_of("https://cdn.example/stream").as_deref(), None);
+        // A dotted host with no path must not be read as an extension.
+        assert_eq!(extension_of("https://cdn.example.com/").as_deref(), None);
     }
 
     #[test]
@@ -755,5 +865,176 @@ mod tests {
             Some("show (2).mkv")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use tokio::net::TcpListener;
+
+    fn which(binary: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(binary))
+                .find(|candidate| candidate.is_file())
+        })
+    }
+
+    /// Serve one file, slowly, for as long as anyone asks for it.
+    ///
+    /// The pace is the point: it keeps ffmpeg reading for several seconds so
+    /// the recording can be stopped part-way through, which is the thing under
+    /// test. Range headers are ignored and the whole body is sent, which
+    /// ffmpeg is content with.
+    async fn serve_slowly(path: PathBuf) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let body = std::fs::read(&path).expect("read the clip");
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    // Enough of the request line to know one arrived.
+                    let mut scratch = [0u8; 2048];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                         Content-Length: {}\r\nAccept-Ranges: none\r\n\r\n",
+                        body.len()
+                    );
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for chunk in body.chunks(32 * 1024) {
+                        if socket.write_all(chunk).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The decisive test for stopping a recording.
+    ///
+    /// The output is an MP4, whose index lives in a `moov` atom written when
+    /// the file is closed. Kill ffmpeg instead of asking it to stop and there
+    /// is no `moov`, and ffprobe reports "moov atom not found" rather than a
+    /// duration. So this passing *is* the proof that the file was finished
+    /// properly rather than merely left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stopping_a_recording_leaves_a_file_that_plays() {
+        if which("ffmpeg").is_none() || which("ffprobe").is_none() {
+            eprintln!("skipping: ffmpeg/ffprobe not installed");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("snatch-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let source = dir.join("clip.mp4");
+
+        // `+faststart` puts the index at the front, so the probe that `record`
+        // does first finishes quickly even though the body arrives slowly.
+        let built = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25:duration=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=30",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-shortest",
+                "-y",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .expect("ffmpeg runs");
+        assert!(built.status.success(), "could not build the test clip");
+
+        let port = serve_slowly(source).await;
+        let (events, mut seen) = mpsc::channel(64);
+        let (stopper, stop) = oneshot::channel();
+
+        let job = Recording {
+            url: format!("http://127.0.0.1:{port}/clip.mp4"),
+            name_hint: Some("stop test".to_owned()),
+            directory: dir.clone(),
+            headers: Headers::default(),
+        };
+        let proxies = ProxyManager::load(dir.join("proxies.json"));
+
+        // Drained concurrently, not collected at the end: a full channel
+        // stops the recorder reading ffmpeg's output, which stalls ffmpeg.
+        let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watching = Arc::clone(&progressed);
+        tokio::spawn(async move {
+            while let Some(event) = seen.recv().await {
+                if let VideoEvent::Progress { progress, .. } = event
+                    && progress.downloaded > 0
+                {
+                    watching.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        let recording = tokio::spawn(async move { record(1, &job, &proxies, stop, &events).await });
+
+        // Long enough that ffmpeg is well into the file and nowhere near its
+        // end, so stopping is genuinely interrupting a recording in progress.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        stopper.send(()).expect("the recorder is still listening");
+
+        let output = tokio::time::timeout(Duration::from_secs(30), recording)
+            .await
+            .expect("the recording ends promptly once asked")
+            .expect("the task did not panic")
+            .expect("the recording succeeded");
+
+        assert!(output.is_file(), "no file at {}", output.display());
+        assert_eq!(output.extension().and_then(|e| e.to_str()), Some("mp4"));
+
+        // The whole point: a killed ffmpeg leaves an MP4 ffprobe cannot open,
+        // so reading a duration back at all is the proof it was finished.
+        let seconds = crate::processor::probe_duration(&output)
+            .await
+            .expect("ffprobe reads the stopped recording")
+            .expect("the stopped recording has a duration")
+            .as_secs_f64();
+        assert!(
+            seconds > 0.5 && seconds < 29.0,
+            "expected part of the clip, got {seconds}s"
+        );
+
+        assert!(
+            progressed.load(std::sync::atomic::Ordering::Relaxed),
+            "no progress was reported"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

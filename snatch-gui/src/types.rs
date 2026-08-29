@@ -103,6 +103,12 @@ pub struct DownloadRequest {
     /// without knowing anything about the site.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<String>,
+    /// Plain media files the browser watched this page load, for the same
+    /// reason as `streams` and consulted at the same time. A site yt-dlp has
+    /// never heard of very often just serves an `.mp4`, and that wants the
+    /// ordinary downloader rather than ffmpeg.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     /// Additional sources for the *same* file. aria2 spreads its connections
     /// across every mirror and fails over between them, so a slow or flaky
     /// primary does not decide the speed.
@@ -195,6 +201,7 @@ impl DownloadRequest {
             mime: None,
             size: None,
             streams: Vec::new(),
+            files: Vec::new(),
             mirrors: Vec::new(),
         }
     }

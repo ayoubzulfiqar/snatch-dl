@@ -137,6 +137,20 @@ picked with an explicit `-map`. A master playlist lists every quality, and
 ffmpeg left to itself takes the first one — so the row would promise 1080p and
 record 480p.
 
+Stopping writes `q` to ffmpeg's stdin. That is its own "finish cleanly" key:
+it writes the trailer and exits 0. Killing it instead is what leaves a file
+with no trailer. So `stream.rs` gives ffmpeg a real stdin pipe and does **not**
+pass `-nostdin`.
+
+### One progress event per tick, not per line
+
+ffmpeg's `-progress` writes about a dozen `key=value` lines per tick. Publish
+each one and you send a dozen near-identical events.
+
+That is not just waste. A consumer that falls behind stops the reader loop,
+which fills ffmpeg's stdout pipe, which stalls the recording itself. Both
+ffmpeg modules accumulate the fields and send one event when the tick ends.
+
 ### The button on a video is a hit test, not a search
 
 Nothing scans the page for `<video>`. Every serious player buries its video

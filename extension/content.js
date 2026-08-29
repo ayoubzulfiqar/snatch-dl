@@ -640,7 +640,11 @@
     const target = location.href;
     const fallback = directSource(video);
 
-    send({ type: "formats", url: target }).then((reply) => {
+    // The address this player is using, straight from the DOM. The background
+    // worker watches for these on the wire too, but only sees them the first
+    // time: a file already in the browser's cache is fetched without a request
+    // for anything to observe. Reading it from the element always works.
+    send({ type: "formats", url: target, source: fallback }).then((reply) => {
       // The pointer moved on, or the user closed it, while we were asking.
       if (!panelOpen) {
         return;
@@ -665,11 +669,19 @@
       if (!format || typeof format.id !== "string") {
         continue;
       }
-      // A row carrying an address is a stream for ffmpeg to record; one
-      // carrying a selector is a format for yt-dlp to fetch.
-      if (typeof format.url === "string" && format.url) {
+      // Each row names the engine that takes it. A manifest is recorded by
+      // ffmpeg, a plain file is fetched by the downloader in sixteen pieces,
+      // and a selector goes to yt-dlp.
+      const address = typeof format.url === "string" ? format.url : "";
+      if (format.source === "stream" && address) {
         addRow(String(format.label || "Stream"), detailOf(format), () =>
-          pick("stream", { url: format.url, title: document.title }, format.label)
+          pick("stream", { url: address, title: document.title }, format.label)
+        );
+        continue;
+      }
+      if (format.source === "file" && address) {
+        addRow(String(format.label || "Video file"), detailOf(format), () =>
+          pick("direct", { url: address, referer: target }, format.label)
         );
         continue;
       }

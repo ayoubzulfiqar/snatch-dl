@@ -57,6 +57,9 @@ pub struct DownloadsPage {
     archive_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
     /// Crawls, keyed separately for the same reason.
     mirror_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
+    /// Recordings the user asked to have converted once they finish. The
+    /// conversion cannot start any earlier: ffmpeg is still writing the file.
+    convert_when_done: RefCell<HashSet<i64>>,
     summary: RefCell<PageSummary>,
 }
 
@@ -127,6 +130,7 @@ impl DownloadsPage {
             jobs: RefCell::new(HashMap::new()),
             archive_jobs: RefCell::new(HashMap::new()),
             mirror_jobs: RefCell::new(HashMap::new()),
+            convert_when_done: RefCell::new(HashSet::new()),
             summary: RefCell::new(PageSummary::default()),
         }
     }
@@ -368,11 +372,23 @@ impl DownloadsPage {
     /// widget with conversions: both are "a subprocess producing a file".
     pub fn handle_video(&self, ui: &Rc<Ui>, event: VideoEvent) {
         match event {
-            VideoEvent::Started { job_id, url } => {
+            VideoEvent::Started {
+                job_id,
+                url,
+                recording,
+            } => {
                 let mut jobs = self.jobs.borrow_mut();
                 let row = jobs.entry(job_id).or_insert_with(|| {
-                    let row = JobRow::new("Extracting video");
-                    row.on_cancel(ui, job_id, true);
+                    let row = JobRow::new(if recording {
+                        "Recording stream"
+                    } else {
+                        "Extracting video"
+                    });
+                    if recording {
+                        row.on_stop_recording(ui, job_id);
+                    } else {
+                        row.on_cancel(ui, job_id, true);
+                    }
                     self.jobs_list.append(&row.root);
                     row
                 });
@@ -382,7 +398,11 @@ impl DownloadsPage {
             }
             VideoEvent::Title { job_id, title } => {
                 if let Some(row) = self.jobs.borrow().get(&job_id) {
-                    row.set_label(&format!("Extracting {title}"));
+                    let recording = ui.backend().video.is_recording(job_id);
+                    row.set_label(&format!(
+                        "{} {title}",
+                        if recording { "Recording" } else { "Extracting" }
+                    ));
                 }
             }
             VideoEvent::Progress { job_id, progress } => {
@@ -392,18 +412,28 @@ impl DownloadsPage {
             }
             VideoEvent::Finished { job_id, output } => {
                 self.drop_job(job_id);
+                let convert = self.convert_when_done.borrow_mut().remove(&job_id);
                 match output {
-                    Some(path) => ui.toast(&format!(
-                        "Saved {}",
-                        path.file_name()
+                    Some(path) => {
+                        let name = path
+                            .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.display().to_string())
-                    )),
+                            .unwrap_or_else(|| path.display().to_string());
+                        // The recording is closed and playable now; this only
+                        // repackages it, and it could not have run any sooner.
+                        if convert {
+                            convert_to_mp4(ui, path);
+                            ui.toast(&format!("Saved {name}, converting to MP4"));
+                        } else {
+                            ui.toast(&format!("Saved {name}"));
+                        }
+                    }
                     None => ui.toast("Extraction finished"),
                 }
             }
             VideoEvent::Failed { job_id, error } => {
                 self.drop_job(job_id);
+                self.convert_when_done.borrow_mut().remove(&job_id);
                 ui.toast(&format!("Extraction failed: {error}"));
             }
         }
@@ -519,6 +549,19 @@ impl JobRow {
             ui.backend().wget.cancel(job_id);
             button.set_sensitive(false);
             ui.toast("Stopping the download");
+        });
+    }
+
+    /// Stop a live recording, keeping what has been written.
+    ///
+    /// A recording is not a download that failed halfway: everything already
+    /// on disk is watchable, and stopping is the only way one ever ends. So
+    /// the button asks what to do with the file rather than throwing it away.
+    fn on_stop_recording(&self, ui: &Rc<Ui>, job_id: i64) {
+        let weak = Rc::downgrade(ui);
+        self.cancel.connect_clicked(move |button| {
+            let Some(ui) = weak.upgrade() else { return };
+            present_stop_recording(&ui, job_id, button.clone());
         });
     }
 
@@ -1193,6 +1236,60 @@ fn start_post_process(ui: &Rc<Ui>, gid: &str, action: MediaAction) {
             }
         });
         ui.toast(&format!("{label}…"));
+    });
+}
+
+/// Ask what to do with a recording the user wants to end.
+fn present_stop_recording(ui: &Rc<Ui>, job_id: i64, button: gtk::Button) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Stop Recording?")
+        .body(
+            "Snatch will finish the file so it plays properly. Everything              recorded so far is kept.\n\nMatroska plays in VLC and mpv.              Convert it if you want a file that plays anywhere.",
+        )
+        .build();
+    dialog.add_responses(&[
+        ("keep", "Keep Recording"),
+        ("save", "Stop and Save"),
+        ("mp4", "Stop and Convert to MP4"),
+    ]);
+    dialog.set_response_appearance("mp4", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("mp4"));
+    dialog.set_close_response("keep");
+
+    let weak = Rc::downgrade(ui);
+    dialog.connect_response(None, move |_, response| {
+        let convert = match response {
+            "save" => false,
+            "mp4" => true,
+            _ => return,
+        };
+        let Some(ui) = weak.upgrade() else { return };
+        if convert {
+            ui.downloads.convert_when_done.borrow_mut().insert(job_id);
+        }
+        // `stop` asks ffmpeg to finish and close the file. `cancel` is the
+        // fallback for a job that turned out not to be a recording after all,
+        // which can happen if it ended between the click and this answer.
+        if !ui.backend().video.stop(job_id) {
+            ui.backend().video.cancel(job_id);
+        }
+        button.set_sensitive(false);
+        ui.toast("Finishing the recording");
+    });
+
+    dialog.present(Some(ui.window()));
+}
+
+/// Repackage a finished recording as MP4 without re-encoding it.
+fn convert_to_mp4(ui: &Rc<Ui>, input: PathBuf) {
+    let backend = ui.backend().clone();
+    let job = MediaJob::beside_input(input, MediaAction::ConvertToMp4);
+    let queue = backend.media.clone();
+    // Detached: the queue reports its own progress through MediaEvent.
+    backend.spawn(async move {
+        if let Err(error) = queue.submit(job).await {
+            log::warn!("could not convert the recording: {error:#}");
+        }
     });
 }
 

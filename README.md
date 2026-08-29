@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.9.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 2.10.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_2.9.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-2.9.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-2.9.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_2.10.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-2.10.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-2.10.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -146,9 +146,12 @@ shows how big each one is. Pick one and it downloads. There is an **Audio only**
 row too, if you just want the sound.
 
 **Live streams work too.** So do sites Snatch has never heard of. If it cannot
-name the sizes, it watches what the player is loading and offers to record
-that instead. Live shows are saved as you watch. Stop any time — the file
-still plays.
+name the sizes, it looks at what the player is loading and offers that instead.
+
+- A **live stream** is recorded while you watch.
+- A **plain video file** is downloaded the fast way, in 16 pieces, with resume.
+
+Snatch tells them apart and picks the right one for you.
 
 If the button says it found nothing, press play first and click it again.
 Snatch can only see a stream once the player asks for it.
@@ -187,9 +190,20 @@ Point at the video. Click the button on it. Pick 1080p, or 480p, or just the
 sound. Snatch fetches that one and joins the picture and the sound into a
 single file.
 
-**Record a live stream.**
+**Record a live stream, and stop when you want.**
 Point at the player. Click the button. Pick the quality. Snatch writes the show
-to disk while it happens. Stop when you like and the file still opens.
+to disk while it happens.
+
+Press stop and it asks what you want:
+
+| Choice | What happens |
+|---|---|
+| **Keep Recording** | Nothing. Carry on. |
+| **Stop and Save** | Finishes the file so it plays. Keeps everything so far. |
+| **Stop and Convert to MP4** | The same, then repacks it as MP4. |
+
+Snatch always closes the file properly. A recording you stop halfway still
+opens and still plays.
 
 **Watch a torrent while it downloads.**
 Add a magnet link. Press the sequential button. The pieces arrive in order, so

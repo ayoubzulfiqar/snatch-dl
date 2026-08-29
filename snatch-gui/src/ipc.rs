@@ -142,16 +142,19 @@ async fn accept_request(
                 log::info!("listed {} formats for {name}", probe.formats.len());
                 return Ok(IpcResponse::listing(probe));
             }
-            // yt-dlp does not know this site. The browser watched the page's
-            // player fetch its manifests, so ffmpeg can be pointed at one of
-            // those instead -- it needs to know nothing about the site.
-            Err(error) if !request.streams.is_empty() => {
-                log::info!("yt-dlp could not read {name} ({error:#}); trying the streams");
+            // yt-dlp does not know this site. The browser watched what the
+            // page loaded, so there is still a manifest to record or a file to
+            // fetch -- neither of which needs anything to know the site.
+            Err(error) if !request.streams.is_empty() || !request.files.is_empty() => {
+                log::info!("yt-dlp could not read {name} ({error:#}); trying what the page loaded");
                 let probe = stream_listing(&request).await;
                 if probe.formats.is_empty() {
                     return Err(error);
                 }
-                log::info!("found {} stream(s) on {name}", probe.formats.len());
+                log::info!(
+                    "found {} playable address(es) on {name}",
+                    probe.formats.len()
+                );
                 return Ok(IpcResponse::listing(probe));
             }
             Err(error) => return Err(error),
@@ -175,10 +178,12 @@ async fn accept_request(
             .video
             .clone()
             .start_stream(
-                request.url.clone(),
-                request.filename.clone(),
-                crate::ytdlp::destination_for(&backend.download_dir),
-                stream_headers(&request),
+                crate::stream::Recording {
+                    url: request.url.clone(),
+                    name_hint: request.filename.clone(),
+                    directory: crate::ytdlp::destination_for(&backend.download_dir),
+                    headers: stream_headers(&request),
+                },
                 backend.proxies.clone(),
                 backend.video_events.clone(),
             )
@@ -278,17 +283,37 @@ fn stream_headers(request: &DownloadRequest) -> crate::stream::Headers {
     }
 }
 
-/// Describe every stream the browser saw, as rows the picker can show.
+/// Describe everything the browser watched this page load, as picker rows.
+///
+/// Two kinds arrive together and are told apart by what they are, not by
+/// where they came from: a playlist is recorded with ffmpeg, and a plain file
+/// is fetched by the downloader, which is far quicker at it and can resume.
 async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
+    use crate::ytdlp::FormatSource;
+
     let headers = stream_headers(request);
-    let mut found = crate::stream::describe_all(&request.streams, &headers).await;
+    let (streams, files) = futures::future::join(
+        crate::stream::describe_all(&request.streams, &headers),
+        crate::stream::describe_all(&request.files, &headers),
+    )
+    .await;
+
+    let mut rows: Vec<(FormatSource, String, crate::stream::StreamInfo)> = streams
+        .into_iter()
+        .map(|(url, info)| (FormatSource::Stream, url, info))
+        .chain(
+            files
+                .into_iter()
+                .map(|(url, info)| (FormatSource::File, url, info)),
+        )
+        .collect();
 
     // Best first, and only one row per description. A player fetches its
     // master playlist and then the rendition inside it, which come back as
     // two rows saying exactly the same thing.
-    found.sort_by_key(|(_, info)| std::cmp::Reverse(info.height));
+    rows.sort_by_key(|(_, _, info)| std::cmp::Reverse(info.height));
     let mut seen: Vec<String> = Vec::new();
-    found.retain(|(_, info)| {
+    rows.retain(|(_, _, info)| {
         let label = info.label();
         if seen.contains(&label) {
             return false;
@@ -300,18 +325,23 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     crate::ytdlp::MediaProbe {
         title: request.filename.clone(),
         duration: None,
-        formats: found
+        formats: rows
             .into_iter()
-            .map(|(url, info)| crate::ytdlp::MediaFormat {
+            .map(|(source, url, info)| crate::ytdlp::MediaFormat {
                 id: String::new(),
                 label: info.label(),
-                ext: info.container().to_owned(),
-                size: None,
+                // A file is downloaded as it is, so it keeps its own
+                // extension; only a recording gets to choose a container.
+                ext: match source {
+                    FormatSource::File => crate::stream::extension_of(&url)
+                        .unwrap_or_else(|| info.container().to_owned()),
+                    _ => info.container().to_owned(),
+                },
+                size: info.size,
                 estimated: false,
                 height: info.height,
                 audio_only: !info.has_video(),
-                // Having an address is what marks this a row for ffmpeg
-                // rather than a yt-dlp format selector.
+                source,
                 url: Some(url),
             })
             .collect(),

@@ -72,8 +72,23 @@ const MANIFEST_TYPES = new Set([
   "video/vnd.mpeg.dash.mpd"
 ]);
 
+/** Whole media files, for the sites that just serve one. */
+const MEDIA_EXTENSIONS = new Set([
+  "mp4", "webm", "m4v", "mov", "mkv", "avi", "flv", "3gp", "ogv",
+  "m4a", "mp3", "aac", "flac", "wav", "ogg", "opus", "m4b"
+]);
+
+/**
+ * Pieces of a stream, never a file to offer on their own.
+ *
+ * A four-second fragment is not a download, and a page playing one produces
+ * hundreds of them.
+ */
+const FRAGMENT_EXTENSIONS = new Set(["m4s", "cmfv", "cmfa", "fmp4", "ts"]);
+
 /** Most manifests worth remembering for one tab. */
 const STREAM_LIMIT = 24;
+const FILE_LIMIT = 8;
 const STREAM_TTL_MS = 15 * 60 * 1000;
 
 const WEB_REQUEST_FILTER = { urls: ["http://*/*", "https://*/*"] };
@@ -93,6 +108,11 @@ const hints = new Map();
 
 /** URLs we deliberately let the browser handle once (hand-off fallback). */
 const passThrough = new Set();
+
+/**
+ * Whole media files each tab has loaded, newest last. See `rememberFile`.
+ */
+const files = new Map();
 
 /**
  * Manifests each tab's player has fetched, newest last.
@@ -305,18 +325,54 @@ function isManifestUrl(url) {
   }
 }
 
-function rememberStream(tabId, url) {
+function remember(store, tabId, url, limit) {
   if (typeof tabId !== "number" || tabId < 0 || !isHijackable(url)) {
     return;
   }
   const now = Date.now();
-  const kept = (streams.get(tabId) ?? []).filter(
+  const kept = (store.get(tabId) ?? []).filter(
     (entry) => entry.url !== url && now - entry.at < STREAM_TTL_MS
   );
   kept.push({ url: url, at: now });
   // Newest last, oldest dropped: a page that re-fetches one playlist forever
   // must not push the others out.
-  streams.set(tabId, kept.slice(-STREAM_LIMIT));
+  store.set(tabId, kept.slice(-limit));
+}
+
+function rememberStream(tabId, url) {
+  remember(streams, tabId, url, STREAM_LIMIT);
+}
+
+function extensionOf(url) {
+  try {
+    const path = new URL(url).pathname;
+    const dot = path.lastIndexOf(".");
+    if (dot < 0 || dot === path.length - 1) {
+      return "";
+    }
+    return path.slice(dot + 1).toLowerCase();
+  } catch (error) {
+    return "";
+  }
+}
+
+/**
+ * Remember a whole media file this tab loaded.
+ *
+ * Skipped entirely once the tab has shown a manifest. A page that streams
+ * fetches its video as hundreds of fragments, and every one of them looks like
+ * a media file; the manifest is already the better answer for that page, so
+ * there is nothing to gain by listing its pieces.
+ */
+function rememberFile(tabId, url) {
+  if ((streams.get(tabId) ?? []).length > 0) {
+    return;
+  }
+  const extension = extensionOf(url);
+  if (FRAGMENT_EXTENSIONS.has(extension) || !MEDIA_EXTENSIONS.has(extension)) {
+    return;
+  }
+  remember(files, tabId, url, FILE_LIMIT);
 }
 
 /**
@@ -325,14 +381,22 @@ function rememberStream(tabId, url) {
  * Freshest first because the last thing a player asked for is the thing it is
  * playing now. Only a handful are ever inspected on the Snatch side.
  */
-function recentStreams(tabId) {
+function recent(store, tabId) {
   if (typeof tabId !== "number") {
     return [];
   }
   const now = Date.now();
-  const kept = (streams.get(tabId) ?? []).filter((entry) => now - entry.at < STREAM_TTL_MS);
-  streams.set(tabId, kept);
+  const kept = (store.get(tabId) ?? []).filter((entry) => now - entry.at < STREAM_TTL_MS);
+  store.set(tabId, kept);
   return kept.map((entry) => entry.url).reverse();
+}
+
+function recentStreams(tabId) {
+  return recent(streams, tabId);
+}
+
+function recentFiles(tabId) {
+  return recent(files, tabId);
 }
 
 // ---------------------------------------------------------------------------
@@ -768,8 +832,20 @@ async function handleContentMessage(message, sender) {
       // What the page's player fetched, for the sites yt-dlp cannot read.
       // Snatch only looks at these if yt-dlp comes back with nothing.
       const observed = recentStreams(tabId);
+      // What the page is playing now comes first: it is the one the user is
+      // looking at, and it is the only one still available once the browser
+      // has the file cached.
+      const loaded = recentFiles(tabId);
+      if (isHijackable(message.source) && !loaded.includes(message.source)) {
+        loaded.unshift(message.source);
+      }
       if (observed.length > 0) {
         payload.streams = observed;
+      }
+      if (loaded.length > 0) {
+        payload.files = loaded;
+      }
+      if (observed.length > 0 || loaded.length > 0) {
         // A manifest is very often refused without the request looking like
         // the player's, so the same three go with it.
         payload.referer = url;
@@ -858,9 +934,12 @@ api.webRequest.onBeforeRequest.addListener(
     // one, and offering them here would record the wrong programme.
     if (details.type === "main_frame") {
       streams.delete(details.tabId);
+      files.delete(details.tabId);
     }
     if (isManifestUrl(details.url)) {
       rememberStream(details.tabId, details.url);
+    } else if (details.type === "media") {
+      rememberFile(details.tabId, details.url);
     }
     if (looksLikeDownload(details.url)) {
       rememberHint(details.url, {
@@ -925,6 +1004,7 @@ api.webRequest.onHeadersReceived.addListener(
 
 api.tabs.onRemoved.addListener((tabId) => {
   streams.delete(tabId);
+  files.delete(tabId);
 });
 
 api.downloads.onCreated.addListener((item) => {
