@@ -964,7 +964,8 @@ impl Ui {
                     | JobKind::Video
                     | JobKind::Sniff
                     | JobKind::Formats
-                    | JobKind::Stream => PAGE_DOWNLOADS,
+                    | JobKind::Stream
+                    | JobKind::Unknown => PAGE_DOWNLOADS,
                 });
                 self.raise_if_hidden();
             }
@@ -1090,6 +1091,7 @@ impl Ui {
             // never reaches the window. Saying so beats adding it silently to
             // a page it does not belong on.
             JobKind::Formats => self.toast("A format listing is not something to download"),
+            JobKind::Unknown => self.toast("This version of Snatch does not know that request"),
             JobKind::Download => self.add_download(request),
         }
     }

@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 3.6.9</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 3.6.10</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_3.6.9-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-3.6.9-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-3.6.9-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_3.6.10-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-3.6.10-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-3.6.10-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -175,6 +175,9 @@ one. No download tool can save those — not Snatch, and not any other.
 
 Snatch only looks when you click the button. It does not read the pages you are
 just visiting.
+
+**Says Snatch is out of date?** The add-on and the app update separately.
+Install the newest Snatch, then restart your browser.
 
 **Updated Snatch and the button stopped working?** It fixes itself. Pages that
 were already open get a fresh button on their own. If one still says to reload,

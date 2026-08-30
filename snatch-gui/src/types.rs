@@ -37,6 +37,16 @@ pub enum JobKind {
     /// A stream address for ffmpeg to record, for the pages yt-dlp cannot
     /// read. Its scheme may be `rtmp:` or `rtsp:` as well as `http:`.
     Stream,
+    /// A kind this build has never heard of.
+    ///
+    /// The add-on and the app are installed separately and can drift apart --
+    /// updating one is not updating the other. Without this, a request from a
+    /// newer add-on fails inside serde, and what reaches the reader is
+    /// "unknown variant `formats`, expected one of `download`, `magnet` …",
+    /// which says nothing about what to do. Naming the case lets the answer
+    /// be "the app is older than the add-on; update it".
+    #[serde(other)]
+    Unknown,
 }
 
 impl JobKind {
@@ -49,6 +59,7 @@ impl JobKind {
             JobKind::Sniff => "sniff",
             JobKind::Formats => "format listing",
             JobKind::Stream => "stream",
+            JobKind::Unknown => "something this version does not do",
         }
     }
 }
@@ -554,6 +565,25 @@ mod tests {
 
         request.skip_seconds = Some(30);
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn a_kind_from_a_newer_add_on_parses_instead_of_failing() {
+        // The add-on and the app are installed separately, so one can be
+        // newer. Before this the whole request failed inside serde and the
+        // reader was shown "unknown variant `formats`, expected one of
+        // `download`, `magnet` …", which says nothing about what to do.
+        let request: DownloadRequest =
+            serde_json::from_str(r#"{"url":"https://x.test/a","kind":"a-kind-from-2030"}"#)
+                .expect("a request from a newer add-on must still parse");
+        assert_eq!(request.kind, JobKind::Unknown);
+        assert_eq!(request.inferred_kind(), JobKind::Unknown);
+
+        // The kinds this build does know are unaffected.
+        let known: DownloadRequest =
+            serde_json::from_str(r#"{"url":"https://x.test/a","kind":"formats"}"#)
+                .expect("must parse");
+        assert_eq!(known.kind, JobKind::Formats);
     }
 
     #[test]

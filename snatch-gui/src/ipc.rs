@@ -173,6 +173,16 @@ async fn accept_request(
         return Ok(IpcResponse::accepted("sniff".to_owned()));
     }
 
+    // Said plainly, and said early: the add-on and the app are installed
+    // separately, so one can be newer than the other and the reader has no way
+    // to know which. This is the only answer that helps.
+    if kind == JobKind::Unknown {
+        bail!(
+            "this copy of Snatch is older than the browser add-on and does not know \
+             how to do that yet; update Snatch"
+        );
+    }
+
     let id = match kind {
         JobKind::Stream => backend
             .video
@@ -247,6 +257,7 @@ async fn accept_request(
         // guards above are ever refactored away.
         JobKind::Sniff => bail!("a sniff has nothing to queue"),
         JobKind::Formats => bail!("a format listing has nothing to queue"),
+        JobKind::Unknown => bail!("this version of Snatch does not know that request"),
         JobKind::Scrape => {
             let base = backend.download_dir.join("Snatch Galleries");
             let config = GalleryConfig::new(destination_for(&base, &request.url));

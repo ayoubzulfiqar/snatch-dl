@@ -61,6 +61,17 @@
   /** The browser found the add-on but not the program behind it. */
   const NO_HOST = /native messaging host|not registered|host is unreachable|could not execute/i;
 
+  /**
+   * The app is older than this add-on.
+   *
+   * They are installed separately, so updating one is not updating the other.
+   * An older app fails inside its own parser and answers with something like
+   * "unknown variant `formats`, expected one of `download`, `magnet` …", which
+   * is true and tells the reader nothing. Newer apps say so themselves; this
+   * catches the ones that cannot.
+   */
+  const OUTDATED = /unknown variant|unknown field|not a valid Snatch download request|older than the browser add-on/i;
+
   let enabled = true;
   /** Set once this script belongs to an extension that is no longer there. */
   let orphaned = false;
@@ -911,6 +922,18 @@
     if (updated) {
       note(UPDATED);
       status("Reload the page", "bad");
+      return;
+    }
+
+    // Checked before anything else about the page: nothing on any site will
+    // work until the app is updated, so it is the whole answer.
+    if (OUTDATED.test(String(error || ""))) {
+      note(
+        "The Snatch app on this computer is older than this add-on, so it does " +
+          "not understand what the button is asking for. Update Snatch, then " +
+          "restart your browser."
+      );
+      status("Snatch is out of date", "bad");
       return;
     }
 

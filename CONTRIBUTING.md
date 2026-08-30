@@ -63,6 +63,15 @@ cargo build --release
 
 Run `./install.sh` to install your build for yourself.
 
+**Run it again after every change you want to try in a browser.** The add-on
+and the app are installed separately. Reloading the extension in Chrome picks
+up your new `content.js`, and it does *not* rebuild or reinstall `snatch-gui` --
+so the browser keeps launching whichever binary you installed last. An add-on
+newer than the app asks for things the app has never heard of.
+
+Snatch says so when that happens rather than failing inside its own parser, but
+the fix is always the same: `cargo build --release && ./install.sh`.
+
 Check your work with the same four commands CI runs:
 
 ```bash

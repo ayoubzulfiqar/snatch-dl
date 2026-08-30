@@ -1,6 +1,6 @@
 # Maintainer: Ayoub Zulfiqar <contact@ayoubzulfiqar.com>
 pkgname=snatch-dl
-pkgver=3.6.9
+pkgver=3.6.10
 pkgrel=1
 pkgdesc="Download manager for Linux: aria2, BitTorrent, yt-dlp and gallery-dl behind one GTK4 window"
 arch=('x86_64')

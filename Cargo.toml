@@ -3,7 +3,7 @@ resolver = "3"
 members = ["snatch-gui", "snatch-nmh"]
 
 [workspace.package]
-version = "3.6.9"
+version = "3.6.10"
 edition = "2024"
 rust-version = "1.92"
 license-file = "LICENSE"
