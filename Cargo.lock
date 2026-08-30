@@ -3405,7 +3405,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "snatch-gui"
-version = "2.14.1"
+version = "3.6.9"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "snatch-nmh"
-version = "2.14.1"
+version = "3.6.9"
 dependencies = [
  "anyhow",
  "serde",

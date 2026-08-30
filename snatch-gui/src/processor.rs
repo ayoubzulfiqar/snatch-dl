@@ -128,8 +128,19 @@ impl MediaJob {
             MediaAction::Mux { .. } => "muxed",
         };
 
+        // The suffix is only there to keep the output away from the input.
+        // When the container changes it already is -- a recording repacked
+        // from Matroska to MP4 lands on `Show.mp4`, not `Show.mp4.mp4`, which
+        // is a poor name to hand somebody who asked for a conversion.
+        let same_container = input
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension.as_str()));
         let directory = input.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let output = directory.join(format!("{stem}.{suffix}.{extension}"));
+        let output = if same_container {
+            directory.join(format!("{stem}.{suffix}.{extension}"))
+        } else {
+            directory.join(format!("{stem}.{extension}"))
+        };
         Self {
             input,
             output,
@@ -700,12 +711,47 @@ mod tests {
     }
 
     #[test]
+    fn a_converted_file_is_named_for_what_it_became() {
+        let from_mkv = MediaJob::beside_input(
+            PathBuf::from("/v/Match of the Day.mkv"),
+            MediaAction::ConvertToMp4,
+        );
+        assert_eq!(from_mkv.output, PathBuf::from("/v/Match of the Day.mp4"));
+
+        // Already an MP4, so the suffix is the only thing keeping the output
+        // from being the input.
+        let from_mp4 =
+            MediaJob::beside_input(PathBuf::from("/v/clip.mp4"), MediaAction::ConvertToMp4);
+        assert_eq!(from_mp4.output, PathBuf::from("/v/clip.mp4.mp4"));
+        assert_ne!(from_mp4.output, from_mp4.input);
+
+        // A trim keeps the container, so it always needs the suffix.
+        let trimmed = MediaJob::beside_input(
+            PathBuf::from("/v/clip.mkv"),
+            MediaAction::Trim {
+                start: Duration::from_secs(1),
+                end: None,
+            },
+        );
+        assert_eq!(trimmed.output, PathBuf::from("/v/clip.trimmed.mkv"));
+
+        // And audio out of a video is already a different container.
+        let audio = MediaJob::beside_input(
+            PathBuf::from("/v/talk.mkv"),
+            MediaAction::ExtractAudio { bitrate_kbps: 192 },
+        );
+        assert_eq!(audio.output, PathBuf::from("/v/talk.mp3"));
+    }
+
+    #[test]
     fn extract_audio_builds_a_video_free_mp3_command() {
         let job = MediaJob::beside_input(
             PathBuf::from("/m/Clip.mkv"),
             MediaAction::ExtractAudio { bitrate_kbps: 192 },
         );
-        assert_eq!(job.output, PathBuf::from("/m/Clip.audio.mp3"));
+        // The container already changed, so no suffix is needed to keep the
+        // output away from the input.
+        assert_eq!(job.output, PathBuf::from("/m/Clip.mp3"));
 
         let args = build_args(&job);
         assert!(args.windows(2).any(|w| w == ["-progress", "pipe:1"]));
@@ -714,7 +760,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-b:a", "192k"]));
         // Without -n an existing file would be silently clobbered.
         assert!(args.contains(&"-n".to_owned()));
-        assert_eq!(args.last().map(String::as_str), Some("/m/Clip.audio.mp3"));
+        assert_eq!(args.last().map(String::as_str), Some("/m/Clip.mp3"));
     }
 
     #[test]
@@ -763,7 +809,7 @@ mod tests {
     #[test]
     fn convert_to_mp4_enables_faststart() {
         let job = MediaJob::beside_input(PathBuf::from("/m/a.webm"), MediaAction::ConvertToMp4);
-        assert_eq!(job.output, PathBuf::from("/m/a.mp4.mp4"));
+        assert_eq!(job.output, PathBuf::from("/m/a.mp4"));
         let args = build_args(&job);
         assert!(args.windows(2).any(|w| w == ["-movflags", "+faststart"]));
     }

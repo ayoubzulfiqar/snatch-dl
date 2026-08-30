@@ -789,10 +789,9 @@ pub async fn record(
     std::fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
     let extension = info.container();
-    // Reserved up front so every part of one recording shares a stem, even if
+    // Chosen up front so every part of one recording shares a stem, even if
     // another recording of the same programme is running beside it.
-    let final_path = unique_path(directory.as_path(), &name, extension);
-    let stem = final_path
+    let stem = unique_path(directory.as_path(), &name, extension)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| name.clone());
@@ -815,7 +814,7 @@ pub async fn record(
 
         let seek = resume_seek(&info, *skip, recorded);
         let part = directory.join(format!("{stem}.part{}.{extension}", parts.len() + 1));
-        let ended = run_part(
+        let outcome = run_part(
             job_id,
             url,
             headers,
@@ -830,8 +829,30 @@ pub async fn record(
             &mut progress,
             &mut recorded,
         )
-        .await?;
+        .await;
+        // Kept whatever it managed to write. A stretch that failed part way
+        // still holds real minutes, and the join is the place to decide
+        // whether they can be used.
         parts.push(part);
+
+        let ended = match outcome {
+            Ok(ended) => ended,
+            // Nothing has been recorded yet, so the reason it failed is the
+            // whole answer.
+            Err(error) if usable(&parts).is_empty() => return Err(error),
+            // Something has. A broadcast that ended while the recording was
+            // paused must not cost the hour that was already captured.
+            Err(error) => {
+                log::warn!("stream job {job_id} ended early: {error:#}");
+                let _ = events
+                    .send(VideoEvent::Title {
+                        job_id,
+                        title: format!("{name} (the stream ended)"),
+                    })
+                    .await;
+                break;
+            }
+        };
 
         match ended {
             PartEnd::Source | PartEnd::Stopped => break,
@@ -861,7 +882,25 @@ pub async fn record(
         }
     }
 
+    // Asked for again now rather than reused from the start: a recording can
+    // run for hours, and `std::fs::rename` replaces whatever it lands on
+    // without a word. Another job finishing on that name in the meantime must
+    // not have its file quietly overwritten.
+    let final_path = unique_path(directory.as_path(), &stem, extension);
     join_parts(job_id, parts, &final_path, events).await
+}
+
+/// The parts that actually hold something.
+///
+/// A stretch stopped in the instant before ffmpeg wrote anything leaves an
+/// empty file behind, and an empty file in a concat list fails the join for
+/// every other part with it.
+fn usable(parts: &[PathBuf]) -> Vec<PathBuf> {
+    parts
+        .iter()
+        .filter(|part| std::fs::metadata(part).is_ok_and(|meta| meta.is_file() && meta.len() > 0))
+        .cloned()
+        .collect()
 }
 
 /// Put the parts together, or hand back the only one there was.
@@ -871,7 +910,14 @@ async fn join_parts(
     final_path: &Path,
     events: &mpsc::Sender<VideoEvent>,
 ) -> Result<PathBuf> {
-    let kept: Vec<PathBuf> = parts.into_iter().filter(|part| part.is_file()).collect();
+    let kept = usable(&parts);
+    // An empty stretch is not a recording, and leaving it in the directory
+    // only puzzles whoever finds it.
+    for part in &parts {
+        if !kept.contains(part) {
+            let _ = std::fs::remove_file(part);
+        }
+    }
     match kept.len() {
         0 => bail!("the recording produced no file"),
         // Never paused: a rename is the whole job.
@@ -1542,6 +1588,29 @@ mod tests {
         );
         // A leading dot would make a hidden file.
         assert_eq!(output_name(Some(".hidden"), "https://x/y"), "hidden");
+    }
+
+    #[test]
+    fn an_empty_stretch_is_not_part_of_the_recording() {
+        let dir = std::env::temp_dir().join(format!("snatch-usable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let real = dir.join("show.part1.mkv");
+        let empty = dir.join("show.part2.mkv");
+        let missing = dir.join("show.part3.mkv");
+        std::fs::write(&real, b"something").expect("write");
+        std::fs::write(&empty, b"").expect("write");
+
+        // A stretch stopped before ffmpeg wrote a byte leaves an empty file,
+        // and an empty file in a concat list fails the join for every good
+        // part beside it.
+        assert_eq!(
+            usable(&[real.clone(), empty.clone(), missing.clone()]),
+            vec![real]
+        );
+        assert!(usable(&[empty, missing]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

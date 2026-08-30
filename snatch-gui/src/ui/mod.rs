@@ -1859,6 +1859,14 @@ impl Ui {
             request
         };
 
+        // Several recordings are a batch however they were written. Only a
+        // pattern used to reach the preview, so pasting sixty addresses
+        // started sixty recordings with nothing asked and no ceiling.
+        if kind_choice == 6 && urls.len() > 1 {
+            self.present_batch_preview(urls.clone(), kind_choice, extras);
+            return;
+        }
+
         if as_mirrors && !rest.is_empty() {
             let mut request = build(first.clone());
             request.mirrors = rest.to_vec();

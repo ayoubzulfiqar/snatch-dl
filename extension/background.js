@@ -282,11 +282,16 @@ async function broadcastOverlay() {
     if (typeof tab.id !== "number") {
       continue;
     }
-    const wanted = globallyOn && !hidden.includes(hostOf(tab.url));
+    // The list goes to the page and the page decides, rather than this
+    // reading `tab.url` to decide for it. Firefox hands out a tab's address
+    // only with the "tabs" permission, which asks the reader for their
+    // browsing history -- a lot to charge for something the page already
+    // knows about itself.
     try {
       const sent = api.tabs.sendMessage(tab.id, {
         type: "snatch-overlay",
-        enabled: wanted
+        enabled: globallyOn,
+        hidden: hidden
       });
       if (sent && typeof sent.catch === "function") {
         sent.catch(() => {});
@@ -344,12 +349,17 @@ function remember(store, tabId, url, limit) {
     return;
   }
   const now = Date.now();
-  const kept = (store.get(tabId) ?? []).filter(
-    (entry) => entry.url !== url && now - entry.at < STREAM_TTL_MS
-  );
-  kept.push({ url: url, at: now });
-  // Newest last, oldest dropped: a page that re-fetches one playlist forever
-  // must not push the others out.
+  const kept = (store.get(tabId) ?? []).filter((entry) => now - entry.at < STREAM_TTL_MS);
+  const seen = kept.find((entry) => entry.url === url);
+  if (seen) {
+    // Counted where it stands rather than moved to the end. How often a
+    // manifest is asked for is the signal below, and reordering would throw
+    // away the order they were first seen in.
+    seen.at = now;
+    seen.hits += 1;
+  } else {
+    kept.push({ url: url, at: now, hits: 1 });
+  }
   store.set(tabId, kept.slice(-limit));
 }
 
@@ -405,7 +415,17 @@ function recent(store, tabId) {
   const now = Date.now();
   const kept = (store.get(tabId) ?? []).filter((entry) => now - entry.at < STREAM_TTL_MS);
   store.set(tabId, kept);
-  return kept.map((entry) => entry.url).reverse();
+  // Fewest fetches first, then newest.
+  //
+  // A master playlist is fetched once and lists every quality. The media
+  // playlist inside it is polled every few seconds and holds exactly one. So
+  // newest-first put the polled ones at the top and, on a player that
+  // switches bitrate, crowded the master out of the handful that get looked
+  // at -- costing the quality list on precisely the streams that have one.
+  return kept
+    .slice()
+    .sort((a, b) => a.hits - b.hits || b.at - a.at)
+    .map((entry) => entry.url);
 }
 
 function recentStreams(tabId) {
@@ -1204,7 +1224,10 @@ api.runtime.onInstalled.addListener(() => {
 async function armOpenTabs() {
   let tabs = [];
   try {
-    tabs = await api.tabs.query({ url: ["http://*/*", "https://*/*"] });
+    // Deliberately unfiltered: matching on `url` needs the "tabs" permission
+    // in Firefox. Injecting into a tab that will not have it simply fails,
+    // which is caught below and is the normal case anyway.
+    tabs = await api.tabs.query({});
   } catch (error) {
     console.warn("Snatch: could not list the open tabs", error);
     return;

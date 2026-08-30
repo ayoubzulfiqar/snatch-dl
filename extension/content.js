@@ -967,8 +967,15 @@
     if (!parts) {
       return null;
     }
+    const hours = Number(parts[1]);
+    const minutes = Number(parts[2]);
+    // `setHours(99, 99)` does not fail, it rolls over into some other day.
+    // A recording that starts four days late is worse than one refused.
+    if (hours > 23 || minutes > 59) {
+      return null;
+    }
     const when = new Date();
-    when.setHours(Number(parts[1]), Number(parts[2]), 0, 0);
+    when.setHours(hours, minutes, 0, 0);
     if (when.getTime() <= Date.now()) {
       when.setDate(when.getDate() + 1);
     }
@@ -983,7 +990,10 @@
       options.start_at = at;
     }
     const minutes = Number.parseInt((minutesField && minutesField.value) || "", 10);
-    if (Number.isFinite(minutes) && minutes > 0) {
+    // A month is longer than any broadcast, and Snatch refuses more anyway;
+    // stopping here means saying so in the panel rather than after a round
+    // trip. A number too big for the field is simply not a length.
+    if (Number.isFinite(minutes) && minutes > 0 && minutes <= 31 * 24 * 60) {
       options.record_seconds = minutes * 60;
     }
     return options;
@@ -1077,11 +1087,18 @@
   window.addEventListener("pagehide", () => hide(true));
 
   api.runtime.onMessage.addListener((message) => {
-    if (message && message.type === "snatch-overlay") {
-      enabled = message.enabled !== false;
-      if (!enabled) {
-        hide(true);
-      }
+    if (!message || message.type !== "snatch-overlay") {
+      return;
+    }
+    // This page knows its own host, so it is told which sites are hidden and
+    // decides for itself. The alternative is the extension reading every
+    // tab's address, which Firefox charges a browsing-history permission for.
+    const blocked =
+      Array.isArray(message.hidden) &&
+      message.hidden.includes(location.hostname.toLowerCase());
+    enabled = message.enabled !== false && !blocked;
+    if (!enabled) {
+      hide(true);
     }
   });
 

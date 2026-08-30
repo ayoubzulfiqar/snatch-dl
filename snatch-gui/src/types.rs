@@ -234,6 +234,20 @@ impl DownloadRequest {
         if url.is_empty() {
             bail!("the URL is empty");
         }
+        // Checked before the per-kind branches below, every one of which
+        // returns early -- including the stream branch, which is the only
+        // kind these two apply to.
+        //
+        // A month is longer than any broadcast, and these arrive from fields
+        // in a web page. An absurd one reaches ffmpeg as `-ss 1.8e19`, which
+        // seeks past the end of everything and records an empty file.
+        const LONGEST: u64 = 31 * 24 * 60 * 60;
+        if self.record_seconds.is_some_and(|seconds| seconds > LONGEST) {
+            bail!("a recording cannot be asked to run for more than a month");
+        }
+        if self.skip_seconds.is_some_and(|seconds| seconds > LONGEST) {
+            bail!("a recording cannot be asked to skip more than a month");
+        }
         if self.inferred_kind() == JobKind::Magnet {
             // A magnet has no `://`, so it is checked on its own terms.
             if !url.starts_with("magnet:") {
@@ -520,6 +534,26 @@ mod tests {
                 .is_err(),
             "a CRLF must never reach the engine"
         );
+    }
+
+    #[test]
+    fn a_recording_cannot_be_asked_for_an_absurd_length() {
+        let mut request = DownloadRequest::stream("https://live.example/a.m3u8");
+        request.record_seconds = Some(2 * 60 * 60);
+        assert!(request.validate().is_ok(), "two hours is a normal ask");
+
+        // These arrive from fields in a web page. Left through, one reaches
+        // ffmpeg as `-ss 1.8e19`, which seeks past the end of everything and
+        // records an empty file for a reason nobody could work out.
+        request.record_seconds = Some(u64::MAX);
+        assert!(request.validate().is_err());
+
+        request.record_seconds = None;
+        request.skip_seconds = Some(u64::MAX);
+        assert!(request.validate().is_err());
+
+        request.skip_seconds = Some(30);
+        assert!(request.validate().is_ok());
     }
 
     #[test]
