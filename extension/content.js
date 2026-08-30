@@ -52,7 +52,18 @@
   /** How long "Sent to Snatch" stays up before the panel closes itself. */
   const DONE_MS = 1500;
 
+  /** What to say when this script has outlived its extension. */
+  const UPDATED = "Snatch was updated. Reload this page to use the button here.";
+
+  /** The two ways Chromium words the same thing. */
+  const DEAD_CONTEXT = /Extension context invalidated|Receiving end does not exist|message port closed/i;
+
+  /** The browser found the add-on but not the program behind it. */
+  const NO_HOST = /native messaging host|not registered|host is unreachable|could not execute/i;
+
   let enabled = true;
+  /** Set once this script belongs to an extension that is no longer there. */
+  let orphaned = false;
   let host = null;
   let root = null;
   let pill = null;
@@ -79,24 +90,81 @@
   // -------------------------------------------------------------------------
 
   /**
+   * Whether this script can still reach the extension it came from.
+   *
+   * Reloading or updating an extension does not touch the content scripts
+   * already running in open tabs. They keep their DOM listeners and their
+   * drawn UI, and every call they make into the extension fails from then on
+   * with "Extension context invalidated" or "Receiving end does not exist" --
+   * which is exactly what a page open across an update reports.
+   *
+   * `runtime.id` is the cheapest way to tell: it goes undefined the moment the
+   * context dies, and reading it never throws.
+   */
+  function alive() {
+    try {
+      return Boolean(api.runtime && api.runtime.id);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Take this script's UI out of the page and stop doing anything.
+   *
+   * The replacement injected by the new extension draws its own, and two
+   * pills in one corner -- one of them dead -- is worse than none.
+   */
+  function teardown() {
+    orphaned = true;
+    enabled = false;
+    panelOpen = false;
+    pillVisible = false;
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = 0;
+    }
+    if (host && host.parentNode) {
+      host.parentNode.removeChild(host);
+    }
+    host = null;
+    root = null;
+    pill = null;
+    panel = null;
+  }
+
+  /**
    * Send one request and always resolve, never reject: every caller here is
    * rendering the answer into the panel, and an exception would leave the
    * panel stuck on "Asking Snatch".
    */
   function send(message) {
+    if (!alive()) {
+      return Promise.resolve({ ok: false, error: UPDATED, updated: true });
+    }
     if (IS_FIREFOX) {
       // Firefox's runtime API is promise-only and rejects a callback argument.
       return globalThis.browser.runtime
         .sendMessage(message)
         .then((reply) => reply || { ok: false, error: "Snatch sent no reply" })
-        .catch((error) => ({ ok: false, error: describe(error) }));
+        .catch((error) => {
+          const message = describe(error);
+          return DEAD_CONTEXT.test(message)
+            ? { ok: false, error: UPDATED, updated: true }
+            : { ok: false, error: message };
+        });
     }
     return new Promise((resolve) => {
       try {
         api.runtime.sendMessage(message, (reply) => {
           const failure = api.runtime.lastError;
           if (failure) {
-            resolve({ ok: false, error: failure.message || "Snatch is unreachable" });
+            const message = failure.message || "Snatch is unreachable";
+            resolve(
+              DEAD_CONTEXT.test(message)
+                ? { ok: false, error: UPDATED, updated: true }
+                : { ok: false, error: message }
+            );
             return;
           }
           resolve(reply || { ok: false, error: "Snatch sent no reply" });
@@ -776,7 +844,7 @@
         renderFormats(reply, target);
         return;
       }
-      renderFallback(reply.error, fallback, target);
+      renderFallback(reply.error, fallback, target, reply.updated === true);
     });
   }
 
@@ -833,9 +901,29 @@
    * yt-dlp could not read the page. A plain `<video src>` is still worth
    * offering: it is the ordinary hand-off Snatch does for any other link.
    */
-  function renderFallback(error, fallback, target) {
+  function renderFallback(error, fallback, target, updated) {
     clear(panelBody);
     optionsBox.classList.remove("shown");
+
+    // Nothing on this page can work until it is reloaded, so say that and
+    // nothing else. Offering a download that cannot start, or advice about
+    // pressing play, only wastes the reader's time.
+    if (updated) {
+      note(UPDATED);
+      status("Reload the page", "bad");
+      return;
+    }
+
+    // The add-on is fine and the program behind it is not there. Advice about
+    // pressing play would send the reader looking in the wrong place.
+    if (NO_HOST.test(String(error || ""))) {
+      note(
+        "Snatch itself is not answering. Install the Snatch app, then restart " +
+          "your browser. The add-on on its own cannot download anything."
+      );
+      status("Snatch is not installed", "bad");
+      return;
+    }
 
     // Detected, and explained rather than attempted. The encrypted bytes are
     // all that crosses the wire; the key goes to a module inside the browser
@@ -907,6 +995,10 @@
       if (!panelOpen) {
         return;
       }
+      if (reply.updated === true) {
+        status(UPDATED, "bad");
+        return;
+      }
       if (reply.ok) {
         status(`Sent ${what || "it"} to Snatch`, "good");
         setTimeout(() => {
@@ -927,7 +1019,7 @@
   document.addEventListener(
     "pointermove",
     (event) => {
-      if (!enabled) {
+      if (orphaned) {
         return;
       }
       const now = Date.now();
@@ -935,6 +1027,16 @@
         return;
       }
       lastHitTest = now;
+      // Checked here because this is the first thing that happens on any page:
+      // an extension replaced under a tab leaves this script running with a
+      // pill that can no longer do anything, so it takes it away.
+      if (!alive()) {
+        teardown();
+        return;
+      }
+      if (!enabled) {
+        return;
+      }
 
       const found = videoAt(event.clientX, event.clientY);
       if (found && isWorthwhile(found)) {

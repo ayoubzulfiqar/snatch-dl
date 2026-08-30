@@ -1185,7 +1185,45 @@ async function installContextMenu() {
 api.runtime.onInstalled.addListener(() => {
   void installContextMenu();
   void refreshAction();
+  void armOpenTabs();
 });
+
+/**
+ * Put a working content script back into tabs that were already open.
+ *
+ * Installing or updating an extension does not touch the content scripts
+ * already running: they keep their listeners and their drawn UI, and every
+ * call they make into the extension fails from then on. Every tab open at the
+ * moment of an update is left with a button that cannot do anything, which
+ * looks like the extension is broken everywhere at once.
+ *
+ * Injecting again gives each of those tabs a live script without the reader
+ * having to reload anything. The stale one notices it has been replaced and
+ * removes its own UI.
+ */
+async function armOpenTabs() {
+  let tabs = [];
+  try {
+    tabs = await api.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  } catch (error) {
+    console.warn("Snatch: could not list the open tabs", error);
+    return;
+  }
+  for (const tab of tabs) {
+    if (typeof tab.id !== "number") {
+      continue;
+    }
+    try {
+      await api.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        files: ["content.js"]
+      });
+    } catch (error) {
+      // Perfectly normal: the Web Store, a PDF, a page that was closing, or
+      // any of the pages an extension is never allowed to touch.
+    }
+  }
+}
 
 api.runtime.onStartup.addListener(() => {
   void installContextMenu();
