@@ -131,6 +131,29 @@ jobs:
           if "key" in firefox:
               sys.exit("the Firefox manifest must not carry the Chromium key")
 
+          # The version lives in five files and only one of them is built
+          # from the others. A release went out with an Arch package still
+          # named 3.6.10 because the PKGBUILD was the one that got missed,
+          # and nothing noticed until the assets were listed.
+          crate = re.search(r'^version = "([^"]+)"',
+                            pathlib.Path("Cargo.toml").read_text(), re.M)
+          if not crate:
+              sys.exit("Cargo.toml has no workspace version")
+          version = crate.group(1)
+
+          pkgbuild = re.search(r'^pkgver=(\S+)',
+                               pathlib.Path("packaging/PKGBUILD").read_text(), re.M)
+          if not pkgbuild:
+              sys.exit("packaging/PKGBUILD has no pkgver")
+
+          for name, found in (("packaging/PKGBUILD", pkgbuild.group(1)),
+                              ("extension/manifest.json", manifest.get("version")),
+                              ("packaging/extension-firefox/manifest.json",
+                               firefox.get("version"))):
+              if found != version:
+                  sys.exit(f"{name} says {found}, Cargo.toml says {version}")
+
+          print(f"every packaged version says {version}")
           print("extension manifests agree and are loadable")
           CHECK
 
