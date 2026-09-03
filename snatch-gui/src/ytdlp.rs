@@ -1828,6 +1828,17 @@ mod probe_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
+        // The binary is what makes the request, so there is nothing to
+        // observe without it. CI installs ffmpeg and 7-Zip but not yt-dlp.
+        let binary = yt_dlp_binary();
+        let installed = std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(&binary).is_file())
+        });
+        if !installed {
+            eprintln!("skipping: {binary} is not installed");
+            return;
+        }
+
         let dir = std::env::temp_dir().join(format!("snatch-ytdlp-hdr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch directory");
 
