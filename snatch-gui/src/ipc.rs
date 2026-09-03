@@ -136,29 +136,35 @@ async fn accept_request(
     // A listing is a question, not a job. Answer it and queue nothing: the
     // button on a video asks this before the user has picked a resolution, so
     // it must not put anything in the window.
+    //
+    // yt-dlp failing is not the end of the answer, it is the start of the
+    // second half of it. It knows a few thousand sites; the web has rather
+    // more, and the ones it does not know still have a player that fetched
+    // something ffmpeg can read. So a failure here is logged and worked
+    // around, never reported, and the reader only ever sees an error when
+    // there was genuinely nothing on the page to offer.
     if kind == JobKind::Formats {
-        match crate::ytdlp::probe(&request.url, backend.proxies.as_ref()).await {
-            Ok(probe) => {
-                log::info!("listed {} formats for {name}", probe.formats.len());
-                return Ok(IpcResponse::listing(probe));
-            }
-            // yt-dlp does not know this site. The browser watched what the
-            // page loaded, so there is still a manifest to record or a file to
-            // fetch -- neither of which needs anything to know the site.
-            Err(error) if !request.streams.is_empty() || !request.files.is_empty() => {
-                log::info!("yt-dlp could not read {name} ({error:#}); trying what the page loaded");
-                let probe = stream_listing(&request).await;
-                if probe.formats.is_empty() {
-                    return Err(error);
+        let headers = stream_headers(&request);
+        let refused =
+            match crate::ytdlp::probe(&request.url, &headers, backend.proxies.as_ref()).await {
+                Ok(probe) if !probe.formats.is_empty() => {
+                    log::info!("listed {} formats for {name}", probe.formats.len());
+                    return Ok(IpcResponse::listing(probe));
                 }
-                log::info!(
-                    "found {} playable address(es) on {name}",
-                    probe.formats.len()
-                );
-                return Ok(IpcResponse::listing(probe));
-            }
-            Err(error) => return Err(error),
+                Ok(_) => anyhow!("yt-dlp found nothing downloadable on that page"),
+                Err(error) => error,
+            };
+
+        log::info!("yt-dlp could not read {name} ({refused:#}); trying what the page loaded");
+        let probe = stream_listing(&request).await;
+        if !probe.formats.is_empty() {
+            log::info!(
+                "found {} playable address(es) on {name}",
+                probe.formats.len()
+            );
+            return Ok(IpcResponse::listing(probe));
         }
+        return Err(refused);
     }
 
     // A sniff has nothing to queue either: it opens the picker in the window.
@@ -240,6 +246,18 @@ async fn accept_request(
             // yt-dlp is left to choose, which is what every other entry point
             // does.
             config.format = request.format_id.clone();
+            // The request the page's player made. A members-only video, a
+            // signed CDN or a site that checks `Origin` refuses anything else.
+            config.headers = stream_headers(&request);
+            // What to fall back to if yt-dlp cannot do it after all. The probe
+            // succeeded or the user would not be looking at a format list, but
+            // extraction happens later and a site can refuse in between.
+            config.fallbacks = request
+                .files
+                .iter()
+                .chain(request.streams.iter())
+                .cloned()
+                .collect();
             backend
                 .video
                 .clone()
@@ -282,6 +300,24 @@ async fn accept_request(
     Ok(IpcResponse::accepted(id))
 }
 
+/// Whether an address is a playlist, which only ffmpeg can follow.
+///
+/// A scheme ffmpeg alone speaks -- `rtmp:`, `rtsp:`, `srt:` -- counts too:
+/// there is no file at the other end of one of those to download.
+fn is_playlist(url: &str) -> bool {
+    let scheme = url
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return true;
+    }
+    matches!(
+        crate::stream::extension_of(url).as_deref(),
+        Some("m3u8" | "m3u" | "mpd")
+    )
+}
+
 /// The request headers a page's player would have sent. A manifest is very
 /// often refused without them.
 fn stream_headers(request: &DownloadRequest) -> crate::stream::Headers {
@@ -289,6 +325,7 @@ fn stream_headers(request: &DownloadRequest) -> crate::stream::Headers {
         referer: request.referer.clone(),
         user_agent: request.user_agent.clone(),
         cookies: request.cookies.clone(),
+        extra: request.extra_headers(),
     }
 }
 
@@ -301,15 +338,40 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     use crate::ytdlp::FormatSource;
 
     let headers = stream_headers(request);
+
+    // Nothing was watched loading. The address itself is still worth opening:
+    // plenty of pages yt-dlp has never heard of *are* the media -- a bare
+    // `.mp4`, an `.m3u8` pasted into the bar, a camera's RTSP address -- and
+    // ffprobe answers that question definitively by opening it. A page that
+    // is only a page fails here in a second and costs nothing.
+    //
+    // Which of the two lists it belongs in is decided by what it is: a
+    // playlist has to be recorded, and anything else is a file the downloader
+    // fetches in sixteen pieces and can resume. Sending an `.mp4` to ffmpeg
+    // instead would work and be several times slower.
+    let fallback;
+    let (watched_streams, watched_files) = if request.streams.is_empty() && request.files.is_empty()
+    {
+        fallback = vec![request.url.clone()];
+        if is_playlist(&request.url) {
+            (&fallback[..], &[][..])
+        } else {
+            (&[][..], &fallback[..])
+        }
+    } else {
+        (&request.streams[..], &request.files[..])
+    };
+
     let (streams, files) = futures::future::join(
-        crate::stream::describe_all(&request.streams, &headers),
-        crate::stream::describe_all(&request.files, &headers),
+        crate::stream::describe_all(watched_streams, &headers),
+        crate::stream::describe_all(watched_files, &headers),
     )
     .await;
 
     // One row per quality, not per address: a master playlist is a list of
     // qualities, and offering only its best would throw the rest away.
     let mut rows: Vec<crate::ytdlp::MediaFormat> = Vec::new();
+    let mut live = false;
     for (source, url, info) in streams
         .into_iter()
         .map(|(url, info)| (FormatSource::Stream, url, info))
@@ -319,6 +381,9 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
                 .map(|(url, info)| (FormatSource::File, url, info)),
         )
     {
+        // Only a playlist can be live. A file has already finished being
+        // whatever it is, however little ffprobe could measure about it.
+        live = live || (source == FormatSource::Stream && info.is_live());
         // A file is downloaded as it is, so it keeps its own extension; only a
         // recording gets to choose a container.
         let ext = match source {
@@ -383,6 +448,121 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     crate::ytdlp::MediaProbe {
         title: request.filename.clone(),
         duration: None,
+        live,
         formats: rows,
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use crate::ytdlp::FormatSource;
+
+    #[test]
+    fn a_playlist_is_recorded_and_a_file_is_downloaded() {
+        // Only ffmpeg can follow a playlist, and only it speaks these
+        // schemes; everything else is a file the downloader fetches in
+        // sixteen pieces and can resume, which is several times quicker.
+        assert!(is_playlist("https://c.example/master.m3u8"));
+        assert!(is_playlist("https://c.example/stream.mpd?token=abc"));
+        assert!(is_playlist("rtmp://live.example/app/key"));
+        assert!(is_playlist("rtsp://camera.local/stream1"));
+        assert!(is_playlist("srt://live.example:9000"));
+
+        assert!(!is_playlist("https://c.example/video.mp4"));
+        assert!(!is_playlist("https://c.example/video.mp4?sig=xyz"));
+        // No extension at all is a file until something says otherwise: a
+        // signed CDN URL ending in a token is the common shape, and ffprobe
+        // is what settles it.
+        assert!(!is_playlist("https://c.example/media/9f8a7b6c"));
+    }
+
+    /// The whole point of the fallback, end to end.
+    ///
+    /// yt-dlp reports no codecs at all for a bare media URL -- checked
+    /// against 2026.08.19 -- so a page that is simply an `.mp4` produces an
+    /// empty listing and, before this, an error message. Opening the address
+    /// answers the question properly, and the reader gets a row to click.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_yt_dlp_cannot_read_is_still_offered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("snatch-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let clip = dir.join("clip.mp4");
+        let built = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&clip)
+            .output()
+            .await;
+        match built {
+            Ok(output) if output.status.success() => {}
+            _ => {
+                eprintln!("skipping: ffmpeg is not available");
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+        }
+
+        let body = std::fs::read(&clip).expect("read the clip");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    let _ = socket.read(&mut scratch).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n\
+                         Content-Length: {}\r\nAccept-Ranges: bytes\r\n\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        // Nothing observed: no manifests, no files. Exactly what arrives from
+        // a page whose video was already in the browser's cache.
+        let request = DownloadRequest::from_url(format!("http://127.0.0.1:{port}/clip.mp4"));
+        assert!(request.streams.is_empty() && request.files.is_empty());
+
+        let probe = stream_listing(&request).await;
+        assert_eq!(probe.formats.len(), 1, "{:?}", probe.formats);
+        let row = &probe.formats[0];
+        // Fetched by the downloader, not recorded: it is a finished file.
+        assert_eq!(row.source, FormatSource::File);
+        assert_eq!(row.height, Some(240));
+        assert_eq!(row.ext, "mp4");
+        assert!(row.size.is_some(), "a file knows how big it is");
+        assert!(!probe.live);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,5 +1,7 @@
 //! Types shared between the IPC layer, the aria2 client and the UI.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,43 @@ use crate::torrent::TorrentSnapshot;
 /// Schemes we are willing to hand to aria2. Anything else (`file:`, `data:`,
 /// `javascript:` …) is rejected: this payload arrives from a web page.
 const ALLOWED_SCHEMES: [&str; 4] = ["http", "https", "ftp", "ftps"];
+
+/// Headers that describe the connection rather than the request, and are the
+/// business of whoever opens it. Forwarding a `Host` from the page points the
+/// request at the wrong server; forwarding a stale `Content-Length` or
+/// `Range` truncates the answer. `Accept-Encoding` is here because a
+/// subprocess that did not ask for a compressed body cannot decode one.
+/// ...plus the three that have fields of their own on the request. Sending
+/// one twice is how a request ends up with two Referers and is refused by a
+/// server that reads the second one.
+const FORBIDDEN_HEADERS: [&str; 15] = [
+    "referer",
+    "cookie",
+    "user-agent",
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "accept-encoding",
+    "range",
+];
+
+/// Enough for any real header, and small enough that a page cannot use one as
+/// a place to put a megabyte.
+const MAX_HEADER_BYTES: usize = 4096;
+/// More than any player sends. Past this the page is padding the list.
+const MAX_HEADERS: usize = 24;
+
+/// The characters RFC 9110 allows in a header name, and no others.
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
 
 /// What the browser (or a socket client) is asking Snatch to do.
 ///
@@ -81,6 +120,17 @@ pub struct DownloadRequest {
     pub referer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// Every other request header the browser watched this page's player send.
+    ///
+    /// Referer, cookies and the user agent have fields of their own above
+    /// because every engine takes them as a named option. This carries the
+    /// rest, and it is what makes the awkward sites work: a CDN that checks
+    /// `Origin`, a player that signs each request with an `Authorization`
+    /// header, a site that puts a session token in one of its own `X-`
+    /// headers. Copied from the real request rather than invented, so what
+    /// ffmpeg or yt-dlp sends is what the player sent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// HTTP Basic or FTP username for a link that asks for one.
     ///
     /// Deliberately never persisted: it lives on the request only long enough
@@ -223,6 +273,7 @@ impl DownloadRequest {
             cookies: None,
             referer: None,
             user_agent: None,
+            headers: BTreeMap::new(),
             username: None,
             password: None,
             checksum: None,
@@ -237,6 +288,37 @@ impl DownloadRequest {
             files: Vec::new(),
             mirrors: Vec::new(),
         }
+    }
+
+    /// The extra headers, checked and ready to hand to a subprocess.
+    ///
+    /// Everything here came from a web page, so nothing is trusted: a name or
+    /// value carrying a line break would let the page append headers of its
+    /// own to the request Snatch makes, and the connection headers belong to
+    /// whoever is making the connection, not to the page that suggested them.
+    pub fn extra_headers(&self) -> Vec<(String, String)> {
+        self.headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.trim();
+                let value = value.trim();
+                if name.is_empty() || value.is_empty() {
+                    return None;
+                }
+                if !name.bytes().all(is_header_name_byte) {
+                    return None;
+                }
+                if value.len() > MAX_HEADER_BYTES || value.bytes().any(|byte| byte < 0x20) {
+                    return None;
+                }
+                let lowered = name.to_ascii_lowercase();
+                if FORBIDDEN_HEADERS.contains(&lowered.as_str()) {
+                    return None;
+                }
+                Some((name.to_owned(), value.to_owned()))
+            })
+            .take(MAX_HEADERS)
+            .collect()
     }
 
     /// Reject anything the chosen engine should never be asked to fetch.
@@ -415,6 +497,10 @@ pub struct IpcResponse {
     /// Its length in seconds, so the picker can show which video it read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<u64>,
+    /// Whether the page is happening now, so the browser can offer the
+    /// length and start-time fields beside the qualities.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
     /// What the page offers, best first. Empty for every other kind, and
     /// omitted from the wire entirely so an ordinary hand-off is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -429,6 +515,7 @@ impl IpcResponse {
             error: None,
             title: None,
             duration: None,
+            live: false,
             formats: Vec::new(),
         }
     }
@@ -440,6 +527,7 @@ impl IpcResponse {
             error: Some(error),
             title: None,
             duration: None,
+            live: false,
             formats: Vec::new(),
         }
     }
@@ -452,6 +540,7 @@ impl IpcResponse {
             error: None,
             title: probe.title,
             duration: probe.duration,
+            live: probe.live,
             formats: probe.formats,
         }
     }
@@ -625,5 +714,88 @@ mod mirror_tests {
                 "https://c.example/f.iso",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    fn with(headers: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut request = DownloadRequest::from_url("https://example.com/v.m3u8");
+        request.headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        request.extra_headers()
+    }
+
+    #[test]
+    fn the_headers_a_player_sends_are_kept() {
+        let kept = with(&[
+            ("Origin", "https://watch.example"),
+            ("X-Playback-Token", "abc123"),
+            ("Authorization", "Bearer xyz"),
+        ]);
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert!(kept.contains(&("Origin".to_owned(), "https://watch.example".to_owned())));
+    }
+
+    #[test]
+    fn a_header_can_never_carry_a_line_break() {
+        // These arrive from a web page. A line break in one would let the page
+        // append headers of its own to the request Snatch makes.
+        assert!(with(&[("X-Evil", "a\r\nX-Injected: 1")]).is_empty());
+        assert!(with(&[("X-Evil", "a\nb")]).is_empty());
+        assert!(with(&[("X-Evil\r\nX-Other", "1")]).is_empty());
+        // A space is not a header name character either.
+        assert!(with(&[("X Evil", "1")]).is_empty());
+    }
+
+    #[test]
+    fn the_connection_headers_belong_to_whoever_opens_the_connection() {
+        // `Host` would point the request at a different server; a stale
+        // `Content-Length` or `Range` would truncate the answer; and nothing
+        // can decode a body compressed because the page asked for it.
+        assert!(
+            with(&[
+                ("Host", "evil.example"),
+                ("Content-Length", "0"),
+                ("Range", "bytes=0-1"),
+                ("Accept-Encoding", "br"),
+                ("Connection", "close"),
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_three_with_fields_of_their_own_never_ride_along_as_well() {
+        // Referer, cookies and the user agent reach every engine through a
+        // named option. Letting a page put them here too would give the
+        // request two of each, and a server that reads the second one refuses
+        // it -- which looks exactly like the failure this all exists to fix.
+        assert!(
+            with(&[
+                ("Referer", "https://evil.example"),
+                ("Cookie", "session=stolen"),
+                ("User-Agent", "not-a-browser"),
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_page_cannot_pad_the_list_or_the_values() {
+        let many: Vec<(String, String)> = (0..200)
+            .map(|n| (format!("X-N{n}"), "1".to_owned()))
+            .collect();
+        let mut request = DownloadRequest::from_url("https://example.com/v.m3u8");
+        request.headers = many.into_iter().collect();
+        assert_eq!(request.extra_headers().len(), MAX_HEADERS);
+
+        assert!(with(&[("X-Big", &"a".repeat(MAX_HEADER_BYTES + 1))]).is_empty());
+        // Empty on either side says nothing and is dropped.
+        assert!(with(&[("X-Empty", "  ")]).is_empty());
     }
 }

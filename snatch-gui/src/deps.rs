@@ -35,10 +35,26 @@ pub enum Tool {
     Ffmpeg,
     YtDlp,
     GalleryDl,
+    /// A JavaScript engine for yt-dlp to run a site's own player code in.
+    ///
+    /// Not something Snatch calls. yt-dlp looks for it, and since 2025 says
+    /// so plainly: "YouTube extraction without a JS runtime has been
+    /// deprecated, and some formats may be missing". What that looks like
+    /// from the outside is a video that offers only low qualities, or a
+    /// download that fails on a site which plays perfectly in the browser --
+    /// with nothing on screen to connect the two. Listing it here is the
+    /// connection.
+    Deno,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 4] = [Tool::Aria2, Tool::Ffmpeg, Tool::YtDlp, Tool::GalleryDl];
+    pub const ALL: [Tool; 5] = [
+        Tool::Aria2,
+        Tool::Ffmpeg,
+        Tool::YtDlp,
+        Tool::GalleryDl,
+        Tool::Deno,
+    ];
 
     pub fn binary(self) -> &'static str {
         match self {
@@ -46,6 +62,7 @@ impl Tool {
             Tool::Ffmpeg => "ffmpeg",
             Tool::YtDlp => "yt-dlp",
             Tool::GalleryDl => "gallery-dl",
+            Tool::Deno => "deno",
         }
     }
 
@@ -55,6 +72,7 @@ impl Tool {
             Tool::Ffmpeg => "FFmpeg",
             Tool::YtDlp => "yt-dlp",
             Tool::GalleryDl => "gallery-dl",
+            Tool::Deno => "Deno",
         }
     }
 
@@ -65,6 +83,7 @@ impl Tool {
             Tool::Ffmpeg => "converting, trimming and extracting audio",
             Tool::YtDlp => "site video extraction",
             Tool::GalleryDl => "gallery scraping",
+            Tool::Deno => "YouTube and the other sites that need JavaScript run",
         }
     }
 
@@ -85,6 +104,7 @@ impl Tool {
             (Tool::Ffmpeg, _) => "ffmpeg",
             (Tool::YtDlp, _) => "yt-dlp",
             (Tool::GalleryDl, _) => "gallery-dl",
+            (Tool::Deno, _) => "deno",
         }
     }
 
@@ -92,7 +112,7 @@ impl Tool {
         match self {
             // aria2c and ffmpeg print a banner; the others print a bare version.
             Tool::Aria2 | Tool::Ffmpeg => &["--version"],
-            Tool::YtDlp | Tool::GalleryDl => &["--version"],
+            Tool::YtDlp | Tool::GalleryDl | Tool::Deno => &["--version"],
         }
     }
 }
@@ -155,6 +175,13 @@ impl ToolStatus {
 
     /// The command a user must run themselves, when root is required.
     pub fn manual_command(&self, distro: Distro) -> Option<String> {
+        // Deno is not in most distributions' repositories, so the ordinary
+        // "install this package" line would fail with "no match" on Fedora
+        // and Debian both. Upstream's own installer works everywhere and
+        // wants no root, so it is offered instead of a command that does not.
+        if self.tool == Tool::Deno {
+            return Some("curl -fsSL https://deno.land/install.sh | sh".to_owned());
+        }
         let prefix = distro.install_prefix()?;
         // Fedora keeps ffmpeg in RPM Fusion, so the bare command would fail
         // with a confusing "no match" rather than an actionable error.
@@ -229,6 +256,8 @@ async fn probe_version(path: &Path, tool: Tool) -> Option<String> {
             .trim_end_matches(',')
             .to_owned(),
         Tool::YtDlp | Tool::GalleryDl => first.to_owned(),
+        // "deno 2.5.3"
+        Tool::Deno => first.split_whitespace().nth(1).unwrap_or(first).to_owned(),
     })
 }
 

@@ -127,6 +127,10 @@ pub struct Headers {
     pub referer: Option<String>,
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
+    /// Everything else the page's player sent: `Origin`, an `Authorization`
+    /// token, a site's own `X-` header. Already checked by
+    /// [`crate::types::DownloadRequest::extra_headers`] before it gets here.
+    pub extra: Vec<(String, String)>,
 }
 
 impl Headers {
@@ -138,6 +142,17 @@ impl Headers {
         }
         if let Some(cookies) = clean(self.cookies.as_deref()) {
             lines.push_str(&format!("Cookie: {cookies}\r\n"));
+        }
+        // Named above, so a site that sent both does not get it twice.
+        for (name, value) in &self.extra {
+            let lowered = name.to_ascii_lowercase();
+            if matches!(lowered.as_str(), "referer" | "cookie" | "user-agent") {
+                continue;
+            }
+            let (Some(name), Some(value)) = (clean(Some(name)), clean(Some(value))) else {
+                continue;
+            };
+            lines.push_str(&format!("{name}: {value}\r\n"));
         }
         if lines.is_empty() { None } else { Some(lines) }
     }
@@ -198,6 +213,7 @@ impl Recording {
                 referer: request.referer.clone(),
                 user_agent: request.user_agent.clone(),
                 cookies: request.cookies.clone(),
+                extra: request.extra_headers(),
             },
             height: request.height,
             start_at: request.start_at,
@@ -1501,6 +1517,7 @@ mod tests {
             referer: Some("https://example.com/watch".to_owned()),
             cookies: Some("session=abc".to_owned()),
             user_agent: Some("Mozilla/5.0".to_owned()),
+            extra: Vec::new(),
         };
         assert_eq!(
             headers.as_field().as_deref(),
@@ -1518,6 +1535,7 @@ mod tests {
             referer: Some("https://x/\r\nX-Evil: 1".to_owned()),
             cookies: Some("a=b\nc=d".to_owned()),
             user_agent: None,
+            extra: Vec::new(),
         };
         assert_eq!(headers.as_field(), None);
 
@@ -1632,6 +1650,7 @@ mod tests {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use tokio::net::TcpListener;
@@ -1659,7 +1678,20 @@ mod stop_tests {
         serve(path, Duration::ZERO).await
     }
 
+    /// A server that refuses anyone who does not send `guard`.
+    ///
+    /// This is what a CDN behind a signed player does, and it is the reason
+    /// downloads fail on sites that play perfectly in the tab: the request
+    /// the browser made carried a header, and the one Snatch made did not.
+    async fn serve_guarded(path: PathBuf, guard: &'static str) -> u16 {
+        serve_with(path, Duration::ZERO, Some(guard)).await
+    }
+
     async fn serve(path: PathBuf, pace: Duration) -> u16 {
+        serve_with(path, pace, None).await
+    }
+
+    async fn serve_with(path: PathBuf, pace: Duration, guard: Option<&'static str>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
@@ -1675,6 +1707,17 @@ mod stop_tests {
                         .await
                         .unwrap_or(0);
                     let request = String::from_utf8_lossy(&scratch[..read]).into_owned();
+
+                    if let Some(guard) = guard
+                        && !request
+                            .to_ascii_lowercase()
+                            .contains(&guard.to_ascii_lowercase())
+                    {
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
 
                     // Ranges are supported because real servers support them,
                     // and because seeking is what resuming a recording does.
@@ -1761,6 +1804,61 @@ mod stop_tests {
             .expect("ffmpeg runs");
         assert!(built.status.success(), "could not build the test clip");
         source
+    }
+
+    /// The one that decides whether a site works at all.
+    ///
+    /// A CDN that checks a header refuses everything without it. The browser
+    /// watched the player send that header, so ffmpeg has to send it too --
+    /// and this proves the value travels all the way from a request to the
+    /// process, rather than only being formatted correctly on the way past.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_header_the_site_insists_on_reaches_ffmpeg() {
+        if which("ffmpeg").is_none() || which("ffprobe").is_none() {
+            eprintln!("skipping: ffmpeg/ffprobe not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("snatch-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = build_clip(&dir, 2).await;
+        let port = serve_guarded(source, "x-playback-token: let-me-in").await;
+        let url = format!("http://127.0.0.1:{port}/clip.mp4");
+
+        // Without it, the server answers 403 and there is nothing to record.
+        let bare = Headers::default();
+        assert!(
+            probe(&url, &bare).await.is_err(),
+            "a server that refuses the request must not look readable"
+        );
+
+        // The same address, with what the player sent.
+        let request = crate::types::DownloadRequest {
+            headers: BTreeMap::from([("X-Playback-Token".to_owned(), "let-me-in".to_owned())]),
+            ..crate::types::DownloadRequest::from_url(url.clone())
+        };
+        let job = Recording::from_request(&request, dir.clone());
+        assert!(
+            job.headers
+                .as_field()
+                .is_some_and(|field| field.contains("X-Playback-Token: let-me-in")),
+            "the header must survive the trip onto the recording"
+        );
+
+        let info = probe(&url, &job.headers)
+            .await
+            .expect("the guarded server lets us in");
+        assert!(info.has_video(), "and hands over the clip itself");
+
+        let (events, mut seen) = mpsc::channel(64);
+        tokio::spawn(async move { while seen.recv().await.is_some() {} });
+        let (_control, stop) = mpsc::channel(4);
+        let proxies = ProxyManager::load(dir.join("proxies.json"));
+        let output = record(1, &job, &proxies, stop, &events)
+            .await
+            .expect("the recording runs");
+        assert!(output.exists(), "and writes a file");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Six seconds asked for, starting five in, must give six seconds -- not

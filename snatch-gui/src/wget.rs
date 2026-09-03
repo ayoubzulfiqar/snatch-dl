@@ -401,6 +401,12 @@ impl WgetEngine {
                 .arg("--header")
                 .arg(format!("Cookie: {}", sanitise_header(cookies)));
         }
+        // Everything else the page's player sent, for a site that checks.
+        for (name, value) in request.extra_headers() {
+            command
+                .arg("--header")
+                .arg(format!("{name}: {}", sanitise_header(&value)));
+        }
         if let Some(proxy) = &proxy {
             // wget reads proxies from the environment.
             command.env("http_proxy", proxy.url());

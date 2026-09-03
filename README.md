@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 3.6.10</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 3.7.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_3.6.10-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-3.6.10-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-3.6.10-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_3.7.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-3.7.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-3.7.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -88,8 +88,15 @@ Everything else is optional. Each one adds a feature:
 | `gallery-dl` | Downloading image galleries |
 | `wget2` | Grabbing a whole site |
 | `7z` | Unpacking archives |
+| `deno` | The best sizes on YouTube and other sites that need it |
 
 Torrents need nothing extra. That part is built in.
+
+**About `deno`.** Some sites, YouTube among them, hide their video behind
+JavaScript that has to be run to get at it. `yt-dlp` needs a JavaScript engine
+for that, and `deno` is the one it looks for. Without it you may see only the
+smaller sizes, or a download that fails on a video that plays fine in your
+browser. Snatch shows the one command to install it.
 
 Missed some? Open **Menu → Dependencies…**. It shows every tool and what it
 does. It installs `yt-dlp` and `gallery-dl` for you. For the rest it shows the
@@ -148,7 +155,8 @@ row too, if you just want the sound.
 **Live streams work too.** So do sites Snatch has never heard of. If it cannot
 name the sizes, it looks at what the player is loading and offers that instead.
 
-- A **live stream** is recorded while you watch.
+- A **live stream** is recorded while you watch. You can stop it at any point
+  and keep what you have.
 - A **plain video file** is downloaded the fast way, in 16 pieces, with resume.
 
 Snatch tells them apart and picks the right one for you.
@@ -166,8 +174,22 @@ list:
 
 Leave them blank to start now and run until you press stop.
 
-If the button says it found nothing, press play first and click it again.
-Snatch can only see a stream once the player asks for it.
+**On a site with lots of videos**, like a social feed, the button asks about
+the one you are pointing at. It finds that post's own page and uses it, and it
+only offers what that video loaded. Videos further down the page are not
+mixed in.
+
+**Signed in?** The button takes your login with it. Snatch copies the same
+headers your browser sent — the referer, the cookies, and any token the site's
+player uses — so a video that only plays while you are signed in downloads too.
+
+**If yt-dlp cannot read the site**, Snatch does not stop there. It looks at
+what the player loaded and offers that. If there is nothing to look at, it
+opens the address itself and sees what is there. You get a row to click, not
+an error.
+
+If the button still says it found nothing, press play first and click it
+again. Snatch can only see a stream once the player asks for it.
 
 **Some videos are locked.** Big paid services lock their video with DRM. The
 key stays inside your browser and never comes out. Snatch says so when it sees

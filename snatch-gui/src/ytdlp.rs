@@ -45,6 +45,57 @@ const PROGRESS_TEMPLATE: &str = concat!(
     "|%(progress.fragment_index)s|%(progress.fragment_count)s"
 );
 
+/// Make yt-dlp send the request the page's player sent.
+///
+/// Without this, yt-dlp arrives at a signed CDN, a members-only video or a
+/// site that checks `Origin` as a stranger, and is refused. The browser
+/// watched the real request go out, so these are copied rather than guessed.
+///
+/// Cookies go through `--add-header` rather than a file on purpose: yt-dlp
+/// scopes a header cookie to the domain of the URL being fetched, which is
+/// the same rule a cookie file would give it, and nothing has to write the
+/// user's session to disk to say so.
+fn apply_headers(command: &mut Command, headers: &crate::stream::Headers) {
+    if let Some(referer) = clean_header(headers.referer.as_deref()) {
+        command.arg("--referer").arg(referer);
+    }
+    if let Some(agent) = clean_header(headers.user_agent.as_deref()) {
+        command.arg("--user-agent").arg(agent);
+    }
+    if let Some(cookies) = clean_header(headers.cookies.as_deref()) {
+        command.arg("--add-header").arg(format!("Cookie:{cookies}"));
+    }
+    for (name, value) in &headers.extra {
+        // Named above; sending them twice is how a request ends up with two
+        // Referers and gets refused by a server that reads the second one.
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "referer" | "cookie" | "user-agent"
+        ) {
+            continue;
+        }
+        let (Some(name), Some(value)) = (clean_header(Some(name)), clean_header(Some(value)))
+        else {
+            continue;
+        };
+        command.arg("--add-header").arg(format!("{name}:{value}"));
+    }
+}
+
+/// A header value safe to put in an argument. These arrive from a web page.
+fn clean_header(value: Option<&str>) -> Option<&str> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty())?;
+    if value.contains(['\r', '\n', '\0']) || value.len() > 4096 {
+        return None;
+    }
+    // A value beginning with a dash would be read as the next flag rather than
+    // as this one's argument.
+    if value.starts_with('-') {
+        return None;
+    }
+    Some(value)
+}
+
 fn yt_dlp_binary() -> String {
     std::env::var("SNATCH_YT_DLP")
         .ok()
@@ -109,6 +160,16 @@ pub struct VideoConfig {
     pub subtitles: bool,
     /// Download a whole playlist rather than just the linked item.
     pub playlist: bool,
+    /// The request the page's player made, for a site that checks.
+    pub headers: crate::stream::Headers,
+    /// Addresses to record if yt-dlp cannot do it.
+    ///
+    /// yt-dlp knows a few thousand sites and the web has rather more, and
+    /// even a site it knows can change under it between releases. What it
+    /// never has to know is how to read an HLS playlist or fetch an `.mp4`,
+    /// and the browser watched the page load one of those. So a failure ends
+    /// with the file arriving rather than with a message about extraction.
+    pub fallbacks: Vec<String>,
 }
 
 impl VideoConfig {
@@ -120,6 +181,8 @@ impl VideoConfig {
             embed_metadata: true,
             subtitles: false,
             playlist: false,
+            headers: crate::stream::Headers::default(),
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -397,7 +460,7 @@ impl VideoEngine {
         let engine = Arc::clone(self);
         let task = tokio::spawn(async move {
             let outcome = engine
-                .run(job_id, &url, &config, proxies.as_ref(), &events)
+                .extract(job_id, &url, &config, proxies.as_ref(), &events)
                 .await;
 
             let (state, error) = match outcome {
@@ -507,6 +570,56 @@ impl VideoEngine {
         Ok(job_id)
     }
 
+    /// Extract with yt-dlp; if that fails, record what the browser saw.
+    ///
+    /// The order matters. yt-dlp gives the better result whenever it works --
+    /// the real title, the right container, metadata and subtitles -- so it
+    /// goes first every time. The fallback exists for the case where it comes
+    /// back with nothing, and in that case the reader wants their video, not
+    /// an explanation of which tool declined to fetch it.
+    async fn extract(
+        &self,
+        job_id: i64,
+        url: &str,
+        config: &VideoConfig,
+        proxies: &ProxyManager,
+        events: &mpsc::Sender<VideoEvent>,
+    ) -> Result<Option<PathBuf>> {
+        let refused = match self.run(job_id, url, config, proxies, events).await {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
+        };
+        if config.fallbacks.is_empty() {
+            return Err(refused);
+        }
+        log::info!(
+            "video job {job_id}: yt-dlp failed ({refused:#}); recording what the page loaded"
+        );
+
+        for address in &config.fallbacks {
+            let mut recording =
+                crate::stream::Recording::new(address.clone(), config.destination.clone());
+            recording.headers = config.headers.clone();
+            // Nothing sends a control here: this path has no stop button of
+            // its own, and dropping the sender would end the recording at
+            // once. Held for as long as the recording runs instead.
+            let (control, commands) = mpsc::channel(1);
+            let outcome =
+                crate::stream::record(job_id, &recording, proxies, commands, events).await;
+            drop(control);
+            match outcome {
+                Ok(output) => {
+                    log::info!("video job {job_id}: recorded {address} instead");
+                    return Ok(Some(output));
+                }
+                Err(error) => {
+                    log::warn!("video job {job_id}: {address} did not record either: {error:#}");
+                }
+            }
+        }
+        Err(refused)
+    }
+
     async fn run(
         &self,
         job_id: i64,
@@ -570,6 +683,7 @@ impl VideoEngine {
         } else {
             "--no-playlist"
         });
+        apply_headers(&mut command, &config.headers);
 
         let task_key = format!("video:{job_id}");
         if let Some(proxy) = proxies
@@ -791,6 +905,15 @@ pub struct MediaProbe {
     /// Seconds, when the site says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<u64>,
+    /// Whether this is happening now.
+    ///
+    /// A broadcast has no end for yt-dlp to download to, so handing one to it
+    /// produces a job that runs until the broadcast does -- with no progress,
+    /// no size, and no way to keep what has arrived so far. Snatch records a
+    /// live one instead, which can be stopped and saved at any point. The
+    /// browser reads this to offer the length and start-time fields.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live: bool,
     pub formats: Vec<MediaFormat>,
 }
 
@@ -830,6 +953,14 @@ struct RawFormat {
     protocol: Option<String>,
     #[serde(default)]
     has_drm: Option<bool>,
+    /// The address of this exact rendition. For HLS that is a playlist ffmpeg
+    /// can read on its own; for DASH it is a segment template that it cannot.
+    #[serde(default)]
+    url: Option<String>,
+    /// The master playlist or MPD this rendition came out of. The one that
+    /// works for DASH, where the rendition address is not playable by itself.
+    #[serde(default)]
+    manifest_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -838,6 +969,13 @@ struct RawInfo {
     title: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
+    /// Older yt-dlp builds report this; newer ones prefer `live_status`. Both
+    /// are read, because Snatch does not get to choose which one is installed.
+    #[serde(default)]
+    is_live: Option<bool>,
+    /// `is_live`, `was_live`, `post_live`, `not_live`, `is_upcoming`.
+    #[serde(default)]
+    live_status: Option<String>,
     #[serde(default)]
     formats: Vec<RawFormat>,
     /// A direct media URL has no `formats` array: the top level describes the
@@ -846,7 +984,51 @@ struct RawInfo {
     single: RawFormat,
 }
 
+impl RawInfo {
+    /// Whether this page is happening now.
+    ///
+    /// Two signals, because one is not enough. A site yt-dlp has an extractor
+    /// for says so outright in `is_live` or `live_status`. A bare playlist
+    /// handed to the generic extractor says nothing at all: checked against
+    /// yt-dlp 2026.08.19, a live HLS master comes back with all three of
+    /// `is_live`, `live_status` and `duration` null, and a VOD playlist from
+    /// the same extractor comes back with a duration. So a manifest with no
+    /// duration is the second signal, and the one that catches the long tail.
+    ///
+    /// Being wrong here is cheap in one direction only. Calling a VOD live
+    /// records it, which finishes by itself when the playlist ends. Calling a
+    /// broadcast a VOD hands it to yt-dlp, which runs until the broadcast
+    /// does, shows no progress, and leaves nothing behind if it is cancelled.
+    fn is_live(&self, duration: Option<f64>) -> bool {
+        if self.is_live.unwrap_or(false)
+            || matches!(self.live_status.as_deref(), Some("is_live" | "post_live"))
+        {
+            return true;
+        }
+        if matches!(self.live_status.as_deref(), Some("was_live" | "not_live")) {
+            return false;
+        }
+        let formats: &[RawFormat] = if self.formats.is_empty() {
+            std::slice::from_ref(&self.single)
+        } else {
+            &self.formats
+        };
+        duration.is_none()
+            && formats
+                .iter()
+                .filter(|format| format.is_usable())
+                .any(RawFormat::is_manifest)
+    }
+}
+
 impl RawFormat {
+    /// Served as a playlist rather than as one file, so it has an address
+    /// ffmpeg can read and a length that only the playlist knows.
+    fn is_manifest(&self) -> bool {
+        let protocol = self.protocol.as_deref().unwrap_or_default();
+        protocol.contains("m3u8") || protocol.contains("dash")
+    }
+
     fn has_video(&self) -> bool {
         matches!(self.vcodec.as_deref(), Some(codec) if codec != "none")
     }
@@ -868,6 +1050,26 @@ impl RawFormat {
 
     /// Storyboards are contact sheets of thumbnails, listed as formats with a
     /// height. Without this the menu offers to download "27p".
+    /// The address to record this rendition from, when the page is live.
+    ///
+    /// HLS gives each rendition its own playlist, which is exactly what to
+    /// record: it is already the chosen quality. DASH gives a segment
+    /// template that ffmpeg cannot open on its own, so the manifest it came
+    /// from is the answer there, and ffmpeg picks the quality out of it.
+    fn live_address(&self) -> Option<&str> {
+        let protocol = self.protocol.as_deref().unwrap_or_default();
+        let candidates = if protocol.contains("m3u8") {
+            [self.url.as_deref(), self.manifest_url.as_deref()]
+        } else {
+            [self.manifest_url.as_deref(), self.url.as_deref()]
+        };
+        candidates
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|url| crate::stream::validate_url(url).is_ok())
+    }
+
     fn is_storyboard(&self) -> bool {
         self.ext.as_deref() == Some("mhtml")
             || self.protocol.as_deref() == Some("mhtml")
@@ -975,6 +1177,7 @@ fn selector_for(format: &RawFormat, id: &str) -> String {
 /// Turn a full listing into one entry per resolution, best first.
 fn distil(info: &RawInfo) -> MediaProbe {
     let duration = info.duration.filter(|seconds| *seconds > 0.0);
+    let live = info.is_live(duration);
 
     // A direct media URL describes itself at the top level with no `formats`.
     let owned;
@@ -1058,16 +1261,31 @@ fn distil(info: &RawInfo) -> MediaProbe {
                 (video, _) => (video, video_estimated),
             }
         };
+        // A broadcast is recorded, not downloaded. Handing one to yt-dlp
+        // gives a job with no end and no way to keep what has arrived; the
+        // recorder can be stopped at any point and writes a playable file.
+        let recording = live.then(|| format.live_address()).flatten();
         entries.push(MediaFormat {
             id: selector_for(format, id),
             label: video_label(height, format.fps),
-            ext: format.ext.clone().unwrap_or_else(|| "mp4".to_owned()),
-            size,
-            estimated,
+            // A recording chooses its own container, and a live one has to be
+            // Matroska: MP4 writes its index on close, which a recording that
+            // is stopped or interrupted never gets to do.
+            ext: match recording {
+                Some(_) => "mkv".to_owned(),
+                None => format.ext.clone().unwrap_or_else(|| "mp4".to_owned()),
+            },
+            // A live stream has no size: what is offered is however much of it
+            // the user decides to record.
+            size: recording.map_or(size, |_| None),
+            estimated: recording.is_none() && estimated,
             height: Some(height),
             audio_only: false,
-            source: FormatSource::Format,
-            url: None,
+            source: match recording {
+                Some(_) => FormatSource::Stream,
+                None => FormatSource::Format,
+            },
+            url: recording.map(str::to_owned),
         });
     }
 
@@ -1104,6 +1322,7 @@ fn distil(info: &RawInfo) -> MediaProbe {
     }
 
     MediaProbe {
+        live,
         title: info
             .title
             .as_deref()
@@ -1138,7 +1357,11 @@ pub fn validate_format(selector: &str) -> Result<()> {
 }
 
 /// Ask yt-dlp what a page offers, without downloading any of it.
-pub async fn probe(url: &str, proxies: &ProxyManager) -> Result<MediaProbe> {
+pub async fn probe(
+    url: &str,
+    headers: &crate::stream::Headers,
+    proxies: &ProxyManager,
+) -> Result<MediaProbe> {
     let url = url.trim();
     validate_url(url)?;
 
@@ -1151,6 +1374,7 @@ pub async fn probe(url: &str, proxies: &ProxyManager) -> Result<MediaProbe> {
         .arg("--no-warnings")
         .arg("--no-colors")
         .arg("--no-progress");
+    apply_headers(&mut command, headers);
 
     if let Some(proxy) = proxies
         .resolve_for("video-probe", Engine::Subprocess)
@@ -1506,6 +1730,177 @@ mod probe_tests {
         )
         .expect("must parse");
         assert!(distil(&info).formats.is_empty());
+    }
+
+    /// A real live HLS master, captured from yt-dlp 2026.08.19. Every field
+    /// that says "this is live" is null in it -- which is the whole point.
+    const LIVE_HLS: &str = include_str!("testdata/live-hls-formats.json");
+
+    fn live_fixture() -> MediaProbe {
+        let info: RawInfo =
+            serde_json::from_str(LIVE_HLS).expect("the captured live listing must parse");
+        distil(&info)
+    }
+
+    #[test]
+    fn a_broadcast_is_recorded_rather_than_downloaded() {
+        let probe = live_fixture();
+        assert!(probe.live, "a playlist with no duration is live");
+        let row = entry(&probe, "1080p");
+        // Not a yt-dlp selector: handing a broadcast to yt-dlp produces a job
+        // that runs until the broadcast does and keeps nothing if stopped.
+        assert_eq!(row.source, FormatSource::Stream);
+        assert_eq!(
+            row.url.as_deref(),
+            Some(
+                "https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/mastermaster_video10000k.m3u8"
+            ),
+            "HLS gives each quality its own playlist, and that is the one to record"
+        );
+        // MP4 writes its index on close, and a recording that is stopped
+        // never gets to do that.
+        assert_eq!(row.ext, "mkv");
+        // However long the user decides to record it for.
+        assert_eq!(row.size, None);
+    }
+
+    #[test]
+    fn a_finished_video_is_still_downloaded() {
+        let probe = probe_fixture();
+        assert!(!probe.live);
+        assert!(
+            probe
+                .formats
+                .iter()
+                .all(|row| row.source == FormatSource::Format),
+            "nothing on a page with a duration should be routed to the recorder"
+        );
+    }
+
+    #[test]
+    fn dash_is_recorded_from_its_manifest_not_its_segments() {
+        // A DASH rendition's own address is a segment template, which ffmpeg
+        // cannot open; the manifest it came from is the one that works.
+        let info: RawInfo = serde_json::from_str(
+            r#"{"title":"Now","formats":[{"format_id":"v1","ext":"mp4","height":720,
+                 "vcodec":"avc1","acodec":"none","protocol":"http_dash_segments",
+                 "url":"https://c.example/seg/$Number$.m4s",
+                 "manifest_url":"https://c.example/stream.mpd"}]}"#,
+        )
+        .expect("fixture must parse");
+        let probe = distil(&info);
+        assert!(probe.live);
+        assert_eq!(
+            entry(&probe, "720p").url.as_deref(),
+            Some("https://c.example/stream.mpd")
+        );
+    }
+
+    #[test]
+    fn a_site_that_says_it_finished_is_believed_over_a_missing_duration() {
+        // `was_live` is a recording of a broadcast: it has an end, even where
+        // the site never says how long it is.
+        let info: RawInfo = serde_json::from_str(
+            r#"{"title":"Yesterday","live_status":"was_live","formats":[{"format_id":"v1",
+                 "ext":"mp4","height":720,"vcodec":"avc1","acodec":"mp4a",
+                 "protocol":"m3u8_native","url":"https://c.example/v.m3u8"}]}"#,
+        )
+        .expect("fixture must parse");
+        assert!(!distil(&info).live);
+    }
+
+    /// The same journey as the ffmpeg one, through the other engine.
+    ///
+    /// yt-dlp is what handles a site Snatch knows, so the headers have to
+    /// reach it too. A members-only video or a signed CDN refuses the probe
+    /// without them, and what the reader sees is "no qualities found" on a
+    /// page that plays fine in the tab.
+    ///
+    /// What is asserted is what the *server* saw, not what yt-dlp made of the
+    /// answer. The point of the exercise is that the request Snatch makes
+    /// looks like the request the player made; how a particular yt-dlp
+    /// version then describes a test clip is a separate question, and one
+    /// that would make this test fail for the wrong reason later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_header_the_site_insists_on_reaches_yt_dlp() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("snatch-ytdlp-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+
+        let refused = Arc::new(AtomicUsize::new(0));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        {
+            let refused = Arc::clone(&refused);
+            let admitted = Arc::clone(&admitted);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let refused = Arc::clone(&refused);
+                    let admitted = Arc::clone(&admitted);
+                    tokio::spawn(async move {
+                        let mut scratch = [0u8; 8192];
+                        let read = socket.read(&mut scratch).await.unwrap_or(0);
+                        let request =
+                            String::from_utf8_lossy(&scratch[..read]).to_ascii_lowercase();
+                        // Every one of the three: the site's own token, the
+                        // referer a CDN checks, and the browser's user agent.
+                        let allowed = request.contains("x-playback-token: let-me-in")
+                            && request.contains("referer: https://watch.example/live")
+                            && request.contains("user-agent: snatch-test/1.0");
+                        if allowed {
+                            admitted.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\
+                                  Connection: close\r\n\r\n",
+                            )
+                            .await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+        }
+
+        let url = format!("http://127.0.0.1:{port}/clip.mp4");
+        let proxies = ProxyManager::load(dir.join("proxies.json"));
+
+        // Nothing attached: the request goes out bare.
+        let _ = probe(&url, &crate::stream::Headers::default(), &proxies).await;
+        assert!(
+            refused.load(Ordering::SeqCst) > 0,
+            "a bare probe must reach the server without the headers"
+        );
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            0,
+            "and must not somehow satisfy the check"
+        );
+
+        // The same address, with what the page's player sent.
+        let headers = crate::stream::Headers {
+            referer: Some("https://watch.example/live".to_owned()),
+            user_agent: Some("snatch-test/1.0".to_owned()),
+            cookies: None,
+            extra: vec![("X-Playback-Token".to_owned(), "let-me-in".to_owned())],
+        };
+        let _ = probe(&url, &headers, &proxies).await;
+        assert!(
+            admitted.load(Ordering::SeqCst) > 0,
+            "the referer, the user agent and the site's own header must all go out"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

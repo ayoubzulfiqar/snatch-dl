@@ -185,11 +185,7 @@ impl DownloadsPage {
         // seeding lives on the Torrents page.
         self.graph.push(summary.speed, 0);
 
-        self.stack.set_visible_child_name(if downloads.is_empty() {
-            PAGE_EMPTY
-        } else {
-            PAGE_LIST
-        });
+        self.refresh_page();
         *self.summary.borrow_mut() = summary;
         summary
     }
@@ -254,7 +250,8 @@ impl DownloadsPage {
                     row
                 });
                 row.set_label(label);
-                self.jobs_frame.set_visible(true);
+                drop(jobs);
+                self.refresh_page();
             }
             MediaEvent::Progress { job_id, progress } => {
                 if let Some(row) = self.jobs.borrow().get(&job_id) {
@@ -276,16 +273,7 @@ impl DownloadsPage {
                 ui.toast(&format!("Conversion failed: {error}"));
             }
         }
-        self.stack
-            .set_visible_child_name(if self.rows.borrow().is_empty() {
-                if self.jobs.borrow().is_empty() {
-                    PAGE_EMPTY
-                } else {
-                    PAGE_LIST
-                }
-            } else {
-                PAGE_LIST
-            });
+        self.refresh_page();
     }
 
     /// Reflect one extraction in the task list.
@@ -306,7 +294,8 @@ impl DownloadsPage {
                     row
                 });
                 row.set_subtitle(name);
-                self.jobs_frame.set_visible(true);
+                drop(jobs);
+                self.refresh_page();
             }
             ArchiveEvent::Progress { job_id, percent } => {
                 if let Some(row) = self.archive_jobs.borrow().get(job_id) {
@@ -319,9 +308,7 @@ impl DownloadsPage {
                 if let Some(row) = self.archive_jobs.borrow_mut().remove(job_id) {
                     self.jobs_list.remove(&row.root);
                 }
-                if self.jobs.borrow().is_empty() && self.archive_jobs.borrow().is_empty() {
-                    self.jobs_frame.set_visible(false);
-                }
+                self.refresh_page();
             }
         }
     }
@@ -339,7 +326,8 @@ impl DownloadsPage {
                     row
                 });
                 row.set_subtitle(host);
-                self.jobs_frame.set_visible(true);
+                drop(jobs);
+                self.refresh_page();
             }
             MirrorEvent::Progress {
                 job_id,
@@ -358,12 +346,7 @@ impl DownloadsPage {
                 if let Some(row) = self.mirror_jobs.borrow_mut().remove(job_id) {
                     self.jobs_list.remove(&row.root);
                 }
-                if self.jobs.borrow().is_empty()
-                    && self.archive_jobs.borrow().is_empty()
-                    && self.mirror_jobs.borrow().is_empty()
-                {
-                    self.jobs_frame.set_visible(false);
-                }
+                self.refresh_page();
             }
         }
     }
@@ -393,8 +376,8 @@ impl DownloadsPage {
                     row
                 });
                 row.set_subtitle(&url);
-                self.jobs_frame.set_visible(true);
-                self.stack.set_visible_child_name(PAGE_LIST);
+                drop(jobs);
+                self.refresh_page();
             }
             VideoEvent::Title { job_id, title } => {
                 if let Some(row) = self.jobs.borrow().get(&job_id) {
@@ -463,8 +446,8 @@ impl DownloadsPage {
                 row.set_label(&format!("Downloading {name}"));
                 // Show the size before the first byte lands.
                 row.update_bytes(0, total, 0);
-                self.jobs_frame.set_visible(true);
-                self.stack.set_visible_child_name(PAGE_LIST);
+                drop(jobs);
+                self.refresh_page();
             }
             WgetEvent::Progress {
                 job_id,
@@ -492,12 +475,38 @@ impl DownloadsPage {
         }
     }
 
+    /// How many task rows the list is holding, across every engine that
+    /// shares it: conversions and video jobs, unpacking, and site grabs.
+    fn task_count(&self) -> usize {
+        self.jobs.borrow().len()
+            + self.archive_jobs.borrow().len()
+            + self.mirror_jobs.borrow().len()
+    }
+
+    /// Show the empty page only when there is genuinely nothing here.
+    ///
+    /// The page holds two lists: aria2's downloads and a task list shared by
+    /// every other engine. Deciding on the downloads alone hid the task list
+    /// the moment aria2 had nothing -- which is most of the time, because a
+    /// recording, an extraction or a conversion is not an aria2 download. The
+    /// row was appended, the job ran, and the next poll swapped the page out
+    /// from under it, so what the user saw was nothing at all.
+    fn refresh_page(&self) {
+        let tasks = self.task_count();
+        self.jobs_frame.set_visible(tasks > 0);
+        self.stack
+            .set_visible_child_name(if self.rows.borrow().is_empty() && tasks == 0 {
+                PAGE_EMPTY
+            } else {
+                PAGE_LIST
+            });
+    }
+
     fn drop_job(&self, job_id: i64) {
-        let mut jobs = self.jobs.borrow_mut();
-        if let Some(row) = jobs.remove(&job_id) {
+        if let Some(row) = self.jobs.borrow_mut().remove(&job_id) {
             self.jobs_list.remove(&row.root);
         }
-        self.jobs_frame.set_visible(!jobs.is_empty());
+        self.refresh_page();
     }
 }
 

@@ -235,9 +235,21 @@ impl Aria2Client {
             ),
         );
 
-        // Cookies ride as a real header so aria2 does not need a cookie jar.
+        // Cookies ride as a real header so aria2 does not need a cookie jar,
+        // and the rest of what the page's player sent rides beside them. A
+        // link behind a login or a signed CDN is refused without both.
+        let mut headers: Vec<String> = Vec::new();
         if let Some(cookies) = clean_header_value(request.cookies.as_deref()) {
-            options.insert("header".to_owned(), json!([format!("Cookie: {cookies}")]));
+            headers.push(format!("Cookie: {cookies}"));
+        }
+        for (name, value) in request.extra_headers() {
+            let Some(value) = clean_header_value(Some(&value)) else {
+                continue;
+            };
+            headers.push(format!("{name}: {value}"));
+        }
+        if !headers.is_empty() {
+            options.insert("header".to_owned(), json!(headers));
         }
 
         // Credentials go through the RPC options rather than aria2's command

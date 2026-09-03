@@ -100,10 +100,67 @@ const FRAGMENT_EXTENSIONS = new Set(["m4s", "cmfv", "cmfa", "fmp4"]);
 const SEGMENT_OR_WHOLE = new Set(["ts", "mts", "m2ts"]);
 const WHOLE_FILE_BYTES = 20 * 1024 * 1024;
 
+/**
+ * Request headers worth copying onto Snatch's own request.
+ *
+ * Not a guess at what a site wants: these are read off the request the page's
+ * player actually made, and handed to ffmpeg or yt-dlp so it makes the same
+ * one. `Origin` and `Referer` are what a CDN checks to see the request came
+ * from the site; `Authorization` and the `X-` headers are where players put
+ * their session tokens. Without them a manifest that plays perfectly in the
+ * tab comes back 403 to everything else, which is the single most common
+ * reason a download fails on a site that works.
+ *
+ * Everything else is left out on purpose. `Accept-Encoding` would promise a
+ * compression the recorder never asked for, `Host` and `Content-Length`
+ * belong to whoever opens the connection, and the rest carry no access.
+ */
+const COPIED_HEADERS = new Set([
+  "origin",
+  "referer",
+  "authorization",
+  "user-agent",
+  "cookie",
+  "x-requested-with",
+  "x-forwarded-for",
+  "x-csrf-token",
+  "x-api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-playback-session-id"
+]);
+
+/** Any of the site's own headers, which is where the awkward ones live. */
+const COPIED_PREFIX = /^x-/i;
+
+/** The headers observed per media URL. Bounded like `hints`, and for the same reason. */
+const mediaHeaders = new Map();
+const HEADER_URL_LIMIT = 128;
+
+/**
+ * The same, kept per origin as well.
+ *
+ * A manifest is not always recognisable from its address -- a signed CDN URL
+ * ending in a token is a common shape -- so the exact one being asked about
+ * may never have had its headers recorded under its own name. Every media
+ * request to one host carries the same access headers, though, so the host's
+ * are the right answer for any address on it.
+ */
+const originHeaders = new Map();
+const HEADER_ORIGIN_LIMIT = 32;
+
 /** Most manifests worth remembering for one tab. */
 const STREAM_LIMIT = 24;
 const FILE_LIMIT = 8;
 const STREAM_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * How far before a video started playing to still count a request as its own.
+ *
+ * A player fetches its manifest a moment before the element reports that it
+ * is loading, so the window has to open slightly earlier than the event.
+ */
+const PLAYBACK_GRACE_MS = 15000;
 
 const WEB_REQUEST_FILTER = { urls: ["http://*/*", "https://*/*"] };
 const WEB_REQUEST_TYPES = [
@@ -344,6 +401,81 @@ function isManifestUrl(url) {
   }
 }
 
+/**
+ * Keep the headers one media request carried.
+ *
+ * Recorded against the URL rather than the tab: a page can be playing two
+ * things at once, and the token that opens one of them is no use for the
+ * other.
+ */
+function rememberHeaders(url, requestHeaders) {
+  if (!url || !Array.isArray(requestHeaders)) {
+    return;
+  }
+  const kept = {};
+  let any = false;
+  for (const header of requestHeaders) {
+    const name = String(header.name || "").toLowerCase();
+    if (!COPIED_HEADERS.has(name) && !COPIED_PREFIX.test(name)) {
+      continue;
+    }
+    const value = header.value;
+    if (typeof value !== "string" || value === "" || value.length > 4096) {
+      continue;
+    }
+    kept[name] = value;
+    any = true;
+  }
+  if (!any) {
+    return;
+  }
+  store(mediaHeaders, url, kept, HEADER_URL_LIMIT);
+  const origin = originOf(url);
+  if (origin) {
+    store(originHeaders, origin, kept, HEADER_ORIGIN_LIMIT);
+  }
+}
+
+/** Insert at the end and prune the front, so the map is oldest-first. */
+function store(map, key, value, limit) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) {
+    map.delete(map.keys().next().value);
+  }
+}
+
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch (error) {
+    return "";
+  }
+}
+
+/**
+ * The headers to send with these addresses, merged newest-wins.
+ *
+ * Merged rather than picked one at a time because the whole set goes on one
+ * request: Snatch asks for the master playlist, and ffmpeg follows it to the
+ * renditions and segments itself, all with the headers it was given.
+ */
+function headersFor(urls) {
+  const merged = {};
+  for (const url of urls) {
+    // This exact address if it was seen, and otherwise whatever else on the
+    // same host was: the access headers are the host's, not the file's.
+    const seen = mediaHeaders.get(url) ?? originHeaders.get(originOf(url));
+    if (!seen) {
+      continue;
+    }
+    for (const [name, value] of Object.entries(seen)) {
+      merged[name] = value;
+    }
+  }
+  return merged;
+}
+
 function remember(store, tabId, url, limit) {
   if (typeof tabId !== "number" || tabId < 0 || !isHijackable(url)) {
     return;
@@ -408,13 +540,33 @@ function rememberFile(tabId, url, knownWhole) {
  * Freshest first because the last thing a player asked for is the thing it is
  * playing now. Only a handful are ever inspected on the Snatch side.
  */
-function recent(store, tabId) {
+/**
+ * @param since When the video being asked about started loading. Everything
+ *   older belonged to a different one.
+ */
+function recent(store, tabId, since) {
   if (typeof tabId !== "number") {
     return [];
   }
   const now = Date.now();
   const kept = (store.get(tabId) ?? []).filter((entry) => now - entry.at < STREAM_TTL_MS);
   store.set(tabId, kept);
+
+  // A feed is one tab with fifty videos in it, and this map holds all of
+  // them. Offering the whole tab's worth is how the panel ends up listing
+  // qualities that belong to a clip three posts further down -- so it is
+  // narrowed to what was fetched once the video under the pointer started
+  // loading, which is when its own playlist was asked for.
+  //
+  // Never narrowed to nothing, though. A video the browser served from cache
+  // made no request to see, and a guess from the same tab beats no answer.
+  let scoped = kept;
+  if (Number.isFinite(since) && since > 0) {
+    const narrowed = kept.filter((entry) => entry.at >= since - PLAYBACK_GRACE_MS);
+    if (narrowed.length > 0) {
+      scoped = narrowed;
+    }
+  }
   // Fewest fetches first, then newest.
   //
   // A master playlist is fetched once and lists every quality. The media
@@ -422,18 +574,18 @@ function recent(store, tabId) {
   // newest-first put the polled ones at the top and, on a player that
   // switches bitrate, crowded the master out of the handful that get looked
   // at -- costing the quality list on precisely the streams that have one.
-  return kept
+  return scoped
     .slice()
     .sort((a, b) => a.hits - b.hits || b.at - a.at)
     .map((entry) => entry.url);
 }
 
-function recentStreams(tabId) {
-  return recent(streams, tabId);
+function recentStreams(tabId, since) {
+  return recent(streams, tabId, since);
 }
 
-function recentFiles(tabId) {
-  return recent(files, tabId);
+function recentFiles(tabId, since) {
+  return recent(files, tabId, since);
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +838,22 @@ async function handOff(details) {
   if (Number.isFinite(details.startAt) && details.startAt > 0) {
     message.start_at = Math.round(details.startAt);
   }
+  if (Number.isFinite(details.skipSeconds) && details.skipSeconds > 0) {
+    message.skip_seconds = Math.round(details.skipSeconds);
+  }
+  // What the page's player sent, minus the three that have fields above.
+  if (details.headers && typeof details.headers === "object") {
+    const extra = { ...details.headers };
+    delete extra.referer;
+    delete extra["user-agent"];
+    if (!message.cookies && extra.cookie) {
+      message.cookies = extra.cookie;
+    }
+    delete extra.cookie;
+    if (Object.keys(extra).length > 0) {
+      message.headers = extra;
+    }
+  }
 
   return sendNative(message);
 }
@@ -731,6 +899,10 @@ async function hijack(item) {
       filename: filename,
       referer: item.referrer || hint.referer,
       userAgent: hint.userAgent,
+      // The headers the browser's own request carried. A link behind a login
+      // is refused without them, and that is exactly the download somebody
+      // most wants a manager for.
+      headers: headersFor([url, item.url]),
       mime: item.mime || hint.mime,
       size: item.totalBytes > 0 ? item.totalBytes : hint.size
     });
@@ -761,7 +933,14 @@ async function hijackDirect(url, referer) {
     return;
   }
   return sendToSnatch(
-    { url: url, filename: nameFromUrl(url), referer: referer },
+    {
+      url: url,
+      filename: nameFromUrl(url),
+      referer: referer,
+      // A "download this link" on a page behind a login is refused without
+      // the headers the page's own requests carry.
+      headers: headersFor([url])
+    },
     "download"
   );
 }
@@ -879,11 +1058,11 @@ async function handleContentMessage(message, sender) {
       const payload = { url: url, kind: "formats" };
       // What the page's player fetched, for the sites yt-dlp cannot read.
       // Snatch only looks at these if yt-dlp comes back with nothing.
-      const observed = recentStreams(tabId);
+      const observed = recentStreams(tabId, message.since);
       // What the page is playing now comes first: it is the one the user is
       // looking at, and it is the only one still available once the browser
       // has the file cached.
-      const loaded = recentFiles(tabId);
+      const loaded = recentFiles(tabId, message.since);
       if (isHijackable(message.source) && !loaded.includes(message.source)) {
         loaded.unshift(message.source);
       }
@@ -893,66 +1072,119 @@ async function handleContentMessage(message, sender) {
       if (loaded.length > 0) {
         payload.files = loaded;
       }
-      if (observed.length > 0 || loaded.length > 0) {
-        // A manifest is very often refused without the request looking like
-        // the player's, so the same three go with it.
-        payload.referer = url;
-        const agent = globalThis.navigator && globalThis.navigator.userAgent;
-        if (agent) {
-          payload.user_agent = agent;
-        }
-        const cookies = await cookieHeader(url);
-        if (cookies) {
-          payload.cookies = cookies;
-        }
-      }
+      // Attached every time, not only when something was observed. yt-dlp
+      // needs them just as much: a members-only video, a signed page or a
+      // site that checks the referer refuses the probe without them, and
+      // that refusal is what the reader sees as "no qualities found".
+      await attachAccess(payload, url, observed.concat(loaded));
       const reply = await sendNative(payload);
       return {
         ok: true,
         title: reply.title,
         duration: reply.duration,
+        live: reply.live === true,
         formats: Array.isArray(reply.formats) ? reply.formats : []
       };
     }
 
-    case "stream":
+    case "stream": {
       // A manifest ffmpeg records. The cookies are read for the manifest's own
       // address, not the page's, because that is the request ffmpeg makes.
+      const target = requireUrl(message.url);
       await handOff({
-        url: requireUrl(message.url),
+        url: target,
         kind: "stream",
         filename: sanitiseName(message.title),
         referer: page,
+        // What the player sent for this exact manifest. ffmpeg has to make
+        // the same request or the CDN refuses it, and refuses every segment
+        // behind it too.
+        headers: headersFor([target]),
         height: message.height,
         recordSeconds: message.record_seconds,
+        skipSeconds: message.skip_seconds,
         startAt: message.start_at
       });
       flashBadge("ok", "#3584e4");
       return { ok: true };
+    }
 
     case "video": {
-      const payload = { url: requireUrl(message.url), kind: "video" };
+      const target = requireUrl(message.url);
+      const payload = { url: target, kind: "video" };
       if (typeof message.format_id === "string" && message.format_id) {
         payload.format_id = message.format_id;
       }
+      // The same access the listing was made with. Without it yt-dlp probes
+      // the page as a stranger, finds the formats, and is then refused when
+      // it goes to fetch one -- which reads as a download that failed for no
+      // reason.
+      const observed = recentStreams(tabId, message.since);
+      const loaded = recentFiles(tabId, message.since);
+      if (observed.length > 0) {
+        payload.streams = observed;
+      }
+      if (loaded.length > 0) {
+        payload.files = loaded;
+      }
+      await attachAccess(payload, target, observed.concat(loaded));
       await sendNative(payload);
       flashBadge("ok", "#3584e4");
       return { ok: true };
     }
 
-    case "direct":
+    case "direct": {
       // A plain file: the ordinary hand-off, with cookies and referer, so a
       // link that only works while signed in still works.
+      const target = requireUrl(message.url);
       await handOff({
-        url: requireUrl(message.url),
-        filename: nameFromUrl(message.url),
-        referer: typeof message.referer === "string" ? message.referer : undefined
+        url: target,
+        filename: nameFromUrl(target),
+        referer: typeof message.referer === "string" ? message.referer : undefined,
+        headers: headersFor([target])
       });
       flashBadge("ok", "#3584e4");
       return { ok: true };
+    }
 
     default:
       throw new Error("unknown request");
+  }
+}
+
+/**
+ * Put everything that gets a request accepted onto a payload.
+ *
+ * Three of these have fields of their own because every engine takes them as
+ * a named option; the rest ride along in `headers`, which is where a site's
+ * own access token ends up. The page's address is the referer rather than the
+ * media's: that is the request a player makes, and a CDN that checks looks
+ * for the site it is embedded on.
+ */
+async function attachAccess(payload, pageUrl, mediaUrls) {
+  payload.referer = pageUrl;
+  const agent = globalThis.navigator && globalThis.navigator.userAgent;
+  if (agent) {
+    payload.user_agent = agent;
+  }
+  // Read through the cookie store rather than off the wire: that reaches the
+  // httpOnly session cookies a request listener is never shown, and those are
+  // the ones a signed-in page depends on.
+  const cookies = await cookieHeader(pageUrl);
+  if (cookies) {
+    payload.cookies = cookies;
+  }
+  const observed = headersFor(mediaUrls || []);
+  // Already sent above, and a duplicate is how a request ends up with two
+  // Referers and is refused by a server that reads the second one.
+  delete observed.referer;
+  delete observed["user-agent"];
+  if (!cookies && observed.cookie) {
+    payload.cookies = observed.cookie;
+  }
+  delete observed.cookie;
+  if (Object.keys(observed).length > 0) {
+    payload.headers = observed;
   }
 }
 
@@ -1002,19 +1234,51 @@ api.webRequest.onBeforeRequest.addListener(
   { urls: WEB_REQUEST_FILTER.urls, types: WEB_REQUEST_TYPES }
 );
 
-api.webRequest.onSendHeaders.addListener(
-  (details) => {
-    if (!looksLikeDownload(details.url)) {
+/**
+ * Watch the headers going out.
+ *
+ * `extraHeaders` matters more than it looks. Chromium hides Cookie, Referer
+ * and Accept-Language from a plain `requestHeaders` listener, so without it
+ * the two headers that decide whether a CDN accepts the request are exactly
+ * the two that never arrive -- and the download fails on a site that plays
+ * fine in the tab. Firefox has no such rule and accepts the flag anyway; the
+ * fallback is there for anything that does not.
+ */
+function watchOutgoingHeaders() {
+  const listener = (details) => {
+    // Anything the page fetched to play, plus anything that looks like a
+    // file. A page's XHR is included because that is how a player asks for a
+    // manifest, and a signed manifest URL is not recognisable as one.
+    const watched =
+      details.type === "media" ||
+      details.type === "xmlhttprequest" ||
+      details.type === "object" ||
+      isManifestUrl(details.url) ||
+      looksLikeDownload(details.url);
+    if (!watched) {
       return;
     }
-    rememberHint(details.url, {
-      referer: headerValue(details.requestHeaders, "referer"),
-      userAgent: headerValue(details.requestHeaders, "user-agent")
-    });
-  },
-  WEB_REQUEST_FILTER,
-  ["requestHeaders"]
-);
+    rememberHeaders(details.url, details.requestHeaders);
+    if (looksLikeDownload(details.url)) {
+      rememberHint(details.url, {
+        referer: headerValue(details.requestHeaders, "referer"),
+        userAgent: headerValue(details.requestHeaders, "user-agent")
+      });
+    }
+  };
+
+  try {
+    api.webRequest.onSendHeaders.addListener(listener, WEB_REQUEST_FILTER, [
+      "requestHeaders",
+      "extraHeaders"
+    ]);
+  } catch (error) {
+    console.warn("Snatch: extraHeaders is unavailable here", error);
+    api.webRequest.onSendHeaders.addListener(listener, WEB_REQUEST_FILTER, ["requestHeaders"]);
+  }
+}
+
+watchOutgoingHeaders();
 
 api.webRequest.onHeadersReceived.addListener(
   (details) => {

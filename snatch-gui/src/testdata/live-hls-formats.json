@@ -1,0 +1,21 @@
+{
+  "id": "master",
+  "title": "master",
+  "duration": null,
+  "is_live": null,
+  "live_status": null,
+  "formats": [
+    {
+      "format_id": "11105",
+      "ext": "mp4",
+      "height": 1080,
+      "fps": 30.0,
+      "vcodec": "avc1.4d4028",
+      "acodec": "mp4a.40.5",
+      "tbr": 11105.6,
+      "protocol": "m3u8_native",
+      "url": "https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/mastermaster_video10000k.m3u8",
+      "manifest_url": "https://cph-p2p-msl.akamaized.net/hls/live/2000341/test/master.m3u8"
+    }
+  ]
+}

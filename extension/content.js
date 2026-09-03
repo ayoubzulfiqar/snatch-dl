@@ -318,6 +318,49 @@
     }
   }
 
+  /**
+   * When this video started loading.
+   *
+   * A feed is one tab holding fifty videos, and the background worker sees
+   * every manifest all of them fetch. Knowing when *this* one began lets it
+   * offer the qualities that belong to it rather than to a clip three posts
+   * down -- which is what made the panel on a social site list something the
+   * reader was not looking at.
+   */
+  const loadedAt = new WeakMap();
+
+  /**
+   * The address of the post this video belongs to.
+   *
+   * On a feed, `location.href` is the feed: yt-dlp asked about it either
+   * fails or answers about whatever the site decided to put first. Nearly
+   * every feed wraps each item in a link to its own page, and that page is
+   * the one yt-dlp knows how to read. So the nearest enclosing link wins over
+   * the address bar whenever there is one and it points somewhere else.
+   */
+  function permalinkFor(candidate) {
+    let node = candidate;
+    for (let depth = 0; node && depth < 12; depth += 1) {
+      const link = typeof node.closest === "function" ? node.closest("a[href]") : null;
+      if (!link) {
+        break;
+      }
+      const href = link.href;
+      if (
+        typeof href === "string" &&
+        /^https?:\/\//i.test(href) &&
+        // A link back to the page it is on identifies nothing.
+        href.split("#")[0] !== location.href.split("#")[0] &&
+        // ...and nor does a bare anchor or an in-page control.
+        !href.startsWith(location.href.split("#")[0] + "#")
+      ) {
+        return href;
+      }
+      node = link.parentElement;
+    }
+    return null;
+  }
+
   /** A plain file we could hand over even when yt-dlp cannot read the page. */
   function directSource(candidate) {
     if (!candidate) {
@@ -839,27 +882,30 @@
       frame = requestAnimationFrame(loop);
     }
 
-    const target = location.href;
+    // The post this video belongs to, falling back to the page itself. On a
+    // feed these are different, and the post is the one yt-dlp can read.
+    const target = permalinkFor(video) || location.href;
     const fallback = directSource(video);
+    const since = loadedAt.get(video);
 
     // The address this player is using, straight from the DOM. The background
     // worker watches for these on the wire too, but only sees them the first
     // time: a file already in the browser's cache is fetched without a request
     // for anything to observe. Reading it from the element always works.
-    send({ type: "formats", url: target, source: fallback }).then((reply) => {
+    send({ type: "formats", url: target, source: fallback, since: since }).then((reply) => {
       // The pointer moved on, or the user closed it, while we were asking.
       if (!panelOpen) {
         return;
       }
       if (reply.ok && Array.isArray(reply.formats) && reply.formats.length > 0) {
-        renderFormats(reply, target);
+        renderFormats(reply, target, since);
         return;
       }
-      renderFallback(reply.error, fallback, target, reply.updated === true);
+      renderFallback(reply.error, fallback, target, reply.updated === true, since);
     });
   }
 
-  function renderFormats(reply, target) {
+  function renderFormats(reply, target, since) {
     clear(panelBody);
     let recordable = false;
     const heading = [reply.title, humanDuration(reply.duration)]
@@ -899,12 +945,16 @@
         continue;
       }
       addRow(String(format.label || "Download"), detailOf(format), () =>
-        pick("video", { url: target, format_id: format.id }, format.label)
+        pick("video", { url: target, format_id: format.id, since: since }, format.label)
       );
     }
     // Scheduling belongs to a recording. Offering it beside a yt-dlp format
     // would promise something that row cannot do.
     optionsBox.classList.toggle("shown", recordable);
+    if (reply.live === true) {
+      status("This is live — pick a quality, and how long to record");
+      return;
+    }
     status(recordable ? "Pick a quality, or set when and how long" : "Pick a quality");
   }
 
@@ -912,7 +962,7 @@
    * yt-dlp could not read the page. A plain `<video src>` is still worth
    * offering: it is the ordinary hand-off Snatch does for any other link.
    */
-  function renderFallback(error, fallback, target, updated) {
+  function renderFallback(error, fallback, target, updated, since) {
     clear(panelBody);
     optionsBox.classList.remove("shown");
 
@@ -967,7 +1017,7 @@
       return;
     }
     addRow("Let Snatch try anyway", "best quality", () =>
-      pick("video", { url: target }, "the video")
+      pick("video", { url: target, since: since }, "the video")
     );
     // Streams are only noticed once the player asks for them, so a panel
     // opened before anything has started has nothing to go on yet.
@@ -1047,6 +1097,33 @@
   // -------------------------------------------------------------------------
   // Listeners
   // -------------------------------------------------------------------------
+
+  // Capture, because media events do not bubble. A listener on the document
+  // still sees them on the way down, which is the only way to watch every
+  // video on a feed without attaching to each one -- and a feed adds videos
+  // for as long as it is scrolled.
+  for (const name of ["loadstart", "playing", "loadedmetadata"]) {
+    document.addEventListener(
+      name,
+      (event) => {
+        const target = event.target;
+        // An extension replaced under an open tab leaves this script running
+        // with nothing to send to. Noting load times for a page that can no
+        // longer be asked about is just work for nothing.
+        if (orphaned || !target || target.tagName !== "VIDEO") {
+          return;
+        }
+        // `loadstart` means a new source, so it always wins: a feed reuses
+        // one element for post after post, and the time the first of them
+        // loaded would keep answering for all of them. The other two only
+        // fill in a video that was already playing when this script arrived.
+        if (name === "loadstart" || !loadedAt.has(target)) {
+          loadedAt.set(target, Date.now());
+        }
+      },
+      { capture: true, passive: true }
+    );
+  }
 
   // Capture, because players stop pointer events from bubbling.
   document.addEventListener(
