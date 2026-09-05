@@ -270,12 +270,21 @@ pub struct StreamInfo {
     pub audio_index: Option<u32>,
     /// Bytes, when the address is one file rather than a playlist.
     pub size: Option<u64>,
+    /// Set only when a manifest stated it outright, rather than it being
+    /// inferred from a missing duration. See [`dash_liveness`].
+    pub live: Option<bool>,
 }
 
 impl StreamInfo {
-    /// A stream with no duration is one that has not finished happening.
+    /// A stream with no duration is one that has not finished happening --
+    /// unless something authoritative already said otherwise.
+    ///
+    /// The guess is right most of the time and wrong in both directions: a
+    /// recording whose length ffprobe could not measure reads as live, and a
+    /// broadcast that reports a length reads as finished. Getting it wrong
+    /// costs either way, so a manifest that states the answer wins.
     pub fn is_live(&self) -> bool {
-        self.duration.is_none()
+        self.live.unwrap_or(self.duration.is_none())
     }
 
     pub fn has_video(&self) -> bool {
@@ -562,6 +571,65 @@ fn distil(raw: &RawProbe) -> StreamInfo {
 /// They are inspected at the same time, not one after another: four addresses
 /// at ten seconds each would take longer in sequence than the browser is
 /// willing to wait for the whole answer.
+/// How much of a DASH manifest is worth reading. They are XML and can be
+/// enormous; nothing this needs is ever past the first few megabytes.
+const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ask a DASH manifest whether it is a broadcast, rather than guessing.
+///
+/// `MPD@type` is the answer and it is not ambiguous: `dynamic` is happening
+/// now, `static` has an end. ffprobe does not report it, so without this the
+/// only signal is whether a duration came back -- which is wrong in both
+/// directions, and wrong expensively. A recording mistaken for a broadcast is
+/// offered as something to record instead of to download; a broadcast
+/// mistaken for a recording is handed to a downloader that sits waiting for
+/// an end that never arrives. That second one is the "stuck at extracting"
+/// this exists to stop.
+///
+/// `None` means the question could not be answered -- not a DASH address, no
+/// network, unreadable XML -- and the caller keeps its guess. Deliberately
+/// cheap to be wrong about: the manifest is a few kilobytes of the thing we
+/// were about to fetch anyway.
+async fn dash_liveness(url: &str, headers: &Headers) -> Option<(bool, Option<Duration>)> {
+    if !matches!(extension_of(url).as_deref(), Some("mpd")) {
+        return None;
+    }
+
+    // No proxy, matching what ffprobe does on this same path. The manifest is
+    // fetched as the browser, for the same reason everything else is.
+    let mut request = wreq::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .emulation(crate::network::browser_profile())
+        .build()
+        .ok()?
+        .get(url);
+    if let Some(referer) = headers.referer.as_deref() {
+        request = request.header(wreq::header::REFERER, referer);
+    }
+    if let Some(cookies) = headers.cookies.as_deref() {
+        request = request.header(wreq::header::COOKIE, cookies);
+    }
+    for (name, value) in &headers.extra {
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.bytes().await.ok()?;
+    let xml = std::str::from_utf8(&body[..body.len().min(MAX_MANIFEST_BYTES)]).ok()?;
+
+    let mpd = dash_mpd::parse(xml)
+        .map_err(|error| log::debug!("{url} is not a manifest we can read: {error}"))
+        .ok()?;
+    let live = mpd.mpdtype.as_deref() == Some("dynamic");
+    let duration = mpd
+        .mediaPresentationDuration
+        .filter(|length| !length.is_zero());
+    Some((live, duration))
+}
+
 pub async fn describe_all(urls: &[String], headers: &Headers) -> Vec<(String, StreamInfo)> {
     let mut wanted: Vec<String> = Vec::new();
     for url in urls {
@@ -580,7 +648,16 @@ pub async fn describe_all(urls: &[String], headers: &Headers) -> Vec<(String, St
 
     let probes = wanted.into_iter().map(|url| async move {
         match probe(&url, headers).await {
-            Ok(info) => Some((url, info)),
+            Ok(mut info) => {
+                // The manifest outranks ffprobe's silence on both counts.
+                if let Some((live, duration)) = dash_liveness(&url, headers).await {
+                    info.live = Some(live);
+                    if !live && info.duration.is_none() {
+                        info.duration = duration;
+                    }
+                }
+                Some((url, info))
+            }
             Err(error) => {
                 log::debug!("ignoring {url}: {error:#}");
                 None
@@ -1771,6 +1848,89 @@ mod stop_tests {
     /// This is what a CDN behind a signed player does, and it is the reason
     /// downloads fail on sites that play perfectly in the tab: the request
     /// the browser made carried a header, and the one Snatch made did not.
+    /// A DASH manifest says whether it is live. ffprobe never asks it.
+    ///
+    /// Both fixtures are the shape real manifests take, trimmed to what is
+    /// read: the live one is what livesim2.dashif.org serves, the recorded
+    /// one what dash.akamaized.net serves for Big Buck Bunny.
+    #[tokio::test]
+    async fn a_dash_manifest_is_asked_whether_it_is_live() {
+        const LIVE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+     minimumUpdatePeriod="PT2S" minBufferTime="PT2S"
+     availabilityStartTime="1970-01-01T00:00:00Z" profiles="urn:mpeg:dash:profile:isoff-live:2011">
+  <Period id="p0" start="PT0S">
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="V300" bandwidth="300000" width="640" height="360" codecs="avc1.64001e"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        const RECORDED: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT634.566S" minBufferTime="PT2S"
+     profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+  <Period id="p0">
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="v1080" bandwidth="9914554" width="1920" height="1080" codecs="avc1.640028"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+        let dir = std::env::temp_dir().join(format!("snatch-mpd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+
+        for (name, xml, expected_live, expected_secs) in [
+            ("live.mpd", LIVE, true, None),
+            ("vod.mpd", RECORDED, false, Some(634)),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, xml).expect("write the manifest");
+            let port = serve(path, Duration::ZERO).await;
+            let url = format!("http://127.0.0.1:{port}/{name}");
+
+            let (live, duration) = dash_liveness(&url, &Headers::default())
+                .await
+                .unwrap_or_else(|| panic!("{name} should be readable as a manifest"));
+            assert_eq!(live, expected_live, "{name}");
+            assert_eq!(duration.map(|d| d.as_secs()), expected_secs, "{name}");
+        }
+
+        // Anything that is not a manifest is left to ffprobe, and costs no
+        // request at all: the extension is checked before the network is.
+        assert!(
+            dash_liveness("https://c.example/clip.mp4", &Headers::default())
+                .await
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manifest overrules the guess, in the direction that matters.
+    #[test]
+    fn a_stated_liveness_beats_a_missing_duration() {
+        // A recording ffprobe could not measure. Without the manifest this
+        // reads as live and gets offered as something to record.
+        let measured_nothing = StreamInfo {
+            duration: None,
+            live: Some(false),
+            ..StreamInfo::default()
+        };
+        assert!(!measured_nothing.is_live());
+
+        // A broadcast that reported a length. Without the manifest this gets
+        // handed to a downloader waiting for an end that never comes.
+        let reported_a_length = StreamInfo {
+            duration: Some(Duration::from_secs(60)),
+            live: Some(true),
+            ..StreamInfo::default()
+        };
+        assert!(reported_a_length.is_live());
+
+        // Nothing said either way, so the old guess still stands.
+        assert!(StreamInfo::default().is_live());
+    }
+
     async fn serve_guarded(path: PathBuf, guard: &'static str) -> u16 {
         serve_with(path, Duration::ZERO, Some(guard)).await
     }

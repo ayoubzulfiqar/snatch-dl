@@ -52,6 +52,12 @@ wreq = { version = "0.16", default-features = false, features = [
 # The browser profiles themselves: Chrome, Firefox, Safari and their versions.
 wreq-util = "0.2"
 
+# Reads a DASH manifest properly, so `MPD@type` answers "is this live?"
+# instead of it being inferred from whether ffprobe reported a duration.
+# Parser only -- `default-features = false` drops its own HTTP stack, which
+# would otherwise pull a second one in beside wreq.
+dash-mpd = { version = "0.20", default-features = false }
+
 # Pure-Rust BitTorrent engine: DHT, ut_pex, magnet links, sequential streaming
 # and SOCKS5 outbound, with no C toolchain required.
 librqbit = { version = "9.0", default-features = false, features = ["rust-tls"] }
