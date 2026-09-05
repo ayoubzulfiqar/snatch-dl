@@ -549,7 +549,7 @@ async fn head_length(
     // A HEAD reply has no body, so the header is the only source of truth.
     response
         .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
+        .get(wreq::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|length| *length > 0)

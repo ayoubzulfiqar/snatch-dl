@@ -300,7 +300,7 @@ pub fn candidate_urls(download_url: &str) -> Vec<String> {
 
 /// Fetch one candidate and pull this file's digest out of it.
 async fn fetch_candidate(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     candidate: &str,
     filename: &str,
 ) -> Option<Checksum> {
@@ -339,7 +339,7 @@ async fn fetch_candidate(
 /// fetched concurrently and the highest-priority hit wins, so the whole thing
 /// costs one round trip in the common case and two at worst.
 pub async fn discover(
-    client: &reqwest::Client,
+    client: &wreq::Client,
     download_url: &str,
     filename: &str,
 ) -> Option<(Checksum, String)> {
@@ -617,7 +617,7 @@ mod tests {
         // The `<file>.sha256` convention, holding the digest alone.
         const DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
         let (base, server) = serve(vec![("/dist/app.tar.gz.sha256", DIGEST)]).await;
-        let client = reqwest::Client::new();
+        let client = wreq::Client::new();
 
         let found = discover(&client, &format!("{base}/dist/app.tar.gz"), "app.tar.gz").await;
         let (checksum, source) = found.expect("the sibling digest is found");
@@ -639,7 +639,7 @@ mod tests {
 3333333333333333333333333333333333333333333333333333333333333333  app.tar.gz
 ";
         let (base, server) = serve(vec![("/dist/SHA256SUMS", SUMS)]).await;
-        let client = reqwest::Client::new();
+        let client = wreq::Client::new();
 
         let found = discover(&client, &format!("{base}/dist/app.tar.gz"), "app.tar.gz").await;
         let (checksum, source) = found.expect("the sums file is found");
@@ -655,7 +655,7 @@ mod tests {
     async fn a_server_with_nothing_published_yields_nothing() {
         // Every candidate 404s. A miss must be quiet, not an error.
         let (base, server) = serve(Vec::new()).await;
-        let client = reqwest::Client::new();
+        let client = wreq::Client::new();
         let found = discover(&client, &format!("{base}/dist/app.tar.gz"), "app.tar.gz").await;
         assert!(found.is_none());
         server.abort();
@@ -670,7 +670,7 @@ mod tests {
         const SUMS: &str =
             "4444444444444444444444444444444444444444444444444444444444444444  unrelated.bin\n";
         let (base, server) = serve(vec![("/dist/SHA256SUMS", SUMS)]).await;
-        let client = reqwest::Client::new();
+        let client = wreq::Client::new();
         let found = discover(&client, &format!("{base}/dist/app.tar.gz"), "app.tar.gz").await;
         assert!(found.is_none(), "{found:?}");
         server.abort();

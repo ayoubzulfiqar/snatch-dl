@@ -399,6 +399,25 @@ You lose crash resume.
 
 ---
 
+## Looking like a browser
+
+Some sites refuse anything that is not a browser. Sending a browser's name is
+not enough any more: a big CDN reads the *shape* of the connection itself --
+the exact way the encryption is set up -- and that says "this is a program"
+no matter what name it gives.
+
+So Snatch does not pretend with a name. Its own requests are made the way
+Chrome makes them, down to that level. A site that only serves real browsers
+now serves Snatch too.
+
+Two things this does not do. It does not touch how `aria2`, `yt-dlp` or
+`gallery-dl` connect -- those are separate programs with their own settings.
+And it is not a disguise for anything: the requests still carry your cookies
+and your referer, exactly as before, because that is what makes a page you
+are signed in to work.
+
+---
+
 ## When the network fights back
 
 Some networks cut connections instead of refusing them. The name looks up

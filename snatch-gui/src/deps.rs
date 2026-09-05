@@ -397,7 +397,7 @@ pub async fn install(
     let source = source_for(tool)?;
     report(InstallProgress::Resolving);
 
-    let http = reqwest::Client::builder()
+    let http = wreq::Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(15))
         .user_agent(concat!("Snatch/", env!("CARGO_PKG_VERSION")))
@@ -458,7 +458,7 @@ pub async fn install(
         )
     })?;
 
-    let mut response = http
+    let response = http
         .get(&binary_asset.browser_download_url)
         .send()
         .await
@@ -470,11 +470,9 @@ pub async fn install(
     let mut body = Vec::with_capacity(total.unwrap_or(8 << 20) as usize);
     report(InstallProgress::Downloading { received: 0, total });
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("the download was interrupted")?
-    {
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.context("the download was interrupted")?;
         body.extend_from_slice(&chunk);
         report(InstallProgress::Downloading {
             received: body.len() as u64,

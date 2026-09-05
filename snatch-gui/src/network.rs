@@ -6,7 +6,7 @@
 //! |---------------------------|------------|--------------|
 //! | aria2 (`--all-proxy`)     | yes        | **no**       |
 //! | librqbit (torrents)       | **no**     | yes          |
-//! | reqwest (our own traffic) | yes        | yes          |
+//! | wreq (our own traffic)    | yes        | yes          |
 //! | yt-dlp / gallery-dl       | yes        | yes          |
 //!
 //! aria2 genuinely has no SOCKS support (it is absent from `aria2c --help=#all`
@@ -34,7 +34,7 @@ pub enum Engine {
     Aria2,
     /// BitTorrent transfers handled by librqbit.
     Torrent,
-    /// Requests Snatch itself makes with reqwest.
+    /// Requests Snatch itself makes with wreq.
     Http,
     /// External helpers (`yt-dlp`, `gallery-dl`) that take a `--proxy` flag.
     Subprocess,
@@ -94,6 +94,56 @@ impl fmt::Display for ProxyScheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// The browser Snatch's own requests present themselves as.
+///
+/// Not a user agent string. A CDN reads the shape of the TLS handshake -- the
+/// cipher list, the extension order, the HTTP/2 settings frame -- and that is
+/// a fingerprint no header can fake. Measured against a fingerprinting
+/// endpoint, a plain rustls client is JA4 `t13d1011h1` and negotiates no
+/// HTTP/2 at all; this is `t13d1516h2`, byte for byte what Chrome sends.
+///
+/// It is pinned rather than random so that a site seeing several requests
+/// from one user sees one consistent client, which is what a real browser
+/// looks like. It wants bumping when it starts to look old.
+///
+/// The platform is set to match the machine actually running this. The
+/// profile's own default is macOS, and a Chrome-on-macOS user agent arriving
+/// from a Linux box is the sort of small disagreement these profiles exist to
+/// avoid.
+pub fn browser_profile() -> wreq_util::Emulation {
+    wreq_util::Emulation::builder()
+        .profile(wreq_util::Profile::Chrome149)
+        .platform(wreq_util::Platform::Linux)
+        .build()
+}
+
+/// The certificate authorities to trust, from the system's own store.
+///
+/// wreq ships Mozilla's list and uses it by default. That is the wrong answer
+/// on a machine whose administrator added a certificate authority of their
+/// own -- a company's inspecting proxy, a lab's internal CA, a developer
+/// running mitmproxy -- because those live in the system store and nowhere
+/// else. `None` falls back to the bundled list, which is better than refusing
+/// to make the request at all.
+fn system_trust_store() -> Option<wreq::tls::trust::CertStore> {
+    static STORE: std::sync::OnceLock<Option<wreq::tls::trust::CertStore>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            wreq::tls::trust::CertStore::builder()
+                .set_default_paths()
+                .build()
+                .map_err(|error| {
+                    log::warn!(
+                        "could not read the system certificate store ({error}); \
+                         falling back to the bundled list"
+                    );
+                })
+                .ok()
+        })
+        .clone()
 }
 
 /// What a cut-off connection says, in each engine's own words.
@@ -537,16 +587,30 @@ impl ProxyManager {
         Ok(Some(proxy))
     }
 
-    /// Build a reqwest client that routes through `endpoint` (or directly).
-    pub fn client(&self, endpoint: Option<&ProxyEndpoint>) -> Result<reqwest::Client> {
-        let mut builder = reqwest::Client::builder()
+    /// Build an HTTP client that routes through `endpoint` (or directly).
+    ///
+    /// Every caller of this is fetching from somebody else's website -- a page
+    /// to sniff, a checksum file, a HEAD to size a link -- so it introduces
+    /// itself the way a browser does, all the way down to the TLS handshake.
+    /// See [`browser_profile`] for why that is not just a user agent string.
+    pub fn client(&self, endpoint: Option<&ProxyEndpoint>) -> Result<wreq::Client> {
+        let mut builder = wreq::Client::builder()
             .timeout(PROBE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("Snatch/", env!("CARGO_PKG_VERSION")));
+            // Sets the handshake, the HTTP/2 settings and the header set
+            // together. Deliberately no `.user_agent()` after it: a Chrome
+            // handshake carrying "Snatch/4.6.9" is a stranger fingerprint than
+            // either half on its own, and a mismatch is exactly what the
+            // things that look for this are looking for.
+            .emulation(browser_profile());
+
+        if let Some(store) = system_trust_store() {
+            builder = builder.tls_cert_store(store);
+        }
 
         builder = match endpoint {
             Some(proxy) => builder.proxy(
-                reqwest::Proxy::all(proxy.url())
+                wreq::Proxy::all(proxy.url())
                     .with_context(|| format!("'{}' is not a usable proxy", proxy.redacted()))?,
             ),
             None => builder.no_proxy(),
@@ -618,7 +682,7 @@ impl ProxyManager {
             Err(error) => ProxyHealth {
                 connect,
                 end_to_end: None,
-                // reqwest's chained source is noise in a list row.
+                // wreq's chained source is noise in a list row.
                 error: Some(format!("request through the proxy failed: {error}")),
             },
         };
@@ -676,6 +740,26 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client still builds once a browser profile and a certificate store
+    /// are attached to it -- direct, and through either kind of proxy.
+    ///
+    /// Cheap, but it is the thing that breaks: `emulation` and
+    /// `tls_cert_store` both hand the builder something that can fail to
+    /// apply, and a client that fails to build takes every sniff, every
+    /// checksum and every HEAD with it.
+    #[test]
+    fn the_browser_client_builds_direct_and_through_a_proxy() {
+        let manager = ProxyManager::load(std::path::PathBuf::from("/nonexistent/proxies.json"));
+        manager.client(None).expect("a direct client builds");
+
+        for url in ["http://127.0.0.1:8080", "socks5://127.0.0.1:1080"] {
+            let endpoint = ProxyEndpoint::parse("test", url).expect("the URL parses");
+            manager
+                .client(Some(&endpoint))
+                .unwrap_or_else(|error| panic!("a client through {url} should build: {error}"));
+        }
+    }
 
     #[test]
     fn parses_a_plain_socks_url() {

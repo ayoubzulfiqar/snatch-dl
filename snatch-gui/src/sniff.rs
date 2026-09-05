@@ -33,8 +33,12 @@ const MAX_CANDIDATES: usize = 500;
 const PROBE_CONCURRENCY: usize = 12;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A browser user agent: many sites serve a stub or a 403 to anything else.
-const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+// There is no user agent constant here any more. Many sites do serve a stub
+// or a 403 to anything that is not a browser, but the client itself now is
+// one, all the way down to the TLS handshake, and it brings the matching user
+// agent and header order with it. Naming a *different* browser on top of that
+// would put a Firefox banner on a Chrome handshake, which is the exact
+// disagreement the emulation exists to avoid. See `network::browser`.
 
 /// Broad classification. Snatch downloads anything, so "Other" is a first-class
 /// result rather than a reason to hide a link.
@@ -257,7 +261,7 @@ impl Default for SniffOptions {
 /// Sniff a page for everything downloadable on it.
 pub async fn sniff(
     page_url: &str,
-    client: reqwest::Client,
+    client: wreq::Client,
     options: SniffOptions,
 ) -> Result<SniffResult> {
     let base = url::Url::parse(page_url.trim())
@@ -269,9 +273,8 @@ pub async fn sniff(
     let mut notes = Vec::new();
 
     let response = client
-        .get(base.clone())
-        .header(reqwest::header::USER_AGENT, BROWSER_UA)
-        .header(reqwest::header::ACCEPT, "text/html,*/*")
+        .get(base.as_str())
+        .header(wreq::header::ACCEPT, "text/html,*/*")
         .send()
         .await
         .with_context(|| format!("could not fetch {base}"))?
@@ -279,10 +282,13 @@ pub async fn sniff(
         .with_context(|| format!("{base} returned an error"))?;
 
     // Redirects mean the effective URL is what relative links resolve against.
-    let effective = response.url().clone();
+    // wreq reports it as an `http::Uri`; everything downstream resolves
+    // against a `url::Url`, and the address we started from is the right
+    // answer if the round trip somehow fails.
+    let effective = url::Url::parse(&response.uri().to_string()).unwrap_or_else(|_| base.clone());
     let content_type = response
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
+        .get(wreq::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_owned();
@@ -357,9 +363,11 @@ pub async fn sniff(
 }
 
 /// Read a body, refusing to buffer more than [`MAX_PAGE_BYTES`].
-async fn read_capped(mut response: reqwest::Response) -> Result<String> {
+async fn read_capped(response: wreq::Response) -> Result<String> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("the page download failed")? {
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.context("the page download failed")?;
         body.extend_from_slice(&chunk);
         if body.len() > MAX_PAGE_BYTES {
             body.truncate(MAX_PAGE_BYTES);
@@ -779,7 +787,7 @@ async fn extractor_candidates(binary: &std::path::Path, page: &str) -> Result<Ve
 }
 
 /// HEAD every candidate to learn its real type and size.
-async fn probe_all(candidates: &mut [Candidate], client: &reqwest::Client) {
+async fn probe_all(candidates: &mut [Candidate], client: &wreq::Client) {
     let limit = Arc::new(Semaphore::new(PROBE_CONCURRENCY));
     let mut tasks = Vec::with_capacity(candidates.len());
 
@@ -793,30 +801,24 @@ async fn probe_all(candidates: &mut [Candidate], client: &reqwest::Client) {
         tasks.push(tokio::spawn(async move {
             // A closed semaphore cannot happen here; treat it as "skip".
             let _permit = limit.acquire_owned().await.ok()?;
-            let response = tokio::time::timeout(
-                PROBE_TIMEOUT,
-                client
-                    .head(&url)
-                    .header(reqwest::header::USER_AGENT, BROWSER_UA)
-                    .send(),
-            )
-            .await
-            .ok()?
-            .ok()?;
+            let response = tokio::time::timeout(PROBE_TIMEOUT, client.head(&url).send())
+                .await
+                .ok()?
+                .ok()?;
 
             if !response.status().is_success() {
                 return None;
             }
             let mime = response
                 .headers()
-                .get(reqwest::header::CONTENT_TYPE)
+                .get(wreq::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             // Read the header rather than `content_length()`: a HEAD reply has
-            // no body, so reqwest reports 0 for it and every size would be lost.
+            // no body, so wreq reports 0 for it and every size would be lost.
             let size = response
                 .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
+                .get(wreq::header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<u64>().ok())
                 .filter(|length| *length > 0);
@@ -1109,37 +1111,57 @@ mod tests {
     mod server {
         use std::io::{BufRead, BufReader, Write};
         use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
 
         pub struct Fixture {
             pub base: String,
+            /// Every `User-Agent` the server was sent, in arrival order.
+            ///
+            /// Recorded so a test can check what actually went out on the
+            /// socket rather than what the code meant to send.
+            pub agents: Arc<Mutex<Vec<String>>>,
             _thread: std::thread::JoinHandle<()>,
         }
 
         pub fn start(page: &'static str) -> Option<Fixture> {
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
+            let agents: Arc<Mutex<Vec<String>>> = Arc::default();
+            let seen = Arc::clone(&agents);
             let thread = std::thread::spawn(move || {
                 // Enough connections for the page plus every HEAD probe.
                 for stream in listener.incoming().take(64) {
                     let Ok(stream) = stream else { break };
-                    let _ = serve(stream, page);
+                    let _ = serve(stream, page, &seen);
                 }
             });
             Some(Fixture {
                 base: format!("http://127.0.0.1:{port}"),
+                agents,
                 _thread: thread,
             })
         }
 
-        fn serve(mut stream: TcpStream, page: &str) -> std::io::Result<()> {
+        fn serve(
+            mut stream: TcpStream,
+            page: &str,
+            agents: &Arc<Mutex<Vec<String>>>,
+        ) -> std::io::Result<()> {
             let mut reader = BufReader::new(stream.try_clone()?);
             let mut request = String::new();
             reader.read_line(&mut request)?;
-            // Drain headers so the client does not see a reset.
+            // Drain headers so the client does not see a reset, noting the
+            // one this fixture is asked about.
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line)? == 0 || line.trim().is_empty() {
                     break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("user-agent")
+                    && let Ok(mut agents) = agents.lock()
+                {
+                    agents.push(value.trim().to_owned());
                 }
             }
 
@@ -1189,8 +1211,11 @@ mod tests {
             eprintln!("skipping: could not bind a local port");
             return;
         };
-        let client = reqwest::Client::builder()
+        // Built the way ProxyManager builds it, so what the fixture records
+        // is what a real sniff puts on the socket.
+        let client = wreq::Client::builder()
             .no_proxy()
+            .emulation(crate::network::browser_profile())
             .build()
             .expect("client builds");
 
@@ -1208,6 +1233,19 @@ mod tests {
         .expect("the page is sniffable");
 
         assert_eq!(result.page_title.as_deref(), Some("Mixed Media Test Page"));
+
+        // Snatch introduces itself as the browser it emulates, on the page
+        // fetch and on every HEAD behind it. Nothing sets a user agent by
+        // hand any more, so if one is ever added back on top of the profile
+        // this is where the disagreement shows up.
+        let agents = fixture.agents.lock().expect("the fixture is not poisoned");
+        assert!(!agents.is_empty(), "the server saw no user agent at all");
+        for agent in agents.iter() {
+            assert!(
+                agent.contains("Chrome/149") && agent.contains("X11; Linux x86_64"),
+                "sent {agent:?}, which is not the emulated browser"
+            );
+        }
 
         let names: Vec<String> = result
             .candidates
@@ -1258,7 +1296,7 @@ mod tests {
         let Some(fixture) = server::start(FIXTURE_PAGE) else {
             return;
         };
-        let client = reqwest::Client::builder()
+        let client = wreq::Client::builder()
             .no_proxy()
             .build()
             .expect("client builds");

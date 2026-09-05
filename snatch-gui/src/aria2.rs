@@ -2,7 +2,7 @@
 //!
 //! Snatch never implements HTTP transfers itself. `aria2c` is spawned as a
 //! private child bound to loopback, and every operation goes through its
-//! JSON-RPC endpoint over `reqwest`.
+//! JSON-RPC endpoint over `wreq`.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -69,7 +69,7 @@ pub struct Aria2Config {
 /// is what moves the call onto the tokio runtime.
 #[derive(Clone)]
 pub struct Aria2Client {
-    http: reqwest::Client,
+    http: wreq::Client,
     endpoint: String,
     token: String,
     download_dir: PathBuf,
@@ -82,7 +82,7 @@ pub struct Aria2Client {
 
 impl Aria2Client {
     pub fn new(download_dir: PathBuf, options: Arc<RwLock<Vec<(String, String)>>>) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = wreq::Client::builder()
             .timeout(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(3))
             .pool_idle_timeout(Duration::from_secs(90))

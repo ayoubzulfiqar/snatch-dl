@@ -26,15 +26,31 @@ serde_json.workspace = true
 gtk4 = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
 
-# rustls (not native-tls) so there is no OpenSSL build dependency; `socks`
-# lets a download be routed through a SOCKS5 proxy by the ProxyManager.
-reqwest = { version = "0.13", default-features = false, features = [
+# A fork of reqwest -- same API -- that can present a real browser's TLS and
+# HTTP/2 handshake instead of an obviously-a-robot one.
+#
+# Not cosmetic. Measured against a fingerprinting endpoint, reqwest with
+# rustls introduces itself as JA4 `t13d1011h1` and negotiates no HTTP/2 at
+# all, where Chrome is `t13d1516h2`. A CDN that fingerprints the handshake --
+# and the large ones all do -- can tell those apart before it has read a
+# single header, which is how a page that loads in the browser still refuses
+# us while carrying that same browser's cookies and user agent.
+#
+# `socks` lets a download be routed through a SOCKS5 proxy by the
+# ProxyManager. `webpki-roots` is deliberately off: the distribution's CA
+# bundle is loaded instead, so a machine with its own certificate authority
+# keeps working.
+wreq = { version = "0.16", default-features = false, features = [
   "json",
   "socks",
-  "rustls",
-  # Trust the distribution's CA bundle rather than shipping our own.
-  "rustls-native-certs",
+  "gzip",
+  "brotli",
+  "deflate",
+  "tokio-rt",
+  "stream",
 ] }
+# The browser profiles themselves: Chrome, Firefox, Safari and their versions.
+wreq-util = "0.2"
 
 # Pure-Rust BitTorrent engine: DHT, ut_pex, magnet links, sequential streaming
 # and SOCKS5 outbound, with no C toolchain required.
