@@ -410,6 +410,28 @@ You lose crash resume.
 
 ---
 
+## Recording a live stream
+
+If a page is playing it, Snatch can record it. That holds even when nothing
+can work out what the page *is*.
+
+There are three ways Snatch tries to understand a page: `yt-dlp`, then
+`streamlink`, then opening the stream itself. All three can fail at once — a
+site calls it a private event, `streamlink` has never heard of it, and the
+stream takes too long to answer. None of that stops the recording. Your
+browser is fetching the stream right now, and the add-on saw the address and
+the exact request that goes with it. That is enough.
+
+So when Snatch cannot name the quality, it offers **Live stream** instead of
+an error, and recording works the same way it always does: it starts saving
+from the moment you press it, you can set a length or a start time, and Stop
+leaves a file you can play.
+
+This used to be the weak spot. `yt-dlp` refusing meant no download at all,
+even though the stream was right there. It no longer does.
+
+---
+
 ## Looking like a browser
 
 Some sites refuse anything that is not a browser. Sending a browser's name is

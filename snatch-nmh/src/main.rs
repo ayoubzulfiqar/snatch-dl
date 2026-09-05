@@ -41,7 +41,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long we wait for a freshly launched GUI to open its socket.
 const GUI_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long we wait for the GUI to answer once connected.
-const GUI_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// This has to outlast the slowest question the GUI can be asked, which is
+/// listing what a page offers. That walks a chain, and every step of it has
+/// its own cap: yt-dlp 30s, then streamlink 20s, then ffprobe 25s on a
+/// playlist. Nothing takes all three -- the first answer wins -- but a page
+/// where everything refuses does, and 75 seconds of that is a page that is
+/// working, not a page that has hung.
+///
+/// Giving up first is worse than waiting: the reader gets "Snatch is not
+/// answering" for a broadcast the app was seconds away from offering to
+/// record. Every step is separately bounded, so the GUI cannot hold this
+/// open indefinitely no matter what a site does.
+const GUI_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The minimum a hand-off must contain. Everything else is passed through
 /// untouched, so this host never needs to know the full schema.

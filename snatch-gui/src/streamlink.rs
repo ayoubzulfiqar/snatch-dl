@@ -29,8 +29,10 @@ use tokio::time::timeout;
 use crate::network::{Engine, ProxyManager};
 
 /// Long enough for a plugin that has to sign in or follow a redirect chain,
-/// short enough that a wrong guess does not hold up the picker.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// short enough that a wrong guess does not hold up the picker. This is one
+/// step of a chain the native host bounds at 90 seconds; see its
+/// `GUI_REPLY_TIMEOUT` for the arithmetic.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// streamlink names one entry per quality plus these aliases for the ends of
 /// the list. They point at a quality that is already listed, so offering them

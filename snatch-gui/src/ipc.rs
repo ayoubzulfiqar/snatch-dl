@@ -454,6 +454,48 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     // qualities, and offering only its best would throw the rest away.
     let mut rows: Vec<crate::ytdlp::MediaFormat> = Vec::new();
     let mut live = false;
+
+    // A manifest the page was playing is recordable whether or not anything
+    // could describe it.
+    //
+    // This is the hole that made Snatch useless for live streams. Every way
+    // of describing a page can fail at once -- yt-dlp refuses a private
+    // event, streamlink does not know the site, ffprobe cannot read the
+    // manifest inside the few seconds it is given, which is ordinary for a
+    // broadcast because it has to pull segments to answer. The manifest is
+    // still right there, still being played, and ffmpeg given that address
+    // and the player's own headers records it perfectly well. Dropping it
+    // because nobody could describe it turned a recordable broadcast into
+    // "no qualities found", which is the one answer that was never true.
+    //
+    // So description is what improves a row -- a quality list, a length --
+    // and never what permits one. These are added first because a page that
+    // is broadcasting is what the reader is there for.
+    // The same list `describe_all` worked from, so an address it never
+    // reached is not offered either -- a page can put two dozen manifests
+    // past the browser, and only the first few are ever looked at.
+    for url in &crate::stream::candidates(watched_streams) {
+        if streams.iter().any(|(described, _)| described == url) {
+            continue;
+        }
+        log::info!("nothing could describe {url}; offering it as a recording anyway");
+        live = true;
+        rows.push(crate::ytdlp::MediaFormat {
+            id: String::new(),
+            // No quality is claimed, because none was measured. Saying
+            // "1080p" here on a guess would be worse than saying nothing.
+            label: "Live stream".to_owned(),
+            // Stopping a recording has to leave a playable file, and only
+            // Matroska survives being cut off mid-write.
+            ext: "mkv".to_owned(),
+            size: None,
+            estimated: false,
+            height: None,
+            audio_only: false,
+            source: crate::ytdlp::FormatSource::Stream,
+            url: Some(url.clone()),
+        });
+    }
     for (source, url, info) in streams
         .into_iter()
         .map(|(url, info)| (FormatSource::Stream, url, info))
@@ -581,6 +623,87 @@ mod fallback_tests {
         for ordinary in ["HTTP Error 404: Not Found", "HTTP Error 403: Forbidden"] {
             assert_eq!(crate::network::explain_failure(ordinary), ordinary);
         }
+    }
+
+    /// A broadcast the browser is playing must be recordable, full stop.
+    ///
+    /// This is the hole that made Snatch useless for live streams. Every way
+    /// of *describing* a page can fail at once -- yt-dlp refuses a private
+    /// event, streamlink does not know the site, ffprobe cannot read the
+    /// manifest in the time it is given -- and the manifest is still right
+    /// there, being played, with the headers that make it work. Dropping it
+    /// because nothing could describe it turned a recordable broadcast into
+    /// "no qualities found", which is the one answer that is never true.
+    ///
+    /// The address here refuses connections, so ffprobe cannot say anything
+    /// about it at all. The row still has to exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_manifest_nothing_could_describe_is_still_offered_to_record() {
+        let request = crate::types::DownloadRequest {
+            streams: vec!["http://127.0.0.1:1/live/master.m3u8".to_owned()],
+            ..crate::types::DownloadRequest::from_url(
+                "https://private.example/event/12345".to_owned(),
+            )
+        };
+
+        let probe = stream_listing(&request).await;
+        assert_eq!(
+            probe.formats.len(),
+            1,
+            "the manifest the page was playing was dropped: {:?}",
+            probe.formats
+        );
+        let row = &probe.formats[0];
+        assert_eq!(row.source, FormatSource::Stream, "it has to be recorded");
+        assert_eq!(
+            row.url.as_deref(),
+            Some("http://127.0.0.1:1/live/master.m3u8")
+        );
+        // Matroska, because stopping a recording has to leave a playable file.
+        assert_eq!(row.ext, "mkv");
+        // Nothing measured it, so it must not claim a size.
+        assert_eq!(row.size, None);
+        assert!(
+            probe.live,
+            "an undescribable manifest is offered as a broadcast"
+        );
+    }
+
+    /// A busy page must not turn into a wall of identical rows.
+    ///
+    /// Offering a manifest nothing could describe is right; offering every
+    /// manifest a video-heavy page ever fetched is not. Two things stop that:
+    /// only the handful ffprobe was given are considered at all, and rows
+    /// that say the same thing collapse into one.
+    ///
+    /// The survivor is the freshest, because the browser sends them freshest
+    /// first and the freshest is the one the player is using now. That
+    /// matters: an undescribed row carries no quality to tell it apart, so
+    /// which one is kept is the whole of the choice being made for the
+    /// reader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_full_of_manifests_offers_one_row_for_the_freshest() {
+        // All refuse connections, so nothing can be described.
+        let streams: Vec<String> = (0..24)
+            .map(|n| format!("http://127.0.0.1:1/ad-{n}/master.m3u8"))
+            .collect();
+        assert!(
+            crate::stream::candidates(&streams).len() <= 8,
+            "a page should not get two dozen probes"
+        );
+
+        let request = crate::types::DownloadRequest {
+            streams: streams.clone(),
+            ..crate::types::DownloadRequest::from_url("https://feed.example/".to_owned())
+        };
+        let probe = stream_listing(&request).await;
+        assert_eq!(probe.formats.len(), 1, "{:?}", probe.formats);
+        assert_eq!(
+            probe.formats[0].url.as_deref(),
+            Some(streams[0].as_str()),
+            "the freshest manifest is the one the player is on"
+        );
+        assert!(probe.live);
     }
 
     /// The bug this guards: a forty-minute film offered as four seconds.

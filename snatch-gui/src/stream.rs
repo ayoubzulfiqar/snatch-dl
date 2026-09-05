@@ -48,12 +48,26 @@ use crate::network::{Engine, ProxyManager};
 use crate::processor::{Field, parse_progress_line};
 use crate::ytdlp::{VideoEvent, VideoProgress};
 
-/// How long ffprobe may spend inspecting one stream.
+/// How long ffprobe may spend inspecting one file.
 ///
-/// Several are inspected at once when a panel opens, and the whole answer has
-/// to reach the browser inside the thirty seconds `snatch-nmh` allows, so this
-/// is the budget for all of them together rather than for each in turn.
+/// Several are inspected at once when a panel opens, so this is the budget
+/// for all of them together rather than for each in turn. A file answers in
+/// well under a second; anything that cannot is not going to.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same, for a playlist, which legitimately takes far longer.
+///
+/// ffprobe has to fetch every variant listed in a master and enough of a
+/// segment from each to name its codec, and that is network time, not
+/// thinking time -- `-probesize` and `-analyzeduration` make no difference to
+/// it. Measured at 20 to 26 seconds against a live master with four
+/// renditions. The old ten-second budget cut that off every time, so a
+/// broadcast lost its quality list and, before the listing learned to offer
+/// an undescribed manifest anyway, lost the row with it.
+///
+/// One step of a chain the native host bounds at 90 seconds; see its
+/// `GUI_REPLY_TIMEOUT`.
+const PLAYLIST_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// How many recordings one batch may start.
 ///
@@ -475,7 +489,11 @@ pub async fn probe(url: &str, headers: &Headers) -> Result<StreamInfo> {
         Err(error) => return Err(error).context("could not start ffprobe"),
     };
 
-    let output = timeout(PROBE_TIMEOUT, child.wait_with_output())
+    let budget = match extension_of(url).as_deref() {
+        Some("m3u8" | "m3u" | "mpd") => PLAYLIST_PROBE_TIMEOUT,
+        _ => PROBE_TIMEOUT,
+    };
+    let output = timeout(budget, child.wait_with_output())
         .await
         .context("ffprobe took too long to read the stream")?
         .context("could not read ffprobe's answer")?;
@@ -630,7 +648,13 @@ async fn dash_liveness(url: &str, headers: &Headers) -> Option<(bool, Option<Dur
     Some((live, duration))
 }
 
-pub async fn describe_all(urls: &[String], headers: &Headers) -> Vec<(String, StreamInfo)> {
+/// The addresses [`describe_all`] will actually look at.
+///
+/// Deduplicated, validated and capped. Exposed because the caller has to know
+/// which addresses were *considered* as well as which could be described: one
+/// that ffprobe could not read is still worth offering, and one that was
+/// never reached is not.
+pub fn candidates(urls: &[String]) -> Vec<String> {
     let mut wanted: Vec<String> = Vec::new();
     for url in urls {
         let url = url.trim();
@@ -645,6 +669,11 @@ pub async fn describe_all(urls: &[String], headers: &Headers) -> Vec<(String, St
             break;
         }
     }
+    wanted
+}
+
+pub async fn describe_all(urls: &[String], headers: &Headers) -> Vec<(String, StreamInfo)> {
+    let wanted = candidates(urls);
 
     let probes = wanted.into_iter().map(|url| async move {
         match probe(&url, headers).await {

@@ -919,7 +919,7 @@ pub fn destination_for(base: &Path) -> PathBuf {
 /// host its own budget on top. A probe that outlives either turns into a
 /// mystery timeout in the page, so it is cut short here, where the reason can
 /// still be reported.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A listing larger than this is not a video page. Real ones are ~150 KiB.
 const MAX_PROBE_BYTES: usize = 32 * 1024 * 1024;
