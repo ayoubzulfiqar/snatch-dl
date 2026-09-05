@@ -553,10 +553,11 @@ The window and the engines run apart. That is why the window never freezes
 while four downloads are going.
 
 **Building it yourself** needs Rust, the GTK4 and libadwaita headers, a C
-compiler and **cmake**. The last two are for the parts written in C that get
-built from source: the database, and the TLS that lets Snatch present itself
-as a browser. On Arch that is `base-devel` plus `cmake`; on Debian and Ubuntu
-`build-essential cmake`; on Fedora `gcc-c++ cmake`.
+compiler, **cmake** and **clang**. Those last three are for the parts written
+in C that get built from source: the database, and the TLS that lets Snatch
+present itself as a browser. On Arch that is `base-devel` plus `cmake clang`;
+on Debian and Ubuntu `build-essential cmake clang`; on Fedora
+`gcc-c++ cmake clang`.
 
 Reading the source? [CONTRIBUTING.md](CONTRIBUTING.md) explains the parts
 that look wrong but are not.

@@ -15,8 +15,10 @@ optdepends=(
   'wget2: grabbing a whole site recursively'
   'p7zip: unpacking downloaded archives'
 )
-# cmake builds the BoringSSL that backs our TLS, and it is not in base-devel.
-makedepends=('cargo' 'pkgconf' 'cmake')
+# BoringSSL backs our TLS and is built from source: cmake compiles it and
+# clang provides the libclang that bindgen reads its headers with. Neither is
+# in base-devel.
+makedepends=('cargo' 'pkgconf' 'cmake' 'clang')
 # The release profile already strips symbols, so makepkg's debug package
 # would be an empty 6 KB file on the release page.
 options=('!lto' '!debug')
