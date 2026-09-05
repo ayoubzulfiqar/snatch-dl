@@ -32,6 +32,7 @@ mod processor;
 mod settings;
 mod sniff;
 mod stream;
+mod streamlink;
 mod torrent;
 mod types;
 mod ui;

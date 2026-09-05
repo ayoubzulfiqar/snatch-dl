@@ -89,6 +89,7 @@ Everything else is optional. Each one adds a feature:
 | `wget2` | Grabbing a whole site |
 | `7z` | Unpacking archives |
 | A JavaScript engine | The best sizes on YouTube and other sites that need it |
+| `streamlink` | Live broadcasts on Twitch, Kick and 130 other sites |
 
 Torrents need nothing extra. That part is built in.
 
@@ -102,6 +103,16 @@ so a computer with `node` on it still does it the old way: you may see only
 the smaller sizes, or no video sizes at all, or a download that fails on a
 video that plays fine in your browser. Snatch stops that happening. If you
 have none of them, it shows the one command to install one.
+
+**About `streamlink`.** `yt-dlp` is built to fetch a video that already
+exists. `streamlink` is built for the opposite: working out what a page is
+broadcasting *right now*. On Twitch, Kick and a lot of other live sites that
+is the difference between a channel Snatch can record and one it says has
+nothing on it.
+
+Snatch only uses it to find the stream. The recording is still the same
+recording, so the stop button and the timer work exactly as they always do.
+No distribution packages it, so Snatch shows `pipx install streamlink`.
 
 Missed some? Open **Menu → Dependencies…**. It shows every tool and what it
 does. It installs `yt-dlp` and `gallery-dl` for you. For the rest it shows the

@@ -155,7 +155,25 @@ async fn accept_request(
                 Err(error) => error,
             };
 
-        log::info!("yt-dlp could not read {name} ({refused:#}); trying what the page loaded");
+        log::info!("yt-dlp could not read {name} ({refused:#}); asking streamlink");
+        // streamlink is the other way round from yt-dlp: it is built to work
+        // out what a page is broadcasting *now*, which is exactly the case
+        // yt-dlp is weakest on. Skipped in a moment when it is not installed
+        // or does not know the site, and never reported -- the reader is not
+        // told about a tool they do not have.
+        match crate::streamlink::resolve(&request.url, &headers, backend.proxies.as_ref()).await {
+            Ok(resolved) => {
+                log::info!(
+                    "streamlink's {} plugin found {} quality(ies) on {name}",
+                    resolved.plugin.as_deref().unwrap_or("?"),
+                    resolved.streams.len()
+                );
+                return Ok(IpcResponse::listing(broadcast_listing(resolved)));
+            }
+            Err(error) => log::info!("streamlink could not read {name} either: {error:#}"),
+        }
+
+        log::info!("trying what the page loaded for {name}");
         let probe = stream_listing(&request).await;
         if !probe.formats.is_empty() {
             log::info!(
@@ -345,6 +363,47 @@ fn stream_headers(request: &DownloadRequest) -> crate::stream::Headers {
         user_agent: request.user_agent.clone(),
         cookies: request.cookies.clone(),
         extra: request.extra_headers(),
+    }
+}
+
+/// Turn what streamlink resolved into picker rows.
+///
+/// Every one is a playlist to record, because that is what a broadcast is.
+/// No size and no duration: it has not finished happening, so there is
+/// nothing truthful to put there.
+fn broadcast_listing(resolved: crate::streamlink::Resolved) -> crate::ytdlp::MediaProbe {
+    use crate::ytdlp::{FormatSource, MediaFormat};
+
+    let formats = resolved
+        .streams
+        .into_iter()
+        .map(|stream| MediaFormat {
+            id: String::new(),
+            label: match (stream.height, stream.audio_only) {
+                (_, true) => "Audio only".to_owned(),
+                (Some(height), _) => format!("{height}p"),
+                // `source` on Twitch, and whatever a plugin calls its one
+                // quality. streamlink's own name beats inventing one.
+                (None, _) => stream.name.clone(),
+            },
+            // Stopping a recording has to leave a playable file, and only
+            // Matroska survives being cut off mid-write.
+            ext: "mkv".to_owned(),
+            size: None,
+            estimated: false,
+            height: stream.height,
+            audio_only: stream.audio_only,
+            source: FormatSource::Stream,
+            url: Some(stream.url),
+        })
+        .collect();
+
+    crate::ytdlp::MediaProbe {
+        title: resolved.title,
+        // A broadcast has no length until it ends.
+        duration: None,
+        live: true,
+        formats,
     }
 }
 

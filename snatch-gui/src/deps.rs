@@ -47,15 +47,25 @@ pub enum Tool {
     /// plays perfectly in the browser -- with nothing on screen to connect
     /// the two. Listing it here is the connection.
     JsRuntime,
+    /// Resolves a live broadcast on the sites yt-dlp is weakest on.
+    ///
+    /// yt-dlp is built for archival -- work out the file and fetch it.
+    /// streamlink is built for the opposite job: work out what a page is
+    /// broadcasting right now. On Twitch, Kick, chzzk, SOOP and a hundred
+    /// others that is the difference between a channel Snatch can record and
+    /// one it reports as having nothing on it. Only ever used as a resolver:
+    /// the recording is still ffmpeg's, so the stop button works the same.
+    Streamlink,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 5] = [
+    pub const ALL: [Tool; 6] = [
         Tool::Aria2,
         Tool::Ffmpeg,
         Tool::YtDlp,
         Tool::GalleryDl,
         Tool::JsRuntime,
+        Tool::Streamlink,
     ];
 
     pub fn binary(self) -> &'static str {
@@ -65,6 +75,7 @@ impl Tool {
             Tool::YtDlp => "yt-dlp",
             Tool::GalleryDl => "gallery-dl",
             Tool::JsRuntime => "deno",
+            Tool::Streamlink => "streamlink",
         }
     }
 
@@ -75,6 +86,7 @@ impl Tool {
             Tool::YtDlp => "yt-dlp",
             Tool::GalleryDl => "gallery-dl",
             Tool::JsRuntime => "JavaScript engine",
+            Tool::Streamlink => "Streamlink",
         }
     }
 
@@ -86,6 +98,7 @@ impl Tool {
             Tool::YtDlp => "site video extraction",
             Tool::GalleryDl => "gallery scraping",
             Tool::JsRuntime => "YouTube and the other sites that need JavaScript run",
+            Tool::Streamlink => "live broadcasts on Twitch, Kick and 130 other sites",
         }
     }
 
@@ -107,6 +120,7 @@ impl Tool {
             (Tool::YtDlp, _) => "yt-dlp",
             (Tool::GalleryDl, _) => "gallery-dl",
             (Tool::JsRuntime, _) => "deno",
+            (Tool::Streamlink, _) => "streamlink",
         }
     }
 
@@ -125,6 +139,7 @@ impl Tool {
                 Tool::YtDlp => &"yt-dlp",
                 Tool::GalleryDl => &"gallery-dl",
                 Tool::JsRuntime => &"deno",
+                Tool::Streamlink => &"streamlink",
             }),
         }
     }
@@ -133,7 +148,7 @@ impl Tool {
         match self {
             // aria2c and ffmpeg print a banner; the others print a bare version.
             Tool::Aria2 | Tool::Ffmpeg => &["--version"],
-            Tool::YtDlp | Tool::GalleryDl | Tool::JsRuntime => &["--version"],
+            Tool::YtDlp | Tool::GalleryDl | Tool::JsRuntime | Tool::Streamlink => &["--version"],
         }
     }
 }
@@ -204,6 +219,13 @@ impl ToolStatus {
         // well if one is already installed -- `candidates` finds it.
         if self.tool == Tool::JsRuntime {
             return Some("curl -fsSL https://deno.land/install.sh | sh".to_owned());
+        }
+        // Nor does any distribution package streamlink. pipx is the way its
+        // own documentation recommends, wants no root, and keeps it out of
+        // the system Python -- which modern distributions refuse to let pip
+        // write to anyway.
+        if self.tool == Tool::Streamlink {
+            return Some("pipx install streamlink".to_owned());
         }
         let prefix = distro.install_prefix()?;
         // Fedora keeps ffmpeg in RPM Fusion, so the bare command would fail
@@ -285,6 +307,8 @@ async fn probe_version(path: &Path, tool: Tool) -> Option<String> {
             .to_owned(),
         Tool::YtDlp | Tool::GalleryDl => first.to_owned(),
         // "deno 2.5.3", "v22.1.0" from node, "1.1.29" from bun.
+        // "streamlink 8.5.0"
+        Tool::Streamlink => first.split_whitespace().nth(1).unwrap_or(first).to_owned(),
         Tool::JsRuntime => first
             .split_whitespace()
             .find(|token| {
