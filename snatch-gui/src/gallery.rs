@@ -161,7 +161,7 @@ fn parse_stderr(line: &str) -> Line {
     // `[downloader.http][warning] '404 …' for '…'` / `[download][error] …`
     let lowered = trimmed.to_ascii_lowercase();
     if lowered.contains("[error]") {
-        return Line::Failed(strip_tags(trimmed));
+        return Line::Failed(crate::network::explain_failure(&strip_tags(trimmed)));
     }
     if lowered.contains("[warning]") {
         return Line::Warning(strip_tags(trimmed));
@@ -299,7 +299,17 @@ impl GalleryEngine {
             .arg(&config.destination)
             // Colours would corrupt the path lines we parse. gallery-dl already
             // suppresses them for a pipe, but a user config can force them on.
-            .arg("--no-colors");
+            .arg("--no-colors")
+            // gallery-dl gives up after four tries with no pause between
+            // them, which on a network that refuses connections at random is
+            // four failures in a row and a batch reported as broken. Ten
+            // tries with a growing gap rides that out; the gap is what makes
+            // it work, because the second try a millisecond later fails for
+            // the same reason the first did.
+            .arg("--retries")
+            .arg("10")
+            .arg("--sleep-retries")
+            .arg("2");
 
         if config.write_info_json {
             command.arg("--write-info-json");

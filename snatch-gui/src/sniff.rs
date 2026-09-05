@@ -399,6 +399,29 @@ fn extract_from_html(body: &str, page: &url::Url) -> (Option<String>, Vec<Candid
         // Lazy-loading sites keep the real URL out of src.
         ("img[data-src]", "data-src"),
         ("img[data-original]", "data-original"),
+        // The rest of the lazy-load vocabulary. There is no standard for it,
+        // so every framework picked its own name, and a page written against
+        // one of them looks empty to a scraper that knows only the other two.
+        // They cost one selector each.
+        ("[data-lazy-src]", "data-lazy-src"),
+        ("[data-lazy]", "data-lazy"),
+        ("[data-echo]", "data-echo"),
+        ("[data-full]", "data-full"),
+        ("[data-full-src]", "data-full-src"),
+        ("[data-large]", "data-large"),
+        ("[data-image]", "data-image"),
+        ("[data-thumb]", "data-thumb"),
+        ("[data-poster]", "data-poster"),
+        ("[data-video]", "data-video"),
+        ("[data-video-src]", "data-video-src"),
+        ("[data-mp4]", "data-mp4"),
+        ("[data-hls]", "data-hls"),
+        ("[data-dash]", "data-dash"),
+        ("[data-audio]", "data-audio"),
+        ("[data-file]", "data-file"),
+        // Microdata states outright which URL is the media.
+        (r#"meta[itemprop="contentUrl"]"#, "content"),
+        (r#"[itemprop="contentUrl"]"#, "href"),
         ("video[src]", "src"),
         ("video[poster]", "poster"),
         ("audio[src]", "src"),
@@ -495,6 +518,34 @@ fn extract_from_html(body: &str, page: &url::Url) -> (Option<String>, Vec<Candid
         push(raw, url_basename(raw), Origin::Metadata, &mut candidates);
     }
 
+    // schema.org, which is where a video page states its own media outright.
+    //
+    // A VideoObject carries `contentUrl` -- the file itself -- and usually
+    // `embedUrl` and `thumbnailUrl` beside it. Sites publish this for search
+    // engines, so it is kept accurate, and it is present on pages whose
+    // player is otherwise entirely JavaScript and invisible to a scraper.
+    // The shape varies -- one object, a list, or a `@graph` -- so this walks
+    // whatever is there rather than reaching for a fixed path.
+    for element in select(&document, r#"script[type="application/ld+json"]"#) {
+        let text = element.text().collect::<String>();
+        if text.len() > 512 * 1024 {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        collect_linked_data(&value, &mut found, 0);
+        for raw in found {
+            push(
+                &raw,
+                title.clone().unwrap_or_else(|| url_basename(&raw)),
+                Origin::Metadata,
+                &mut candidates,
+            );
+        }
+    }
+
     // CSS background images in inline styles.
     for element in select(&document, "[style]") {
         let Some(style) = element.attr("style") else {
@@ -512,6 +563,67 @@ fn extract_from_html(body: &str, page: &url::Url) -> (Option<String>, Vec<Candid
 ///
 /// The selectors here are literals, so a failure is a programming error rather
 /// than something a page can cause; log it and carry on rather than abort.
+/// The media addresses inside a block of JSON-LD.
+///
+/// Only the keys that name a file are followed: a VideoObject also carries
+/// author URLs, a licence URL and a publisher's logo, and offering those as
+/// downloads would bury the video in noise.
+fn collect_linked_data(value: &serde_json::Value, found: &mut Vec<String>, depth: usize) {
+    const MEDIA_KEYS: [&str; 6] = [
+        "contenturl",
+        "embedurl",
+        "thumbnailurl",
+        "image",
+        "audio",
+        "video",
+    ];
+    // A page can nest `@graph` inside `@graph`. Deep enough for any of them,
+    // and shallow enough that a hostile page cannot spend the stack.
+    if depth > 12 {
+        return;
+    }
+    let keep = |text: &str, found: &mut Vec<String>| {
+        let text = text.trim();
+        if text.starts_with("http") && !found.iter().any(|seen| seen == text) {
+            found.push(text.to_owned());
+        }
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_linked_data(item, found, depth + 1);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, child) in fields {
+                let named = MEDIA_KEYS.contains(&key.to_ascii_lowercase().as_str());
+                match child {
+                    // "contentUrl": "https://..."
+                    serde_json::Value::String(text) if named => keep(text, found),
+                    // "image": { "@type": "ImageObject", "url": "https://..." }
+                    serde_json::Value::Object(inner) if named => {
+                        if let Some(serde_json::Value::String(text)) = inner.get("url") {
+                            keep(text, found);
+                        }
+                        collect_linked_data(child, found, depth + 1);
+                    }
+                    // "image": ["https://a", "https://b"]
+                    serde_json::Value::Array(items) if named => {
+                        for item in items {
+                            match item {
+                                serde_json::Value::String(text) => keep(text, found),
+                                other => collect_linked_data(other, found, depth + 1),
+                            }
+                        }
+                    }
+                    other => collect_linked_data(other, found, depth + 1),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn select<'a>(
     document: &'a Html,
     selector: &str,
@@ -781,6 +893,64 @@ mod tests {
 
     fn urls(candidates: &[Candidate]) -> Vec<&str> {
         candidates.iter().map(|c| c.url.as_str()).collect()
+    }
+
+    /// A page whose player is entirely JavaScript still says what it holds.
+    ///
+    /// The markup here has no `<video>` at all -- the player is built at
+    /// runtime -- which is the shape of most news video and a good deal of
+    /// social media. What it does have is the block the site publishes for
+    /// search engines, and that names the file outright.
+    #[test]
+    fn finds_the_video_a_page_only_declares_in_json_ld() {
+        let (_, found) = page(
+            r#"<html><head><title>Report</title>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org","@graph":[
+              {"@type":"WebPage","url":"https://example.com/x"},
+              {"@type":"VideoObject",
+               "name":"The report",
+               "contentUrl":"https://cdn.example.com/report-1080.mp4",
+               "embedUrl":"https://example.com/embed/9f8a",
+               "thumbnailUrl":["https://cdn.example.com/thumb-a.jpg"],
+               "image":{"@type":"ImageObject","url":"https://cdn.example.com/poster.jpg"},
+               "author":{"@type":"Person","url":"https://example.com/staff/jo"}}
+            ]}
+            </script></head><body>nothing to see</body></html>"#,
+        );
+        let addresses = urls(&found);
+        assert!(addresses.contains(&"https://cdn.example.com/report-1080.mp4"));
+        assert!(addresses.contains(&"https://example.com/embed/9f8a"));
+        assert!(addresses.contains(&"https://cdn.example.com/thumb-a.jpg"));
+        assert!(addresses.contains(&"https://cdn.example.com/poster.jpg"));
+        // The author's page is a URL in the same block and is not media.
+        assert!(!addresses.contains(&"https://example.com/staff/jo"));
+    }
+
+    #[test]
+    fn a_broken_json_ld_block_costs_nothing() {
+        // Sites ship invalid JSON here more often than anyone would like.
+        let (_, found) = page(
+            r#"<html><body><script type="application/ld+json">{ oh dear </script>
+            <img src="real.jpg"></body></html>"#,
+        );
+        assert_eq!(urls(&found), vec!["https://example.com/gallery/real.jpg"]);
+    }
+
+    #[test]
+    fn lazy_loaded_images_are_not_invisible() {
+        // Four frameworks, four attribute names, one page.
+        let (_, found) = page(
+            r#"<html><body>
+            <img data-lazy-src="a.jpg"><div data-image="b.jpg"></div>
+            <span data-thumb="c.jpg"></span><i data-full="d.jpg"></i>
+            </body></html>"#,
+        );
+        let addresses = urls(&found);
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            let want = format!("https://example.com/gallery/{name}");
+            assert!(addresses.contains(&want.as_str()), "{name} was missed");
+        }
     }
 
     #[test]

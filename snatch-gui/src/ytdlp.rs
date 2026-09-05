@@ -82,6 +82,79 @@ fn apply_headers(command: &mut Command, headers: &crate::stream::Headers) {
     }
 }
 
+/// Keep going when the network is unreliable, and say so when it is not.
+///
+/// yt-dlp's own defaults assume a good connection. Two of them are actively
+/// wrong on a bad one:
+///
+/// * there is no socket timeout at all, so a connection that is cut without
+///   being closed hangs until the operating system gives up, which is minutes;
+/// * unavailable fragments are *skipped* by default, so a video that lost a
+///   dozen pieces on the way down is written out short and reported as a
+///   success. That is the download that arrives as a few seconds of a long
+///   film, with nothing on screen to say why.
+///
+/// So: retry hard, back off between tries, and if a fragment is still
+/// unreachable after all of that, fail loudly instead of quietly handing over
+/// a broken file. Retrying is what makes the difference on a network that
+/// refuses connections at random -- and the numbers here are sized for one,
+/// not for a good line.
+fn apply_resilience(command: &mut Command) {
+    command
+        // A cut connection is noticed in twenty seconds rather than minutes.
+        .arg("--socket-timeout")
+        .arg("20")
+        .arg("--retries")
+        .arg("10")
+        .arg("--fragment-retries")
+        .arg("10")
+        .arg("--extractor-retries")
+        .arg("3")
+        .arg("--file-access-retries")
+        .arg("3")
+        // 1s, 3s, 5s ... rather than hammering a host that just refused.
+        .arg("--retry-sleep")
+        .arg("linear=1::2")
+        .arg("--retry-sleep")
+        .arg("fragment:linear=1::2")
+        // A missing piece is a broken file. Better to say so.
+        .arg("--abort-on-unavailable-fragments")
+        // Four pieces at a time. yt-dlp fetches one at a time by default,
+        // which on a fragmented stream is most of the wait.
+        .arg("--concurrent-fragments")
+        .arg("4");
+}
+
+/// The JavaScript engines yt-dlp knows how to drive, best first.
+///
+/// This is yt-dlp's own order of preference, not ours.
+const JS_RUNTIMES: [&str; 4] = ["deno", "node", "quickjs", "bun"];
+
+/// Let yt-dlp run a site's player code, using whichever engine is installed.
+///
+/// yt-dlp enables only `deno` by default. Everything else it supports it will
+/// happily use, but only when told to -- so a machine with `node` on it, which
+/// is most of them, still extracts YouTube the deprecated way and warns that
+/// "some formats may be missing". That is a listing with no video in it, or a
+/// download that fails on a page which plays fine in the browser.
+///
+/// Naming every engine that is actually here costs nothing and asks the user
+/// to install nothing. yt-dlp picks its favourite from the ones it is given.
+fn apply_js_runtime(command: &mut Command) {
+    for runtime in JS_RUNTIMES {
+        if let Some(path) = crate::deps::which(runtime) {
+            // With the path attached, a runtime outside PATH -- a `bun` under
+            // ~/.bun, say -- is still found when yt-dlp goes looking.
+            match path.to_str() {
+                Some(path) => command
+                    .arg("--js-runtimes")
+                    .arg(format!("{runtime}:{path}")),
+                None => command.arg("--js-runtimes").arg(runtime),
+            };
+        }
+    }
+}
+
 /// A header value safe to put in an argument. These arrive from a web page.
 fn clean_header(value: Option<&str>) -> Option<&str> {
     let value = value.map(str::trim).filter(|value| !value.is_empty())?;
@@ -327,7 +400,9 @@ fn parse_line(line: &str) -> Line {
     }
 
     if trimmed.starts_with("ERROR:") {
-        return Line::Error(trimmed.trim_start_matches("ERROR:").trim().to_owned());
+        return Line::Error(crate::network::explain_failure(
+            trimmed.trim_start_matches("ERROR:").trim(),
+        ));
     }
 
     Line::Ignored
@@ -684,6 +759,8 @@ impl VideoEngine {
             "--no-playlist"
         });
         apply_headers(&mut command, &config.headers);
+        apply_js_runtime(&mut command);
+        apply_resilience(&mut command);
 
         let task_key = format!("video:{job_id}");
         if let Some(proxy) = proxies
@@ -842,7 +919,7 @@ pub fn destination_for(base: &Path) -> PathBuf {
 /// host its own budget on top. A probe that outlives either turns into a
 /// mystery timeout in the page, so it is cut short here, where the reason can
 /// still be reported.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A listing larger than this is not a video page. Real ones are ~150 KiB.
 const MAX_PROBE_BYTES: usize = 32 * 1024 * 1024;
@@ -1375,6 +1452,18 @@ pub async fn probe(
         .arg("--no-colors")
         .arg("--no-progress");
     apply_headers(&mut command, headers);
+    apply_js_runtime(&mut command);
+    // Lighter than a download's: someone is watching a spinner, and the whole
+    // probe is abandoned at PROBE_TIMEOUT regardless.
+    command
+        .arg("--socket-timeout")
+        .arg("10")
+        .arg("--retries")
+        .arg("3")
+        .arg("--extractor-retries")
+        .arg("2")
+        .arg("--retry-sleep")
+        .arg("linear=1::2");
 
     if let Some(proxy) = proxies
         .resolve_for("video-probe", Engine::Subprocess)
@@ -1438,6 +1527,37 @@ mod tests {
     use super::*;
 
     // Fixtures below are literal lines captured from yt-dlp 2026.08.19.
+
+    /// yt-dlp enables only Deno on its own.
+    ///
+    /// Measured against yt-dlp 2026.08.19 on a machine with node but no deno:
+    /// without this flag it warns "No supported JavaScript runtime could be
+    /// found ... some formats may be missing", falls back to the visionos
+    /// player, and on some videos gives up with "This video is unavailable".
+    /// With `--js-runtimes node` the warning and the fallback both go away.
+    #[test]
+    fn every_javascript_engine_on_the_machine_is_offered_to_yt_dlp() {
+        let mut command = Command::new("yt-dlp");
+        apply_js_runtime(&mut command);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        // Whatever this machine has, each one is named with its path, and
+        // never named without the flag that introduces it.
+        for (flag, value) in args.chunks(2).map(|pair| (&pair[0], &pair[1])) {
+            assert_eq!(flag, "--js-runtimes");
+            let (name, path) = value.split_once(':').unwrap_or((value, ""));
+            assert!(
+                JS_RUNTIMES.contains(&name),
+                "{name} is not an engine yt-dlp drives"
+            );
+            assert!(path.starts_with('/'), "{value} should carry a real path");
+        }
+        assert_eq!(args.len() % 2, 0, "a flag was left without its value");
+    }
 
     #[test]
     fn reads_a_progress_tick() {

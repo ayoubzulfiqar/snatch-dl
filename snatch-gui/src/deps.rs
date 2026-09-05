@@ -37,14 +37,16 @@ pub enum Tool {
     GalleryDl,
     /// A JavaScript engine for yt-dlp to run a site's own player code in.
     ///
-    /// Not something Snatch calls. yt-dlp looks for it, and since 2025 says
-    /// so plainly: "YouTube extraction without a JS runtime has been
-    /// deprecated, and some formats may be missing". What that looks like
-    /// from the outside is a video that offers only low qualities, or a
-    /// download that fails on a site which plays perfectly in the browser --
-    /// with nothing on screen to connect the two. Listing it here is the
-    /// connection.
-    Deno,
+    /// Not something Snatch runs itself: it names whichever engine is
+    /// installed to yt-dlp, which drives it. yt-dlp enables only Deno on its
+    /// own, so a machine with node on it still extracts the deprecated way
+    /// unless it is told -- and says so: "YouTube extraction without a JS
+    /// runtime has been deprecated, and some formats may be missing". What
+    /// that looks like from the outside is a video that offers only low
+    /// qualities or no video at all, or a download that fails on a site which
+    /// plays perfectly in the browser -- with nothing on screen to connect
+    /// the two. Listing it here is the connection.
+    JsRuntime,
 }
 
 impl Tool {
@@ -53,7 +55,7 @@ impl Tool {
         Tool::Ffmpeg,
         Tool::YtDlp,
         Tool::GalleryDl,
-        Tool::Deno,
+        Tool::JsRuntime,
     ];
 
     pub fn binary(self) -> &'static str {
@@ -62,7 +64,7 @@ impl Tool {
             Tool::Ffmpeg => "ffmpeg",
             Tool::YtDlp => "yt-dlp",
             Tool::GalleryDl => "gallery-dl",
-            Tool::Deno => "deno",
+            Tool::JsRuntime => "deno",
         }
     }
 
@@ -72,7 +74,7 @@ impl Tool {
             Tool::Ffmpeg => "FFmpeg",
             Tool::YtDlp => "yt-dlp",
             Tool::GalleryDl => "gallery-dl",
-            Tool::Deno => "Deno",
+            Tool::JsRuntime => "JavaScript engine",
         }
     }
 
@@ -83,7 +85,7 @@ impl Tool {
             Tool::Ffmpeg => "converting, trimming and extracting audio",
             Tool::YtDlp => "site video extraction",
             Tool::GalleryDl => "gallery scraping",
-            Tool::Deno => "YouTube and the other sites that need JavaScript run",
+            Tool::JsRuntime => "YouTube and the other sites that need JavaScript run",
         }
     }
 
@@ -104,7 +106,26 @@ impl Tool {
             (Tool::Ffmpeg, _) => "ffmpeg",
             (Tool::YtDlp, _) => "yt-dlp",
             (Tool::GalleryDl, _) => "gallery-dl",
-            (Tool::Deno, _) => "deno",
+            (Tool::JsRuntime, _) => "deno",
+        }
+    }
+
+    /// Every binary that satisfies this tool, best first.
+    ///
+    /// Only the JavaScript engine has more than one: yt-dlp drives four, and
+    /// any of them does the job. Reporting "Deno: missing" on a machine with
+    /// node on it would send the reader off to install something they do not
+    /// need.
+    pub fn candidates(self) -> &'static [&'static str] {
+        match self {
+            Tool::JsRuntime => &["deno", "node", "quickjs", "bun"],
+            other => std::slice::from_ref(match other {
+                Tool::Aria2 => &"aria2c",
+                Tool::Ffmpeg => &"ffmpeg",
+                Tool::YtDlp => &"yt-dlp",
+                Tool::GalleryDl => &"gallery-dl",
+                Tool::JsRuntime => &"deno",
+            }),
         }
     }
 
@@ -112,7 +133,7 @@ impl Tool {
         match self {
             // aria2c and ffmpeg print a banner; the others print a bare version.
             Tool::Aria2 | Tool::Ffmpeg => &["--version"],
-            Tool::YtDlp | Tool::GalleryDl | Tool::Deno => &["--version"],
+            Tool::YtDlp | Tool::GalleryDl | Tool::JsRuntime => &["--version"],
         }
     }
 }
@@ -175,11 +196,13 @@ impl ToolStatus {
 
     /// The command a user must run themselves, when root is required.
     pub fn manual_command(&self, distro: Distro) -> Option<String> {
-        // Deno is not in most distributions' repositories, so the ordinary
-        // "install this package" line would fail with "no match" on Fedora
-        // and Debian both. Upstream's own installer works everywhere and
-        // wants no root, so it is offered instead of a command that does not.
-        if self.tool == Tool::Deno {
+        // No JavaScript engine yt-dlp likes is in most distributions'
+        // repositories, so the ordinary "install this package" line would
+        // fail with "no match" on Fedora and Debian both. Deno's own
+        // installer works everywhere and wants no root, so it is offered
+        // instead of a command that does not. Node satisfies this just as
+        // well if one is already installed -- `candidates` finds it.
+        if self.tool == Tool::JsRuntime {
             return Some("curl -fsSL https://deno.land/install.sh | sh".to_owned());
         }
         let prefix = distro.install_prefix()?;
@@ -218,11 +241,16 @@ fn is_executable(path: &Path) -> bool {
 /// Engines call this so a self-installed binary is picked up without the user
 /// having to touch `PATH`.
 pub fn resolve(tool: Tool, managed_dir: &Path) -> Option<PathBuf> {
-    let managed = managed_dir.join(tool.binary());
-    if is_executable(&managed) {
-        return Some(managed);
+    for candidate in tool.candidates() {
+        let managed = managed_dir.join(candidate);
+        if is_executable(&managed) {
+            return Some(managed);
+        }
+        if let Some(found) = which(candidate) {
+            return Some(found);
+        }
     }
-    which(tool.binary())
+    None
 }
 
 /// Ask a tool for its version, briefly.
@@ -256,8 +284,16 @@ async fn probe_version(path: &Path, tool: Tool) -> Option<String> {
             .trim_end_matches(',')
             .to_owned(),
         Tool::YtDlp | Tool::GalleryDl => first.to_owned(),
-        // "deno 2.5.3"
-        Tool::Deno => first.split_whitespace().nth(1).unwrap_or(first).to_owned(),
+        // "deno 2.5.3", "v22.1.0" from node, "1.1.29" from bun.
+        Tool::JsRuntime => first
+            .split_whitespace()
+            .find(|token| {
+                token
+                    .trim_start_matches('v')
+                    .starts_with(|c: char| c.is_ascii_digit())
+            })
+            .unwrap_or(first)
+            .to_owned(),
     })
 }
 

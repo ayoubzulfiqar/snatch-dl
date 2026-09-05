@@ -96,6 +96,53 @@ impl fmt::Display for ProxyScheme {
     }
 }
 
+/// What a cut-off connection says, in each engine's own words.
+///
+/// All of these mean the same thing and none of them say it.
+const CUT_OFF: [&str; 8] = [
+    "connection reset by peer",
+    "connectionreseterror",
+    "econnreset",
+    "handshake failure",
+    "handshake failed",
+    "ssl/tls handshake",
+    "tlsv1_alert",
+    "sslv3_alert_handshake_failure",
+];
+
+/// Say so when a connection was cut on the way out rather than refused by the
+/// site.
+///
+/// A blocked site does not look blocked from inside a download. The name
+/// resolves, the connection opens, and then it is cut in the middle of the
+/// handshake -- so every engine reports it in its own words and none of them
+/// report the useful part. gallery-dl says `ConnectionResetError(104)`, aria2
+/// says "SSL/TLS handshake failure", ffmpeg says the pull function failed.
+/// The reader is left thinking the file is gone, when the file is fine.
+///
+/// Deliberately not called a block. This cannot tell a filtered network from
+/// a flaky one, and saying which would be a guess; what it can say is that
+/// the failure has the shape of a cut connection, and what to try next.
+pub fn cut_off_hint(message: &str) -> Option<&'static str> {
+    let lowered = message.to_ascii_lowercase();
+    CUT_OFF
+        .iter()
+        .any(|marker| lowered.contains(marker))
+        .then_some(
+            "the connection was cut while it was still being set up, so this is not the site \
+             saying no -- something on the network in between dropped it. A proxy or VPN in \
+             Settings gets past that.",
+        )
+}
+
+/// Add the hint to a failure message when it fits, and leave it alone if not.
+pub fn explain_failure(message: &str) -> String {
+    match cut_off_hint(message) {
+        Some(hint) => format!("{}: {hint}", message.trim_end_matches(['.', ' '])),
+        None => message.to_owned(),
+    }
+}
+
 /// One configured proxy server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyEndpoint {

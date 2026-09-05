@@ -652,6 +652,94 @@ pub fn extension_of(url: &str) -> Option<String> {
     Some(extension.to_ascii_lowercase())
 }
 
+/// Query parameters a player adds to ask for one slice of a file.
+///
+/// `range` is the slice itself; `rn` and `rbuf` are the bookkeeping that goes
+/// with it. None of them describe a different file, so dropping all three
+/// turns "the first half megabyte" back into "the file".
+const SLICE_PARAMETERS: [&str; 3] = ["range", "rn", "rbuf"];
+
+/// File extensions that only ever hold one piece of a stream.
+const FRAGMENT_EXTENSIONS: [&str; 4] = ["m4s", "cmfv", "cmfa", "fmp4"];
+
+/// One piece of a stream, rather than a file worth downloading.
+///
+/// A page plays a long video by fetching hundreds of these, and every one of
+/// them looks exactly like a small video from the outside: ffprobe opens it,
+/// reports a resolution and a codec, and gives no hint that the rest of the
+/// film is somewhere else. Offering one is how a forty-minute film arrives as
+/// four seconds. The manifest is the right answer for these, and the browser
+/// hands that over separately.
+pub fn is_fragment(url: &str) -> bool {
+    if matches!(extension_of(url).as_deref(), Some(extension)
+        if FRAGMENT_EXTENSIONS.contains(&extension))
+    {
+        return true;
+    }
+    // A sequence number names one piece of a live stream, and there is no
+    // whole file behind it to ask for instead. Digits only, because `sq` is
+    // also an ordinary word: plenty of sites use it for a search query.
+    query_of(url).is_some_and(|query| {
+        parameters(query).any(|(name, value)| {
+            name.eq_ignore_ascii_case("sq")
+                && !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+        })
+    })
+}
+
+/// The whole file that a byte-range address is one slice of.
+///
+/// `range=` is not a fragment scheme. It is the same file, asked for a piece
+/// at a time, so the whole thing is still there behind the same address once
+/// the parameter naming the piece is gone. `None` when the address was
+/// already asking for all of it.
+pub fn whole_file(url: &str) -> Option<String> {
+    let (head, query) = url.split_once('?')?;
+    let (query, tail) = match query.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (query, None),
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            !SLICE_PARAMETERS
+                .iter()
+                .any(|slice| name.eq_ignore_ascii_case(slice))
+        })
+        .collect();
+    if kept.len() == query.split('&').filter(|pair| !pair.is_empty()).count() {
+        return None;
+    }
+    let mut whole = String::with_capacity(url.len());
+    whole.push_str(head);
+    if !kept.is_empty() {
+        whole.push('?');
+        whole.push_str(&kept.join("&"));
+    }
+    if let Some(tail) = tail {
+        whole.push('#');
+        whole.push_str(tail);
+    }
+    Some(whole)
+}
+
+/// The query string, without the `?` and without any `#fragment` after it.
+fn query_of(url: &str) -> Option<&str> {
+    let (_, query) = url.split_once('?')?;
+    Some(query.split('#').next().unwrap_or(query))
+}
+
+/// The `name=value` pairs of a query string, undecoded.
+fn parameters(query: &str) -> impl Iterator<Item = (&str, &str)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+}
+
 /// "3 minutes", "2 hours" -- enough for a row that is only counting down.
 fn human_wait(wait: Duration) -> String {
     let seconds = wait.as_secs();

@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 3.7.2</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 4.6.9</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_3.7.2-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-3.7.2-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-3.7.2-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_4.6.9-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-4.6.9-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-4.6.9-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -88,15 +88,20 @@ Everything else is optional. Each one adds a feature:
 | `gallery-dl` | Downloading image galleries |
 | `wget2` | Grabbing a whole site |
 | `7z` | Unpacking archives |
-| `deno` | The best sizes on YouTube and other sites that need it |
+| A JavaScript engine | The best sizes on YouTube and other sites that need it |
 
 Torrents need nothing extra. That part is built in.
 
-**About `deno`.** Some sites, YouTube among them, hide their video behind
-JavaScript that has to be run to get at it. `yt-dlp` needs a JavaScript engine
-for that, and `deno` is the one it looks for. Without it you may see only the
-smaller sizes, or a download that fails on a video that plays fine in your
-browser. Snatch shows the one command to install it.
+**About the JavaScript engine.** Some sites, YouTube among them, hide their
+video behind JavaScript that has to be run to get at it. `yt-dlp` needs an
+engine for that. Any one of `deno`, `node`, `quickjs` or `bun` will do, and
+Snatch hands `yt-dlp` whichever one you already have.
+
+This matters more than it sounds. On its own `yt-dlp` looks only for `deno`,
+so a computer with `node` on it still does it the old way: you may see only
+the smaller sizes, or no video sizes at all, or a download that fails on a
+video that plays fine in your browser. Snatch stops that happening. If you
+have none of them, it shows the one command to install one.
 
 Missed some? Open **Menu → Dependencies…**. It shows every tool and what it
 does. It installs `yt-dlp` and `gallery-dl` for you. For the rest it shows the
@@ -391,6 +396,35 @@ file is how Snatch resumes after a crash. It goes away when the download ends.
 
 Do not want them? Turn off **Write resume data while downloading** in Settings.
 You lose crash resume.
+
+---
+
+## When the network fights back
+
+Some networks cut connections instead of refusing them. The name looks up
+fine, the connection opens, and then it dies in the middle. Every tool
+reports that in its own words, and none of them say the useful part.
+
+Snatch handles it in three ways:
+
+- **It keeps trying.** Ten goes at a file and ten at each piece of a video,
+  with a growing pause between them. A pause matters: trying again a
+  millisecond later fails for the same reason it failed the first time.
+- **It never hands you half a file quietly.** `yt-dlp` skips pieces it cannot
+  get and calls that a success, which is how a forty-minute film arrives as
+  four seconds. Snatch turns that off. A missing piece is an error you can
+  see, not a broken file you find out about later.
+- **It says what happened.** A cut connection now reads as a cut connection,
+  with what to try next, instead of `SSL/TLS handshake failure`.
+
+If a site still will not load, try it in your browser first. If the browser
+cannot reach it either, the problem is not Snatch, and a proxy is the answer.
+
+**A warning about DPI bypass tools.** If you run one of these -- zapret,
+GoodbyeDPI, ByeDPI -- and downloads start failing on sites that used to work,
+turn it off and try again before blaming anything else. These tools work by
+sending deliberately malformed packets, and some of them make certain servers
+hang up on you. Test with it off. Then test with it on.
 
 ---
 

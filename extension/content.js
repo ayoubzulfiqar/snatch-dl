@@ -45,6 +45,11 @@
   /** Below this a "video" is an advert, an emoji or a tracking pixel. */
   const MIN_WIDTH = 240;
   const MIN_HEIGHT = 140;
+  /** A sound-only player is a control bar, not a picture. */
+  const MIN_AUDIO_WIDTH = 120;
+  const MIN_AUDIO_HEIGHT = 16;
+  /** How many shadow roots deep to keep looking for the media element. */
+  const SHADOW_DEPTH = 8;
   /** A hit test per pointer move would be wasteful; eight a second is plenty. */
   const POINTER_INTERVAL_MS = 120;
   /** Grace period so the pointer can travel from the video to the pill. */
@@ -252,6 +257,13 @@
       return false;
     }
     const rect = candidate.getBoundingClientRect();
+    // A player with sound and no picture is a few pixels tall by design, so
+    // the size that tells a real video from a tracking pixel would throw
+    // every podcast and every preview clip away. It still has to be wide
+    // enough to be a control bar rather than a hidden element.
+    if (candidate instanceof HTMLAudioElement) {
+      return rect.width >= MIN_AUDIO_WIDTH && rect.height >= MIN_AUDIO_HEIGHT;
+    }
     return rect.width >= MIN_WIDTH && rect.height >= MIN_HEIGHT;
   }
 
@@ -269,8 +281,47 @@
       return video;
     }
     for (const element of stack) {
-      if (element instanceof HTMLVideoElement) {
-        return element;
+      const found = mediaWithin(element, x, y, 0);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The media element painted at this point, looking inside shadow roots.
+   *
+   * A player built as a web component keeps its `<video>` in a shadow root,
+   * and `elementsFromPoint` stops at the boundary: the stack holds the
+   * component and nothing from inside it. A shadow root can hit-test the same
+   * point itself, so this carries on from there, one boundary at a time.
+   *
+   * Only open roots can be entered. A closed one hands out no reference, by
+   * design, and that is the page's decision to make.
+   */
+  function mediaWithin(element, x, y, depth) {
+    if (element instanceof HTMLMediaElement) {
+      return element;
+    }
+    if (depth >= SHADOW_DEPTH || !element || !element.shadowRoot) {
+      return null;
+    }
+    let inside;
+    try {
+      inside = element.shadowRoot.elementsFromPoint(x, y);
+    } catch (error) {
+      return null;
+    }
+    for (const child of inside || []) {
+      // The root hands back the host itself as the outermost hit; following
+      // that would recurse on the element we are already inside.
+      if (child === element) {
+        continue;
+      }
+      const found = mediaWithin(child, x, y, depth + 1);
+      if (found) {
+        return found;
       }
     }
     return null;
@@ -720,11 +771,13 @@
       hide(true);
       return;
     }
-    const rect = video.getBoundingClientRect();
-    if (rect.width < MIN_WIDTH || rect.height < MIN_HEIGHT) {
+    // The same gate the candidate passed to get here, so a sound-only
+    // player does not qualify and then have its pill hidden every frame.
+    if (!isWorthwhile(video)) {
       hide(true);
       return;
     }
+    const rect = video.getBoundingClientRect();
 
     const width = pill.offsetWidth || 170;
     const height = pill.offsetHeight || 32;

@@ -78,11 +78,25 @@ const MANIFEST_TYPES = new Set([
   "video/vnd.mpeg.dash.mpd"
 ]);
 
-/** Whole media files, for the sites that just serve one. */
+/**
+ * Whole media files, for the sites that just serve one.
+ *
+ * Everything ffmpeg can open and aria2 can fetch, not only the handful the
+ * modern web uses: an archive of lecture recordings is .wmv, a fan site is
+ * .rmvb, a podcast back catalogue is .oga, and a downloader that only knows
+ * .mp4 walks past all of them. Nothing here is offered without ffprobe
+ * opening it first, so a wrong guess costs a second, not a bad file.
+ */
 const MEDIA_EXTENSIONS = new Set([
-  "mp4", "webm", "m4v", "mov", "mkv", "avi", "flv", "3gp", "ogv",
-  "ts", "mts", "m2ts",
-  "m4a", "mp3", "aac", "flac", "wav", "ogg", "opus", "m4b"
+  // Video containers.
+  "mp4", "webm", "m4v", "mov", "mkv", "avi", "flv", "3gp", "3g2", "ogv",
+  "ts", "mts", "m2ts", "mpg", "mpeg", "m2v", "mpv", "wmv", "asf", "f4v",
+  "vob", "divx", "rm", "rmvb", "mxf", "y4m", "qt", "amv",
+  // Audio containers.
+  "m4a", "mp3", "aac", "flac", "wav", "ogg", "opus", "m4b", "m4r",
+  "wma", "weba", "oga", "spx", "aiff", "aif", "aifc", "caf", "ape",
+  "wv", "mka", "dsf", "dff", "amr", "ac3", "eac3", "dts", "mp2", "mpa",
+  "au", "ra", "tta", "shn", "voc", "w64", "gsm"
 ]);
 
 /**
@@ -520,6 +534,66 @@ function extensionOf(url) {
  * a media file; the manifest is already the better answer for that page, so
  * there is nothing to gain by listing its pieces.
  */
+/**
+ * Query parameters a player adds to ask for one slice of a file.
+ *
+ * `range` is the slice; `rn` and `rbuf` are the bookkeeping beside it. None
+ * of them name a different file, so dropping them turns "the first half
+ * megabyte of the film" back into "the film".
+ */
+const SLICE_PARAMETERS = new Set(["range", "rn", "rbuf"]);
+
+/**
+ * The whole file an address is one slice of.
+ *
+ * A page that streams asks for its video a slice at a time, so the same file
+ * goes past a hundred times under a hundred addresses. Trimming the slice off
+ * makes them one address again -- which is both the right thing to download
+ * and the difference between remembering one file and filling the list with
+ * a hundred copies of it.
+ *
+ * Rebuilt by hand rather than through URLSearchParams, which re-encodes every
+ * other parameter on the way out and invalidates a CDN's signature.
+ */
+function wholeFile(url) {
+  const mark = url.indexOf("?");
+  if (mark < 0) {
+    return url;
+  }
+  const hash = url.indexOf("#", mark);
+  const head = url.slice(0, mark);
+  const query = url.slice(mark + 1, hash < 0 ? undefined : hash);
+  const tail = hash < 0 ? "" : url.slice(hash);
+  const kept = query.split("&").filter((pair) => {
+    if (!pair) {
+      return false;
+    }
+    const equals = pair.indexOf("=");
+    const name = (equals < 0 ? pair : pair.slice(0, equals)).toLowerCase();
+    return !SLICE_PARAMETERS.has(name);
+  });
+  return head + (kept.length > 0 ? "?" + kept.join("&") : "") + tail;
+}
+
+/**
+ * True when the address names one piece of a live stream.
+ *
+ * A sequence number has no whole file behind it to ask for instead, so there
+ * is nothing to trim and nothing to offer. Digits only: `sq` is an ordinary
+ * word, and plenty of sites use it for a search query.
+ */
+function isSequenced(url) {
+  const mark = url.indexOf("?");
+  if (mark < 0) {
+    return false;
+  }
+  const hash = url.indexOf("#", mark);
+  return url
+    .slice(mark + 1, hash < 0 ? undefined : hash)
+    .split("&")
+    .some((pair) => /^sq=\d+$/i.test(pair));
+}
+
 function rememberFile(tabId, url, knownWhole) {
   if ((streams.get(tabId) ?? []).length > 0) {
     return;
@@ -531,7 +605,10 @@ function rememberFile(tabId, url, knownWhole) {
   if (SEGMENT_OR_WHOLE.has(extension) && !knownWhole) {
     return;
   }
-  remember(files, tabId, url, FILE_LIMIT);
+  if (isSequenced(url)) {
+    return;
+  }
+  remember(files, tabId, wholeFile(url), FILE_LIMIT);
 }
 
 /**

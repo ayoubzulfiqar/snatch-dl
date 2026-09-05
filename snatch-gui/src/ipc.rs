@@ -252,11 +252,9 @@ async fn accept_request(
             // What to fall back to if yt-dlp cannot do it after all. The probe
             // succeeded or the user would not be looking at a format list, but
             // extraction happens later and a site can refuse in between.
-            config.fallbacks = request
-                .files
-                .iter()
-                .chain(request.streams.iter())
-                .cloned()
+            config.fallbacks = downloadable(&request.files)
+                .into_iter()
+                .chain(request.streams.iter().cloned())
                 .collect();
             backend
                 .video
@@ -304,6 +302,27 @@ async fn accept_request(
 ///
 /// A scheme ffmpeg alone speaks -- `rtmp:`, `rtsp:`, `srt:` -- counts too:
 /// there is no file at the other end of one of those to download.
+/// The addresses from a page that are worth downloading whole.
+///
+/// What the browser watched go past is not always a file: a page that streams
+/// asks for its video a slice at a time, and each slice looks like a small
+/// complete video to everything downstream. A slice of a file becomes the
+/// file, and a piece of a stream is dropped -- the manifest already covers
+/// those, and it arrives on the same request.
+fn downloadable(urls: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::with_capacity(urls.len());
+    for url in urls {
+        if crate::stream::is_fragment(url) {
+            continue;
+        }
+        let whole = crate::stream::whole_file(url).unwrap_or_else(|| url.clone());
+        if !kept.contains(&whole) {
+            kept.push(whole);
+        }
+    }
+    kept
+}
+
 fn is_playlist(url: &str) -> bool {
     let scheme = url
         .split_once("://")
@@ -350,16 +369,20 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     // fetches in sixteen pieces and can resume. Sending an `.mp4` to ffmpeg
     // instead would work and be several times slower.
     let fallback;
-    let (watched_streams, watched_files) = if request.streams.is_empty() && request.files.is_empty()
-    {
-        fallback = vec![request.url.clone()];
-        if is_playlist(&request.url) {
+    let loaded = downloadable(&request.files);
+    let (watched_streams, watched_files) = if request.streams.is_empty() && loaded.is_empty() {
+        // The address itself, with any "just this slice" parameter taken
+        // off it. Trimmed rather than dropped: an address the reader typed
+        // is always worth trying, and there is nothing else to fall back to.
+        fallback =
+            vec![crate::stream::whole_file(&request.url).unwrap_or_else(|| request.url.clone())];
+        if is_playlist(&fallback[0]) {
             (&fallback[..], &[][..])
         } else {
             (&[][..], &fallback[..])
         }
     } else {
-        (&request.streams[..], &request.files[..])
+        (&request.streams[..], &loaded[..])
     };
 
     let (streams, files) = futures::future::join(
@@ -475,6 +498,106 @@ mod fallback_tests {
         // signed CDN URL ending in a token is the common shape, and ffprobe
         // is what settles it.
         assert!(!is_playlist("https://c.example/media/9f8a7b6c"));
+    }
+
+    /// The image failure that started this: gallery-dl's own words for it.
+    #[test]
+    fn a_cut_connection_says_what_to_do_about_it() {
+        // What gallery-dl printed on a site that resolves, accepts a TCP
+        // connection, and is then cut mid-handshake.
+        let raw = "HttpError: ConnectionError: ('Connection aborted.', \
+                   ConnectionResetError(104, 'Connection reset by peer'))";
+        let shown = crate::network::explain_failure(raw);
+        assert!(shown.starts_with(raw), "the original wording is kept");
+        assert!(shown.contains("proxy"), "and it says what to try: {shown}");
+
+        // aria2 and ffmpeg words for the same thing.
+        assert!(crate::network::cut_off_hint("SSL/TLS handshake failure").is_some());
+        assert!(
+            crate::network::cut_off_hint("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] alert").is_some()
+        );
+
+        // An ordinary refusal is left alone: this is a real answer from the
+        // site, and telling the reader to try a proxy would be wrong.
+        for ordinary in ["HTTP Error 404: Not Found", "HTTP Error 403: Forbidden"] {
+            assert_eq!(crate::network::explain_failure(ordinary), ordinary);
+        }
+    }
+
+    /// The bug this guards: a forty-minute film offered as four seconds.
+    ///
+    /// Both shapes were reproduced against the running app. Handing it the
+    /// audio address of a YouTube video listed one "Audio stream" row and no
+    /// video at all; handing it the same video address with `range=` on the
+    /// end listed a "360p" row that was 512 KB of a 17 MB file. Neither was
+    /// reported as a failure -- they downloaded, and what landed was wrong.
+    #[test]
+    fn a_slice_of_a_file_becomes_the_whole_file() {
+        let sliced =
+            "https://r1.example/videoplayback?id=9f8a&mime=video%2Fmp4&range=0-524287&rn=3&rbuf=0";
+        assert_eq!(
+            downloadable(&[sliced.to_owned()]),
+            vec!["https://r1.example/videoplayback?id=9f8a&mime=video%2Fmp4".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_signature_on_the_rest_of_the_query_survives() {
+        // Re-encoding the query is how a CDN's signature stops matching, so
+        // every parameter that is kept has to come out byte for byte.
+        let signed = "https://r1.example/v?sig=a%2Fb%3Dc&range=10-20&expire=99";
+        assert_eq!(
+            crate::stream::whole_file(signed).as_deref(),
+            Some("https://r1.example/v?sig=a%2Fb%3Dc&expire=99")
+        );
+        // Nothing to trim, so nothing is rewritten.
+        assert_eq!(
+            crate::stream::whole_file("https://r1.example/v?sig=a%2Fb"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hundred_slices_of_one_file_are_one_row() {
+        // A page that streams asks for the same file over and over. Before
+        // this they arrived as a hundred separate offers of the same video.
+        let slices: Vec<String> = (0..100)
+            .map(|n| {
+                format!(
+                    "https://r1.example/v?id=1&range={}-{}",
+                    n * 1000,
+                    n * 1000 + 999
+                )
+            })
+            .collect();
+        assert_eq!(
+            downloadable(&slices),
+            vec!["https://r1.example/v?id=1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_piece_of_a_stream_is_dropped_rather_than_offered() {
+        // There is no whole file behind these to ask for instead. The
+        // manifest is the answer, and it arrives on the same request.
+        let pieces = vec![
+            "https://c.example/chunk-00042.m4s".to_owned(),
+            "https://c.example/seg.cmfv".to_owned(),
+            "https://r1.example/videoplayback?id=9f8a&sq=137".to_owned(),
+        ];
+        assert!(downloadable(&pieces).is_empty());
+    }
+
+    #[test]
+    fn an_ordinary_file_is_left_exactly_as_it_is() {
+        // Including one whose query happens to contain the word `sq`, which
+        // is a search box on plenty of sites and a sequence number on none of
+        // them unless it is all digits.
+        let files = vec![
+            "https://c.example/film.mp4".to_owned(),
+            "https://c.example/find?sq=holiday&page=2".to_owned(),
+        ];
+        assert_eq!(downloadable(&files), files);
     }
 
     /// The whole point of the fallback, end to end.

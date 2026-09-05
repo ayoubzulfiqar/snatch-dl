@@ -1555,7 +1555,7 @@ fn detail_line(download: &DownloadStatus) -> String {
             .map(str::trim)
             .filter(|message| !message.is_empty())
         {
-            Some(message) => format!("Error {code}: {message}"),
+            Some(message) => format!("Error {code}: {}", crate::network::explain_failure(message)),
             None => format!("aria2 error {code}"),
         };
     }

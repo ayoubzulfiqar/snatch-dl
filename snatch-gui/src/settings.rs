@@ -483,6 +483,16 @@ impl Settings {
             format!("--file-allocation={}", download.allocation.as_str()),
             format!("--max-tries={}", download.retries),
             format!("--retry-wait={}", download.retry_wait_seconds),
+            // Not settings: these are floors, not preferences. aria2 waits a
+            // full minute on both by default, so a connection that is cut
+            // without being closed -- which is what a hostile network does --
+            // holds one of the sixteen slots doing nothing for that minute
+            // before the retry that would have worked.
+            "--connect-timeout=15".to_owned(),
+            "--timeout=30".to_owned(),
+            // A CDN that answers 404 while it warms a cache is common enough
+            // to be worth two more goes before the file is called missing.
+            "--max-file-not-found=2".to_owned(),
             format!("--check-certificate={}", download.check_certificate),
             format!("--auto-save-interval={}", download.auto_save_interval),
             format!("--user-agent={}", download.user_agent),
