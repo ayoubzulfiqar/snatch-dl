@@ -15,7 +15,8 @@ optdepends=(
   'wget2: grabbing a whole site recursively'
   'p7zip: unpacking downloaded archives'
 )
-makedepends=('cargo' 'pkgconf')
+# cmake builds the BoringSSL that backs our TLS, and it is not in base-devel.
+makedepends=('cargo' 'pkgconf' 'cmake')
 # The release profile already strips symbols, so makepkg's debug package
 # would be an empty 6 KB file on the release page.
 options=('!lto' '!debug')

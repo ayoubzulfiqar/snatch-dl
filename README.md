@@ -535,6 +535,7 @@ good at it.
 | Torrents | **librqbit** | DHT, peer exchange, play while downloading |
 | Site video | **yt-dlp** | Knows thousands of sites |
 | Live and odd streams | **ffmpeg** | Reads what the player reads |
+| Live broadcasts | **streamlink** | Built for what is on air now |
 | Galleries | **gallery-dl** | Knows hundreds of gallery sites |
 | Converting | **ffmpeg** | The standard tool for it |
 | Whole sites | **Wget2** | Follows links and filters what it keeps |
@@ -550,6 +551,12 @@ good at it.
 
 The window and the engines run apart. That is why the window never freezes
 while four downloads are going.
+
+**Building it yourself** needs Rust, the GTK4 and libadwaita headers, a C
+compiler and **cmake**. The last two are for the parts written in C that get
+built from source: the database, and the TLS that lets Snatch present itself
+as a browser. On Arch that is `base-devel` plus `cmake`; on Debian and Ubuntu
+`build-essential cmake`; on Fedora `gcc-c++ cmake`.
 
 Reading the source? [CONTRIBUTING.md](CONTRIBUTING.md) explains the parts
 that look wrong but are not.

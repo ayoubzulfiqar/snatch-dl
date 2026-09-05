@@ -116,7 +116,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed rust gtk4 libadwaita git sudo
+          pacman -Syu --noconfirm --needed rust gtk4 libadwaita git sudo cmake
 
       - name: Build with makepkg
         run: |
