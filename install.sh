@@ -635,6 +635,30 @@ main() {
 
   if [ "${skip_build}" -eq 0 ]; then
     require cargo
+    # Say which development files are missing before cargo says it in three
+    # hundred lines of build-script output. These are checked rather than
+    # assumed because a machine can have the library and not its headers,
+    # which is the ordinary state of a desktop that has never built anything.
+    if command -v pkg-config >/dev/null 2>&1; then
+      missing=''
+      for pkg in gtk4 libadwaita-1 webkitgtk-6.0; do
+        pkg-config --exists "${pkg}" 2>/dev/null || missing="${missing} ${pkg}"
+      done
+      if [ -n "${missing}" ]; then
+        printf '\n'
+        printf 'Missing development files:%s\n' "${missing}"
+        printf '\n'
+        printf 'Install them, then run this again:\n'
+        printf '  Fedora        sudo dnf install gtk4-devel libadwaita-devel webkitgtk6.0-devel\n'
+        printf '  Debian/Ubuntu sudo apt install libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev\n'
+        printf '  Arch          sudo pacman -S --needed gtk4 libadwaita webkitgtk-6.0\n'
+        printf '\n'
+        printf 'Or build without the Browse window, which is what needs WebKit:\n'
+        printf '  cargo build --release --no-default-features && ./install.sh --skip-build\n'
+        printf '\n'
+        die "install the development files listed above"
+      fi
+    fi
     step "Building the workspace (release)"
     cargo build --release --manifest-path "${SOURCE_DIR}/Cargo.toml"
   else
