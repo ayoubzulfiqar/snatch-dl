@@ -18,14 +18,21 @@
 //! frames would never come back to us. What this solves is the other kind of
 //! difficulty: manifests that only exist once the page has run.
 //!
-//! Closing the window does not stop anything. A download is handed to the
-//! engines the moment it is picked, and they outlive this window the same way
+//! It is a page in the window rather than a window of its own, so browsing
+//! sits beside the downloads it produces: pick something here and it appears
+//! on the Downloads page without anything having to be dismissed first. The
+//! page and its engine are built once and kept, so going away and coming
+//! back does not reload the site or lose what has been found.
+//!
+//! Leaving the page does not stop anything. A download is handed to the
+//! engines the moment it is picked, and they outlive the page the same way
 //! they outlive the dialog that started them.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use adw::prelude::*;
 use webkit6::prelude::*;
 
 use super::Ui;
@@ -38,6 +45,9 @@ use gtk::glib;
 /// the interesting ones are few; this is far above any real page and stops a
 /// hostile one growing the list without end.
 const MAX_FINDS: usize = 60;
+
+/// What the counter says before anything has been played.
+const FOUND_NOTHING: &str = "Nothing found yet";
 
 /// What the server says a playlist is.
 const MANIFEST_TYPES: [&str; 6] = [
@@ -86,126 +96,309 @@ struct Hit {
     page: String,
 }
 
-/// Open the browser, optionally at a starting address.
-pub fn present(ui: &Rc<Ui>, start: Option<String>) {
-    let view = webkit6::WebView::new();
-    view.set_vexpand(true);
+/// The Browse page: an address bar, a real browser, and what it found.
+pub struct BrowserPage {
+    root: gtk::Box,
+    view: webkit6::WebView,
+    address: gtk::Entry,
+    /// Says how many things are on offer, and opens the list when pressed.
+    ///
+    /// A counter rather than a list down the side of the page: the page is
+    /// what the reader is looking at, and a list that is empty most of the
+    /// time should not be taking a fifth of the height to say so.
+    found: gtk::Button,
+    /// What has been found, in the order it was found.
+    ///
+    /// Kept as data rather than as rows, so the dialog can be opened, closed
+    /// and opened again without losing anything -- and so an address already
+    /// queued still says so the second time it is looked at.
+    hits: Rc<RefCell<Vec<Hit>>>,
+    /// Addresses already handed to the engines.
+    queued: Rc<RefCell<Vec<String>>>,
+}
 
-    let address = gtk::Entry::builder()
-        .placeholder_text("Type a web address and press Enter")
-        .input_purpose(gtk::InputPurpose::Url)
-        .hexpand(true)
-        .build();
+impl BrowserPage {
+    pub fn new() -> Self {
+        let view = webkit6::WebView::new();
+        view.set_vexpand(true);
 
-    let back = gtk::Button::from_icon_name("go-previous-symbolic");
-    back.set_tooltip_text(Some("Back"));
-    let forward = gtk::Button::from_icon_name("go-next-symbolic");
-    forward.set_tooltip_text(Some("Forward"));
-    let reload = gtk::Button::from_icon_name("view-refresh-symbolic");
-    reload.set_tooltip_text(Some("Reload"));
+        let address = gtk::Entry::builder()
+            .placeholder_text("Type a web address and press Enter")
+            .input_purpose(gtk::InputPurpose::Url)
+            .hexpand(true)
+            .build();
 
-    let bar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(6)
-        .margin_end(6)
-        .build();
-    bar.append(&back);
-    bar.append(&forward);
-    bar.append(&reload);
-    bar.append(&address);
+        let back = gtk::Button::from_icon_name("go-previous-symbolic");
+        back.set_tooltip_text(Some("Back"));
+        let forward = gtk::Button::from_icon_name("go-next-symbolic");
+        forward.set_tooltip_text(Some("Forward"));
+        let reload = gtk::Button::from_icon_name("view-refresh-symbolic");
+        reload.set_tooltip_text(Some("Reload"));
 
-    let finds = gtk::ListBox::builder()
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        bar.append(&back);
+        bar.append(&forward);
+        bar.append(&reload);
+        bar.append(&address);
+
+        let found = gtk::Button::builder()
+            .label(FOUND_NOTHING)
+            .sensitive(false)
+            .tooltip_text("What this page has played so far")
+            .build();
+        bar.append(&found);
+
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        root.append(&bar);
+        root.append(&view);
+
+        // Navigation needs nothing from the rest of the app, so it is wired
+        // here; only the part that queues a download waits for `attach`.
+        {
+            let view = view.clone();
+            address.connect_activate(move |entry| {
+                let typed = entry.text().trim().to_owned();
+                if !typed.is_empty() {
+                    view.load_uri(&normalise(&typed));
+                }
+            });
+        }
+        for (button, action) in [
+            (&back, Navigate::Back),
+            (&forward, Navigate::Forward),
+            (&reload, Navigate::Reload),
+        ] {
+            let view = view.clone();
+            button.connect_clicked(move |_| match action {
+                Navigate::Back => view.go_back(),
+                Navigate::Forward => view.go_forward(),
+                Navigate::Reload => view.reload(),
+            });
+        }
+        // Keep the address bar showing where the page actually went, which is
+        // not always where it was sent -- a redirect, or a link it followed.
+        {
+            let address = address.clone();
+            view.connect_uri_notify(move |view| {
+                if let Some(uri) = view.uri() {
+                    address.set_text(&uri);
+                }
+            });
+        }
+        // Grey the arrows out when there is nowhere to go.
+        {
+            let back = back.clone();
+            let forward = forward.clone();
+            let update = move |view: &webkit6::WebView| {
+                back.set_sensitive(view.can_go_back());
+                forward.set_sensitive(view.can_go_forward());
+            };
+            update(&view);
+            view.connect_load_changed(move |view, _| update(view));
+        }
+
+        Self {
+            root,
+            view,
+            address,
+            found,
+            hits: Rc::new(RefCell::new(Vec::new())),
+            queued: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    pub fn widget(&self) -> &gtk::Box {
+        &self.root
+    }
+
+    /// Start watching, now that there is something to hand a download to.
+    ///
+    /// Separate from `new` because the page is built while `Ui` is still
+    /// being assembled, and queuing needs the finished thing.
+    pub fn attach(&self, ui: &Rc<Ui>) {
+        // Pressing the counter opens what has been found.
+        {
+            let ui = Rc::clone(ui);
+            let hits = Rc::clone(&self.hits);
+            let queued = Rc::clone(&self.queued);
+            self.found.connect_clicked(move |button| {
+                present_finds(&ui, button, &hits, &queued);
+            });
+        }
+
+        let hits = Rc::clone(&self.hits);
+        let found = self.found.clone();
+
+        self.view
+            .connect_resource_load_started(move |view, resource, request| {
+                // The page the request belongs to, for the referer a CDN
+                // checks.
+                let page = view.uri().map(|uri| uri.to_string()).unwrap_or_default();
+                let headers = copy_headers(request.http_headers().as_ref());
+
+                let hits = Rc::clone(&hits);
+                let found = found.clone();
+
+                // Waiting for the answer rather than acting on the request
+                // means the server's own content type decides what this is.
+                // Plenty of media addresses carry no extension to guess from
+                // -- a signed CDN URL ending in a token is the usual shape --
+                // and the answer is the only thing that knows.
+                //
+                // The answer is read off the resource rather than taken from
+                // the `sent-request` signal. That signal's second argument is
+                // the *redirected* response, which C leaves null for the
+                // ordinary request that was not redirected -- and the binding
+                // dereferences it without checking, inside a callback that
+                // cannot unwind. The result is not an error a caller could
+                // handle: the process aborts, on the first page that loads.
+                // Asked for this way it is an `Option`, and the notification
+                // arrives as soon as the headers do rather than waiting for a
+                // body that, on a live stream, never ends.
+                resource.connect_response_notify(move |resource| {
+                    let Some(response) = resource.response() else {
+                        return;
+                    };
+                    if !(200..400).contains(&response.status_code()) {
+                        return;
+                    }
+                    let Some(url) = resource.uri().map(|uri| uri.to_string()) else {
+                        return;
+                    };
+                    let mime = response
+                        .mime_type()
+                        .map(|mime| mime.to_string())
+                        .unwrap_or_default();
+                    let Some(hit) =
+                        classify(&url, &mime, response.content_length(), &page, &headers)
+                    else {
+                        return;
+                    };
+
+                    let total = {
+                        let mut hits = hits.borrow_mut();
+                        // A live playlist is re-fetched every few seconds, so
+                        // without this the same broadcast is counted forever.
+                        if hits.iter().any(|known| known.url == hit.url) || hits.len() >= MAX_FINDS
+                        {
+                            return;
+                        }
+                        log::info!(
+                            "browse: found {} {} ({} header(s) copied)",
+                            match hit.kind {
+                                Found::Stream => "stream",
+                                Found::File => "file",
+                            },
+                            hit.url,
+                            hit.headers.len()
+                        );
+                        hits.push(hit);
+                        hits.len()
+                    };
+
+                    found.set_label(&count_label(total));
+                    found.set_sensitive(true);
+                    found.add_css_class("suggested-action");
+                });
+            });
+    }
+
+    /// Go to an address, or just focus the bar when there is none.
+    pub fn open(&self, url: Option<&str>) {
+        match url.map(str::trim).filter(|url| !url.is_empty()) {
+            Some(url) => {
+                self.address.set_text(url);
+                self.view.load_uri(&normalise(url));
+            }
+            None => {
+                self.address.grab_focus();
+            }
+        }
+    }
+}
+
+/// "3 found", and "1 found" rather than "1 founds".
+fn count_label(total: usize) -> String {
+    match total {
+        0 => FOUND_NOTHING.to_owned(),
+        1 => "1 found".to_owned(),
+        many => format!("{many} found"),
+    }
+}
+
+/// Show what the page has played, and let one be taken.
+///
+/// A dialog rather than a permanent list: it is empty most of the time, and
+/// the page is what the reader came to look at.
+fn present_finds(
+    ui: &Rc<Ui>,
+    anchor: &gtk::Button,
+    hits: &Rc<RefCell<Vec<Hit>>>,
+    queued: &Rc<RefCell<Vec<String>>>,
+) {
+    let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
-    let finds_scroller = gtk::ScrolledWindow::builder()
+
+    // Newest first: on a page that has been browsed for a while, the thing
+    // just played is the thing being asked for.
+    for hit in hits.borrow().iter().rev() {
+        list.append(&row(ui, hit, queued));
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .min_content_height(150)
-        .max_content_height(260)
         .propagate_natural_height(true)
-        .child(&finds)
+        .max_content_height(420)
+        .child(&list)
         .build();
 
-    let heading = gtk::Label::builder()
-        .xalign(0.0)
-        .label("Nothing found yet — play the video and it will appear here")
-        .css_classes(["snatch-section-heading"])
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
-        .margin_top(6)
         .build();
+    body.append(
+        &gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .label(
+                "Everything this page has played. Recording keeps going after \
+             this window is closed.",
+            )
+            .css_classes(["dim-label"])
+            .build(),
+    );
+    body.append(&scroller);
 
-    let found_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .margin_bottom(6)
+    let dialog = adw::Dialog::builder()
+        .title("Found on this page")
+        .content_width(620)
+        .content_height(480)
+        .child(&body)
         .build();
-    found_box.append(&heading);
-    found_box.append(&finds_scroller);
+    dialog.present(Some(anchor));
+}
 
-    let column = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .build();
-    column.append(&bar);
-    column.append(&view);
-    column.append(&found_box);
-
-    let window = adw::Window::builder()
-        .title("Browse")
-        .default_width(1100)
-        .default_height(800)
-        .content(&column)
-        .build();
-    window.set_transient_for(Some(&ui.window));
-
-    // Every address seen so far, so the same manifest fetched every few
-    // seconds -- which is what a live playlist is -- is listed once.
-    let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-
-    watch(ui, &view, &finds, &heading, &seen);
-
-    {
-        let view = view.clone();
-        address.connect_activate(move |entry| {
-            let typed = entry.text().trim().to_owned();
-            if typed.is_empty() {
-                return;
-            }
-            view.load_uri(&normalise(&typed));
-        });
-    }
-    {
-        let view = view.clone();
-        back.connect_clicked(move |_| view.go_back());
-    }
-    {
-        let view = view.clone();
-        forward.connect_clicked(move |_| view.go_forward());
-    }
-    {
-        let view = view.clone();
-        reload.connect_clicked(move |_| view.reload());
-    }
-    // Keep the address bar showing where the page actually went, which is not
-    // always where it was sent -- a redirect, or a link the page followed.
-    {
-        let address = address.clone();
-        view.connect_uri_notify(move |view| {
-            if let Some(uri) = view.uri() {
-                address.set_text(&uri);
-            }
-        });
-    }
-
-    if let Some(start) = start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        address.set_text(start);
-        view.load_uri(&normalise(start));
-    }
-
-    window.present();
+/// Which way a navigation button goes.
+#[derive(Clone, Copy)]
+enum Navigate {
+    Back,
+    Forward,
+    Reload,
 }
 
 /// Give a typed word a scheme, so "example.com" goes somewhere.
@@ -221,86 +414,6 @@ fn normalise(typed: &str) -> String {
         );
     }
     format!("https://{typed}")
-}
-
-/// Watch what the page fetches and list anything worth downloading.
-fn watch(
-    ui: &Rc<Ui>,
-    view: &webkit6::WebView,
-    finds: &gtk::ListBox,
-    heading: &gtk::Label,
-    seen: &Rc<RefCell<Vec<String>>>,
-) {
-    let ui = Rc::clone(ui);
-    let finds = finds.clone();
-    let heading = heading.clone();
-    let seen = Rc::clone(seen);
-
-    view.connect_resource_load_started(move |view, resource, request| {
-        // The page the request belongs to, for the referer a CDN checks.
-        let page = view.uri().map(|uri| uri.to_string()).unwrap_or_default();
-        let headers = copy_headers(request.http_headers().as_ref());
-
-        let ui = Rc::clone(&ui);
-        let finds = finds.clone();
-        let heading = heading.clone();
-        let seen = Rc::clone(&seen);
-
-        // Waiting for the answer rather than acting on the request means the
-        // server's own content type decides what this is. Plenty of media
-        // addresses carry no extension to guess from -- a signed CDN URL
-        // ending in a token is the usual shape -- and the answer is the only
-        // thing that knows.
-        //
-        // The answer is read off the resource rather than taken from the
-        // `sent-request` signal. That signal's second argument is the
-        // *redirected* response, which C leaves null for the ordinary request
-        // that was not redirected -- and the binding dereferences it without
-        // checking, inside a callback that cannot unwind. The result is not
-        // an error a caller could handle: the process aborts, on the first
-        // page that loads. Asked for this way it is an `Option`, and the
-        // notification arrives as soon as the headers do rather than waiting
-        // for a body that, on a live stream, never ends.
-        resource.connect_response_notify(move |resource| {
-            let Some(response) = resource.response() else {
-                return;
-            };
-            if !(200..400).contains(&response.status_code()) {
-                return;
-            }
-            let Some(url) = resource.uri().map(|uri| uri.to_string()) else {
-                return;
-            };
-            let mime = response
-                .mime_type()
-                .map(|mime| mime.to_string())
-                .unwrap_or_default();
-            let Some(hit) = classify(&url, &mime, response.content_length(), &page, &headers)
-            else {
-                return;
-            };
-
-            {
-                let mut seen = seen.borrow_mut();
-                if seen.iter().any(|known| known == &hit.url) || seen.len() >= MAX_FINDS {
-                    return;
-                }
-                seen.push(hit.url.clone());
-            }
-
-            log::info!(
-                "browse: found {} {} ({} header(s) copied)",
-                match hit.kind {
-                    Found::Stream => "stream",
-                    Found::File => "file",
-                },
-                hit.url,
-                hit.headers.len()
-            );
-            heading.set_label("Found on this page");
-            finds.append(&row(&ui, &hit));
-        });
-    });
 }
 
 /// Decide whether an address is worth offering, and as what.
@@ -386,7 +499,8 @@ fn copy_headers(headers: Option<&webkit6::soup::MessageHeaders>) -> BTreeMap<Str
 }
 
 /// One row, with the button that queues it.
-fn row(ui: &Rc<Ui>, hit: &Hit) -> gtk::ListBoxRow {
+fn row(ui: &Rc<Ui>, hit: &Hit, queued: &Rc<RefCell<Vec<String>>>) -> gtk::ListBoxRow {
+    let already = queued.borrow().iter().any(|url| url == &hit.url);
     let title = gtk::Label::builder()
         .xalign(0.0)
         .hexpand(true)
@@ -395,10 +509,15 @@ fn row(ui: &Rc<Ui>, hit: &Hit) -> gtk::ListBoxRow {
         .build();
 
     let action = gtk::Button::builder()
-        .label(match hit.kind {
-            Found::Stream => "Record",
-            Found::File => "Download",
+        .label(if already {
+            "Queued"
+        } else {
+            match hit.kind {
+                Found::Stream => "Record",
+                Found::File => "Download",
+            }
         })
+        .sensitive(!already)
         .css_classes(["suggested-action"])
         .valign(gtk::Align::Center)
         .build();
@@ -406,10 +525,12 @@ fn row(ui: &Rc<Ui>, hit: &Hit) -> gtk::ListBoxRow {
     {
         let ui = Rc::clone(ui);
         let hit = hit.clone();
+        let queued = Rc::clone(queued);
         action.connect_clicked(move |button| {
             ui.enqueue(request_for(&hit));
-            // Queued once. The engines own it from here, so this window can
-            // be closed and the download carries on.
+            queued.borrow_mut().push(hit.url.clone());
+            // Queued once. The engines own it from here, so the dialog and
+            // the page can both be left and the download carries on.
             button.set_sensitive(false);
             button.set_label("Queued");
         });
@@ -468,6 +589,13 @@ fn request_for(hit: &Hit) -> DownloadRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_counter_says_how_many_and_says_one_properly() {
+        assert_eq!(count_label(0), FOUND_NOTHING);
+        assert_eq!(count_label(1), "1 found");
+        assert_eq!(count_label(7), "7 found");
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

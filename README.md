@@ -417,15 +417,17 @@ Some pages cannot be read from outside. The player builds its address in
 JavaScript, or signs each request with a token it works out as it goes, so
 there is nothing in the page for an add-on to find.
 
-**Menu → Browse…** opens a real browser window inside Snatch. Load the page,
-press play, and whatever the player fetches appears in a list underneath —
-with a **Record** or **Download** button beside it. It works because it is a
-browser: the page's own code runs, and Snatch watches the requests that code
-makes, including the headers, so what it saves is what the player was
-watching.
+**Browse** is one of Snatch's own pages, next to Downloads. Type an address,
+press play, and a button in the toolbar counts what the page has played —
+**3 found**. Press it and pick what you want, with **Record** for a stream and
+**Download** for a file.
 
-You can close the window straight after pressing the button. The download has
-already been handed over and carries on without it.
+It works because it is a browser: the page's own code runs, and Snatch watches
+the requests that code makes, headers included, so what it saves is what the
+player was watching.
+
+Go anywhere else in Snatch straight after pressing the button. The download
+has already been handed over and carries on without the page.
 
 From a terminal: `snatch-gui --browse https://example.com/live`.
 

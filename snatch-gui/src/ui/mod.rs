@@ -41,6 +41,8 @@ const WINDOW_WIDTH: i32 = 900;
 const WINDOW_HEIGHT: i32 = 640;
 
 pub const PAGE_DOWNLOADS: &str = "downloads";
+#[cfg(feature = "webview")]
+pub const PAGE_BROWSE: &str = "browse";
 pub const PAGE_TORRENTS: &str = "torrents";
 pub const PAGE_SCRAPER: &str = "scraper";
 pub const PAGE_HISTORY: &str = "history";
@@ -79,12 +81,17 @@ pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Re
     ui.window.present();
     ui.load_history();
     ui.load_scheduled_starts();
+    // The Browse page is built with the rest of the window, but it can only
+    // start queuing downloads once there is a `Ui` to queue them through.
+    #[cfg(feature = "webview")]
+    ui.browser.attach(&ui);
 
     // `snatch-gui --browse [address]` opens straight into the browser, which
     // is how a page gets opened from a terminal or a desktop launcher.
     #[cfg(feature = "webview")]
     if let Some(start) = browse_argument() {
-        browser::present(&ui, start);
+        ui.select_page(PAGE_BROWSE);
+        ui.browser.open(start.as_deref());
     }
 
     // The task owns the only strong reference to `Ui`: it is the application
@@ -187,6 +194,8 @@ pub struct Ui {
     sidebar_rows: Vec<(String, gtk::Label)>,
     backend: Backend,
     downloads: downloads::DownloadsPage,
+    #[cfg(feature = "webview")]
+    browser: browser::BrowserPage,
     torrents: torrents::TorrentsPage,
     scraper: scraper::ScraperPage,
     history: history::HistoryPage,
@@ -216,12 +225,23 @@ impl Ui {
         let history = history::HistoryPage::new();
         let settings_page = settings::SettingsPage::new();
 
+        #[cfg(feature = "webview")]
+        let browser = browser::BrowserPage::new();
+
         let stack = adw::ViewStack::new();
         stack.add_titled_with_icon(
             downloads.widget(),
             Some(PAGE_DOWNLOADS),
             "Downloads",
             "folder-download-symbolic",
+        );
+        // Next to Downloads because that is where what it finds ends up.
+        #[cfg(feature = "webview")]
+        stack.add_titled_with_icon(
+            browser.widget(),
+            Some(PAGE_BROWSE),
+            "Browse",
+            "web-browser-symbolic",
         );
         stack.add_titled_with_icon(
             torrents.widget(),
@@ -264,6 +284,13 @@ impl Ui {
                 "Downloads",
                 "Files, videos and conversions",
                 "folder-download-symbolic",
+            ),
+            #[cfg(feature = "webview")]
+            (
+                PAGE_BROWSE,
+                "Browse",
+                "Open a site and take what it plays",
+                "web-browser-symbolic",
             ),
             (
                 PAGE_TORRENTS,
@@ -425,6 +452,8 @@ impl Ui {
             sidebar_rows,
             backend,
             downloads,
+            #[cfg(feature = "webview")]
+            browser,
             torrents,
             scraper,
             history,
@@ -885,7 +914,10 @@ impl Ui {
         self.add_action("sniff", |ui| sniff::present(ui, None));
         // The in-app browser, for pages nothing outside them can see into.
         #[cfg(feature = "webview")]
-        self.add_action("browse", |ui| browser::present(ui, None));
+        self.add_action("browse", |ui| {
+            ui.select_page(PAGE_BROWSE);
+            ui.browser.open(None);
+        });
         self.add_action("grab-site", |ui| ui.present_site_grabber());
         self.add_action("dependencies", deps::present);
         self.add_action("show-history", |ui| ui.select_page(PAGE_HISTORY));
@@ -2710,10 +2742,11 @@ fn buffer_text(buffer: &gtk::TextBuffer) -> String {
 fn main_menu() -> gio::Menu {
     let sources = gio::Menu::new();
     sources.append(Some("Add Torrent File…"), Some("win.add-torrent-file"));
-    // First in the list because it is the answer when nothing else worked:
-    // the page runs here, so whatever the player fetches, Snatch sees.
+    // No ellipsis: this goes to a page in the window rather than opening a
+    // dialog, and the sidebar has it too. It is here as well because this is
+    // the menu someone opens when nothing else could read a page.
     #[cfg(feature = "webview")]
-    sources.append(Some("Browse…"), Some("win.browse"));
+    sources.append(Some("Browse a Site"), Some("win.browse"));
     sources.append(Some("Sniff a Page…"), Some("win.sniff"));
     sources.append(Some("Extract Video…"), Some("win.extract-video"));
     sources.append(Some("Scrape a Page…"), Some("win.scrape"));
