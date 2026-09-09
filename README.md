@@ -89,6 +89,7 @@ Everything else is optional. Each one adds a feature:
 | `wget2` | Grabbing a whole site |
 | `7z` | Unpacking archives |
 | A JavaScript engine | The best sizes on YouTube and other sites that need it |
+| WebKitGTK | The **Browse…** window (installed with Snatch by the packages) |
 | `streamlink` | Live broadcasts on Twitch, Kick and 130 other sites |
 
 Torrents need nothing extra. That part is built in.
@@ -407,6 +408,32 @@ file is how Snatch resumes after a crash. It goes away when the download ends.
 
 Do not want them? Turn off **Write resume data while downloading** in Settings.
 You lose crash resume.
+
+---
+
+## Browse inside Snatch
+
+Some pages cannot be read from outside. The player builds its address in
+JavaScript, or signs each request with a token it works out as it goes, so
+there is nothing in the page for an add-on to find.
+
+**Menu → Browse…** opens a real browser window inside Snatch. Load the page,
+press play, and whatever the player fetches appears in a list underneath —
+with a **Record** or **Download** button beside it. It works because it is a
+browser: the page's own code runs, and Snatch watches the requests that code
+makes, including the headers, so what it saves is what the player was
+watching.
+
+You can close the window straight after pressing the button. The download has
+already been handed over and carries on without it.
+
+From a terminal: `snatch-gui --browse https://example.com/live`.
+
+**It cannot open DRM.** A page locked with DRM hands its key to a part of the
+browser that never gives it back, and there is no such part here — so those
+pages will not play. That is not a limit of Snatch: no download tool can save
+them. What this solves is the other kind of difficulty, where the address
+simply is not in the page until the page has run.
 
 ---
 

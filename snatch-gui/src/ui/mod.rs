@@ -11,6 +11,8 @@
 //! keeps the ownership graph a tree and avoids an `Rc` cycle that would leak
 //! every row.
 
+#[cfg(feature = "webview")]
+mod browser;
 mod deps;
 mod downloads;
 mod format;
@@ -45,6 +47,26 @@ pub const PAGE_HISTORY: &str = "history";
 pub const PAGE_SETTINGS: &str = "settings";
 
 /// Construct the window on first activation; raise it on every later one.
+/// The address `--browse` was given, if it was given at all.
+///
+/// Read from the process arguments rather than through GTK, which is told to
+/// parse none of them: Snatch's own options must not collide with the dozen
+/// GTK would otherwise claim.
+#[cfg(feature = "webview")]
+fn browse_argument() -> Option<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--browse" {
+            // The address is optional: with none, the browser opens empty.
+            return Some(args.next().filter(|next| !next.starts_with('-')));
+        }
+        if let Some(address) = argument.strip_prefix("--browse=") {
+            return Some(Some(address.to_owned()));
+        }
+    }
+    None
+}
+
 pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Receiver<UiEvent>) {
     if let Some(window) = app.active_window() {
         window.present();
@@ -57,6 +79,13 @@ pub fn build(app: &adw::Application, backend: Backend, events: async_channel::Re
     ui.window.present();
     ui.load_history();
     ui.load_scheduled_starts();
+
+    // `snatch-gui --browse [address]` opens straight into the browser, which
+    // is how a page gets opened from a terminal or a desktop launcher.
+    #[cfg(feature = "webview")]
+    if let Some(start) = browse_argument() {
+        browser::present(&ui, start);
+    }
 
     // The task owns the only strong reference to `Ui`: it is the application
     // state and lives exactly as long as the event channel.
@@ -854,6 +883,9 @@ impl Ui {
         self.add_action("proxies", proxy::present);
         self.add_action("extract-video", |ui| ui.present_video_dialog());
         self.add_action("sniff", |ui| sniff::present(ui, None));
+        // The in-app browser, for pages nothing outside them can see into.
+        #[cfg(feature = "webview")]
+        self.add_action("browse", |ui| browser::present(ui, None));
         self.add_action("grab-site", |ui| ui.present_site_grabber());
         self.add_action("dependencies", deps::present);
         self.add_action("show-history", |ui| ui.select_page(PAGE_HISTORY));
@@ -2678,6 +2710,10 @@ fn buffer_text(buffer: &gtk::TextBuffer) -> String {
 fn main_menu() -> gio::Menu {
     let sources = gio::Menu::new();
     sources.append(Some("Add Torrent File…"), Some("win.add-torrent-file"));
+    // First in the list because it is the answer when nothing else worked:
+    // the page runs here, so whatever the player fetches, Snatch sees.
+    #[cfg(feature = "webview")]
+    sources.append(Some("Browse…"), Some("win.browse"));
     sources.append(Some("Sniff a Page…"), Some("win.sniff"));
     sources.append(Some("Extract Video…"), Some("win.extract-video"));
     sources.append(Some("Scrape a Page…"), Some("win.scrape"));

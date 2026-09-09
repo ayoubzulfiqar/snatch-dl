@@ -73,6 +73,26 @@ url = "2.5"
 scraper = "0.27"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "process", "sync", "fs", "signal"] }
 
+# WebKitGTK, for the browser window inside Snatch.
+#
+# A page that builds its manifest in JavaScript is invisible from outside, so
+# this opens it here, lets its own code run and reads the requests that code
+# makes. It resolves against the same gtk4 0.11 the rest of the window uses,
+# and re-exports the `soup` needed to read a request's headers, so it brings
+# no second toolkit with it.
+#
+# Optional because it is not small: WebKitGTK is about 96 MB of runtime, and
+# a build that does not want it should not have to have it. On by default
+# because the packaged builds do.
+webkit6 = { version = "0.6", optional = true }
+
+[features]
+default = ["webview"]
+# The in-app browser. Needs the `webkitgtk-6.0` development files to build
+# and the WebKitGTK runtime to run; `--no-default-features` leaves both out
+# and takes the Browse window with them.
+webview = ["dep:webkit6"]
+
 # --- Debian / Ubuntu -------------------------------------------------------
 # `cargo deb -p snatch-gui`
 [package.metadata.deb]
@@ -186,6 +206,10 @@ assets = [
 aria2 = "*"
 gtk4 = "*"
 libadwaita = "*"
+# The Browse window's engine. A hard requirement because the binary links
+# against it: without it the program does not start at all, which is a worse
+# failure than a missing feature.
+"webkitgtk6.0" = "*"
 
 # Weak dependencies, installed by default by dnf but removable, and never
 # able to make the package itself uninstallable. ffmpeg in particular is not

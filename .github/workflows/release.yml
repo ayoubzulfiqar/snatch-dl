@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config
+            libgtk-4-dev libadwaita-1-dev pkg-config libwebkitgtk-6.0-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config
+            libgtk-4-dev libadwaita-1-dev pkg-config libwebkitgtk-6.0-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -116,7 +116,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed rust gtk4 libadwaita git sudo cmake clang
+          pacman -Syu --noconfirm --needed rust gtk4 libadwaita git sudo cmake clang webkitgtk-6.0
 
       - name: Build with makepkg
         run: |

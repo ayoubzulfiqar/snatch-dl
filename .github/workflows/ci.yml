@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            libgtk-4-dev libadwaita-1-dev pkg-config
+            libgtk-4-dev libadwaita-1-dev pkg-config libwebkitgtk-6.0-dev
 
       # Optional at runtime, but the processor and archive tests exercise the
       # real binaries end to end; without these they skip themselves, which is

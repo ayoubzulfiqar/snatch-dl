@@ -6,7 +6,7 @@ pkgdesc="Download manager for Linux: aria2, BitTorrent, yt-dlp and gallery-dl be
 arch=('x86_64')
 url="https://ayoubzulfiqar.com/projects"
 license=('custom:snatch')
-depends=('gtk4' 'libadwaita' 'aria2')
+depends=('gtk4' 'libadwaita' 'aria2' 'webkitgtk-6.0')
 # Torrents are built in; the rest are only needed for their own features.
 optdepends=(
   'ffmpeg: post-processing, conversion and trimming'
@@ -17,7 +17,8 @@ optdepends=(
 )
 # BoringSSL backs our TLS and is built from source: cmake compiles it and
 # clang provides the libclang that bindgen reads its headers with. Neither is
-# in base-devel.
+# in base-devel. webkitgtk-6.0 is a runtime dependency above and carries its
+# own headers, so it needs no separate entry here.
 makedepends=('cargo' 'pkgconf' 'cmake' 'clang')
 # The release profile already strips symbols, so makepkg's debug package
 # would be an empty 6 KB file on the release page.

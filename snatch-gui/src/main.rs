@@ -237,7 +237,9 @@ fn run() -> Result<glib::ExitCode> {
         move |app| ui::build(app, backend.clone(), events_rx.clone())
     });
 
-    // GTK must not try to parse our argv; Snatch takes no command line options.
+    // GTK must not try to parse our argv. Snatch reads the one option it takes,
+    // `--browse`, itself; letting GTK at the rest would have it claim a dozen
+    // of its own and refuse anything it did not recognise.
     let code = app.run_with_args::<&str>(&[]);
 
     // The window is gone. Stop the torrent session first so it flushes resume
