@@ -61,6 +61,10 @@ pub struct DownloadsPage {
     /// conversion cannot start any earlier: ffmpeg is still writing the file.
     convert_when_done: RefCell<HashSet<i64>>,
     summary: RefCell<PageSummary>,
+    /// Shown only once aria2 has something finished to forget.
+    clear_finished: gtk::Button,
+    /// Hidden with it, so an empty list has no heading over it.
+    list_heading: gtk::Box,
 }
 
 impl DownloadsPage {
@@ -86,12 +90,45 @@ impl DownloadsPage {
 
         let graph = super::graph::Bandwidth::new();
 
+        // Clearing finished downloads was only in the window menu, which is
+        // not where anyone looks when they are staring at a list of finished
+        // downloads wondering how to get rid of them. The same action, put
+        // where the problem is.
+        //
+        // Hidden until there is something to clear, so it never offers to do
+        // nothing. Only the files aria2 has finished with are forgotten --
+        // recordings and the other tasks take themselves off the list when
+        // they end.
+        let clear_finished = gtk::Button::builder()
+            .label("Clear finished")
+            .action_name("win.clear-finished")
+            .halign(gtk::Align::End)
+            .visible(false)
+            .css_classes(["flat"])
+            .tooltip_text("Forget every finished download. The files stay on disk.")
+            .build();
+
+        let list_heading = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        let downloads_label = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .label("Downloads")
+            .css_classes(["snatch-section-heading"])
+            .build();
+        list_heading.append(&downloads_label);
+        list_heading.append(&clear_finished);
+
         let column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(0)
             .build();
         column.append(graph.widget());
         column.append(&jobs_frame);
+        column.append(&list_heading);
         column.append(&list);
 
         let scroller = boxed_list_page(&column);
@@ -121,6 +158,8 @@ impl DownloadsPage {
         Self {
             root,
             stack,
+            clear_finished,
+            list_heading,
             list,
             jobs_list,
             jobs_frame,
@@ -151,23 +190,46 @@ impl DownloadsPage {
             total: downloads.len(),
             ..PageSummary::default()
         };
+        // Whether the button that forgets them is worth showing.
+        let mut finished = 0usize;
 
         {
             let mut rows = self.rows.borrow_mut();
 
-            for download in downloads {
+            for (position, download) in downloads.iter().enumerate() {
                 seen.insert(download.gid.as_str());
                 let row = rows.entry(download.gid.clone()).or_insert_with(|| {
                     let row = Row::new(&download.gid, ui);
                     self.list.append(&row.root);
                     row
                 });
+                // Keep the list in the order aria2 gave: active first, then
+                // queued, then finished.
+                //
+                // Rows are created once and never moved, so without this the
+                // list stays in the order things were *first seen*. A
+                // download added now was appended last and stayed there,
+                // underneath everything already finished -- which is why a
+                // new download turned up at the bottom instead of the top.
+                //
+                // Each row is put at its final index in turn, so this is a
+                // selection sort that settles in one pass and does nothing at
+                // all on the ordinary poll where nothing has moved. The `Rc`
+                // holds the widget alive across the remove.
+                let wanted = position as i32;
+                if row.root.index() != wanted {
+                    self.list.remove(&row.root);
+                    self.list.insert(&row.root, wanted);
+                }
                 row.update(download, ui.scheduled_minute_for(&download.gid));
                 self.record_if_finished(ui, download);
 
                 if download.is_active() {
                     summary.active += 1;
                     summary.speed += download.download_speed;
+                }
+                if download.is_finished() {
+                    finished += 1;
                 }
             }
 
@@ -178,6 +240,11 @@ impl DownloadsPage {
                 }
                 keep
             });
+
+            // Never offer to clear nothing, and never leave a heading above
+            // an empty list.
+            self.clear_finished.set_visible(finished > 0);
+            self.list_heading.set_visible(!rows.is_empty());
         }
 
         // One sample per poll keeps the graph in step with the numbers above

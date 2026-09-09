@@ -103,6 +103,25 @@ impl JobKind {
     }
 }
 
+/// The extension of an address, ignoring any query string or fragment.
+///
+/// Deliberately not `stream::extension_of`: this runs on a request before any
+/// engine is chosen, and dragging that module in for four lines would tie the
+/// request type to the recorder.
+fn playlist_extension(url: &str) -> Option<String> {
+    let path = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['?', '#'])
+        .next()?;
+    let last = path.rsplit('/').next()?;
+    let extension = last.rsplit_once('.')?.1;
+    (!extension.is_empty()
+        && extension.len() <= 5
+        && extension.chars().all(|c| c.is_ascii_alphanumeric()))
+    .then(|| extension.to_ascii_lowercase())
+}
+
 /// A download hand-off, as produced by the browser extension and forwarded by
 /// `snatch-nmh`. Must stay wire-compatible with the struct of the same name in
 /// the `snatch-nmh` crate.
@@ -257,9 +276,42 @@ impl DownloadRequest {
     }
 
     /// Infer the kind from the URL when the sender did not say.
+    /// Schemes that only ever carry a live stream.
+    ///
+    /// aria2 cannot speak any of them; ffmpeg speaks all of them.
+    const STREAM_SCHEMES: [&'static str; 8] = [
+        "rtmp", "rtmps", "rtsp", "rtsps", "srt", "rtp", "mms", "mmsh",
+    ];
+
+    /// What this address actually is, when nobody said.
+    ///
+    /// "Detect automatically" used to detect exactly one thing, `magnet:`,
+    /// and call everything else a file for aria2 to fetch. For a live stream
+    /// that is not a failure anyone can see: aria2 fetches the address quite
+    /// happily, and what lands is the playlist -- a hundred and fifty bytes
+    /// of text naming the video, with none of the video in it. The download
+    /// says it succeeded, and the file is useless.
+    ///
+    /// A playlist and a streaming scheme both mean "record this with ffmpeg",
+    /// so they are named here rather than left to be discovered by whoever
+    /// opens the file afterwards.
     pub fn inferred_kind(&self) -> JobKind {
-        if self.kind == JobKind::Download && self.url.trim_start().starts_with("magnet:") {
+        if self.kind != JobKind::Download {
+            return self.kind;
+        }
+        let url = self.url.trim();
+        if url.starts_with("magnet:") {
             return JobKind::Magnet;
+        }
+        if let Some((scheme, _)) = url.split_once("://")
+            && Self::STREAM_SCHEMES
+                .iter()
+                .any(|known| scheme.eq_ignore_ascii_case(known))
+        {
+            return JobKind::Stream;
+        }
+        if matches!(playlist_extension(url).as_deref(), Some("m3u8" | "mpd")) {
+            return JobKind::Stream;
         }
         self.kind
     }
@@ -583,6 +635,72 @@ pub enum UiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug that made Snatch useless for IPTV.
+    ///
+    /// "Detect automatically" detected `magnet:` and nothing else, so a live
+    /// stream address was treated as a file for aria2. aria2 fetched it
+    /// perfectly well and what landed was the playlist: measured at 151 bytes
+    /// of text naming the video, with none of the video in it, reported as a
+    /// finished download.
+    #[test]
+    fn a_live_stream_address_is_recorded_not_fetched() {
+        for address in [
+            "http://185.9.2.18/chid_218/index.m3u8",
+            "https://cdn.example/live/master.m3u8?token=abc",
+            "https://cdn.example/live/manifest.mpd",
+            "rtmp://live.example/app/key",
+            "rtsp://camera.local/stream1",
+            "srt://live.example:9000",
+            "RTMPS://Live.Example/App",
+        ] {
+            assert_eq!(
+                DownloadRequest::from_url(address).inferred_kind(),
+                JobKind::Stream,
+                "{address} should be recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_file_is_still_an_ordinary_download() {
+        for address in [
+            "https://cdn.example/film.mp4",
+            "https://cdn.example/album.zip",
+            // No extension at all: a signed CDN address, which is a file
+            // until something says otherwise.
+            "https://cdn.example/media/9f8a7b6c",
+            // `.m3u` is left alone on purpose: an IPTV subscription is a
+            // .m3u listing thousands of channels, which is a list to import
+            // and not one stream to record.
+            "https://iptv.example/subscription.m3u",
+        ] {
+            assert_eq!(
+                DownloadRequest::from_url(address).inferred_kind(),
+                JobKind::Download,
+                "{address} should be fetched"
+            );
+        }
+        assert_eq!(
+            DownloadRequest::from_url("magnet:?xt=urn:btih:abc").inferred_kind(),
+            JobKind::Magnet
+        );
+    }
+
+    /// A kind the reader chose by hand is never second-guessed.
+    #[test]
+    fn an_explicit_choice_wins() {
+        let mut request = DownloadRequest::from_url("https://cdn.example/live/master.m3u8");
+        request.kind = JobKind::Download;
+        assert_eq!(request.inferred_kind(), JobKind::Stream);
+
+        // ...but picking "Direct download" in the dialog builds a request
+        // that is already `Download`, which is indistinguishable here. The
+        // dialog passes the choice through separately; this only fills in
+        // for "Detect automatically".
+        let explicit = DownloadRequest::video("https://cdn.example/live/master.m3u8".to_owned());
+        assert_eq!(explicit.inferred_kind(), JobKind::Video);
+    }
 
     #[test]
     fn magnet_names_come_from_the_dn_parameter() {

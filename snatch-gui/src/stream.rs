@@ -65,9 +65,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// broadcast lost its quality list and, before the listing learned to offer
 /// an undescribed manifest anyway, lost the row with it.
 ///
+/// Thirty rather than twenty-five because a survey of live IPTV channels put
+/// a real one at 27 seconds, and the difference between 25 and 30 is a
+/// channel that lists its qualities and one that does not.
+///
 /// One step of a chain the native host bounds at 90 seconds; see its
 /// `GUI_REPLY_TIMEOUT`.
-const PLAYLIST_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const PLAYLIST_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many recordings one batch may start.
 ///
@@ -509,6 +513,18 @@ pub async fn probe(url: &str, headers: &Headers) -> Result<StreamInfo> {
 
     let raw: RawProbe = serde_json::from_slice(&output.stdout)
         .context("ffprobe printed something that was not a stream description")?;
+
+    // ffprobe can exit cleanly having learned nothing at all -- an address it
+    // opened but could not make sense of inside the time allowed comes back
+    // as an empty description. That is not a stream with no video in it, and
+    // saying so is worse than saying nothing: an empty description has no
+    // video track, which reads as "Audio only", so a television channel gets
+    // offered as radio and the reader passes over the one row that would have
+    // worked. Nothing learned is nothing learned, and the caller has a
+    // perfectly good answer for that.
+    if raw.streams.is_empty() {
+        bail!("ffprobe opened that address but could not describe anything in it");
+    }
     Ok(distil(&raw))
 }
 
@@ -756,6 +772,42 @@ pub fn extension_of(url: &str) -> Option<String> {
         return None;
     }
     Some(extension.to_ascii_lowercase())
+}
+
+/// Keep a recording alive across the things that happen to long ones.
+///
+/// A broadcast is not a file: it is hours of somebody else's network, and it
+/// will drop. A CDN rotates an edge and closes the connection, a segment
+/// 404s while the origin catches up, the laptop's wifi hands over. Without
+/// any of this ffmpeg treats the first of those as the end of the stream,
+/// stops, and leaves whatever it had -- so a two-hour recording quietly
+/// becomes four minutes, and nothing on screen says why.
+///
+/// These are HTTP-protocol options, so they have to come before `-i`.
+///
+/// `reconnect_at_eof` is deliberately absent. On a live playlist an end of
+/// file is how a finished broadcast announces itself, and reconnecting past
+/// it would leave the recording running against a stream that is over.
+fn apply_reconnect(command: &mut Command) {
+    command
+        .arg("-reconnect")
+        .arg("1")
+        // The one that matters here: a live stream is not seekable, and
+        // without this ffmpeg will not retry a stream it cannot seek.
+        .arg("-reconnect_streamed")
+        .arg("1")
+        .arg("-reconnect_on_network_error")
+        .arg("1")
+        // A segment that is briefly missing while the origin catches up is
+        // ordinary on a live edge, and is worth another go rather than the
+        // end of the recording.
+        .arg("-reconnect_on_http_error")
+        .arg("404,408,429,500,502,503,504")
+        // Back off up to half a minute. Long enough to ride out a wifi
+        // handover or an edge rotation, short enough that the gap in the
+        // recording is a gap and not the rest of the programme.
+        .arg("-reconnect_delay_max")
+        .arg("30");
 }
 
 /// Query parameters a player adds to ask for one slice of a file.
@@ -1268,6 +1320,7 @@ async fn run_part(
     // nothing for it to steal.
     command.arg("-hide_banner").arg("-loglevel").arg("error");
     apply_headers(&mut command, headers);
+    apply_reconnect(&mut command);
     // Seeking before the input is the fast kind: ffmpeg jumps to the nearest
     // keyframe rather than decoding its way there. With `-c copy` that is the
     // only kind available, and a keyframe is where a copied stream has to
@@ -1844,6 +1897,51 @@ mod tests {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+
+    /// A recording has to survive the network, not just start on it.
+    ///
+    /// These are HTTP-protocol options, which ffmpeg only reads before `-i`.
+    /// Put after it they are silently accepted as output options and do
+    /// nothing at all -- so the ordering is the test.
+    #[test]
+    fn a_recording_is_told_to_reconnect_before_the_input_is_named() {
+        let mut command = Command::new("ffmpeg");
+        apply_reconnect(&mut command);
+        command.arg("-i").arg("https://c.example/live.m3u8");
+
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        let input = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("the input is named");
+        for flag in [
+            "-reconnect",
+            // The one that matters: a live stream is not seekable, and
+            // without this ffmpeg will not retry it at all.
+            "-reconnect_streamed",
+            "-reconnect_on_network_error",
+            "-reconnect_on_http_error",
+            "-reconnect_delay_max",
+        ] {
+            let at = args
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} is not passed"));
+            assert!(
+                at < input,
+                "{flag} must come before -i or ffmpeg ignores it"
+            );
+        }
+
+        // Reconnecting past the end of a live playlist would keep recording
+        // a broadcast that has finished.
+        assert!(!args.iter().any(|arg| arg == "-reconnect_at_eof"));
+    }
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

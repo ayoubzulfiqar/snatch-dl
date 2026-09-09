@@ -1129,13 +1129,24 @@ impl RawFormat {
     /// height. Without this the menu offers to download "27p".
     /// The address to record this rendition from, when the page is live.
     ///
-    /// HLS gives each rendition its own playlist, which is exactly what to
-    /// record: it is already the chosen quality. DASH gives a segment
-    /// template that ffmpeg cannot open on its own, so the manifest it came
-    /// from is the answer there, and ffmpeg picks the quality out of it.
+    /// HLS gives each rendition its own playlist, and when that rendition
+    /// carries its own sound it is exactly what to record: it is already the
+    /// chosen quality and nothing else has to be opened.
+    ///
+    /// It does not always carry its own sound. A YouTube broadcast lists its
+    /// video renditions as video *only* -- 229 through 312 -- with the audio
+    /// beside them as separate entries, 233 and 234. Recording one of those
+    /// on its own gives a picture and silence, and it does it quietly: the
+    /// file plays, it is the right length, and the sound is simply not there.
+    ///
+    /// The master lists both halves, so that is what to open when the
+    /// rendition is missing one, and the height already on the row is what
+    /// picks the quality out of it. DASH is the same story for a different
+    /// reason: its `url` is a segment template ffmpeg cannot open at all.
     fn live_address(&self) -> Option<&str> {
         let protocol = self.protocol.as_deref().unwrap_or_default();
-        let candidates = if protocol.contains("m3u8") {
+        let complete_on_its_own = protocol.contains("m3u8") && self.has_audio();
+        let candidates = if complete_on_its_own {
             [self.url.as_deref(), self.manifest_url.as_deref()]
         } else {
             [self.manifest_url.as_deref(), self.url.as_deref()]
@@ -1682,6 +1693,64 @@ mod tests {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+
+    /// A live recording that comes out silent is the worst kind of bug: the
+    /// file plays, it is the right length, and the sound is simply absent.
+    ///
+    /// This is the shape a YouTube broadcast actually has, captured from
+    /// yt-dlp 2026.08.19: every video rendition is video only, and the audio
+    /// is a separate entry. Recording rendition 231's own playlist gives a
+    /// picture and nothing else, so the master has to be what is opened.
+    #[test]
+    fn a_live_rendition_with_no_sound_is_recorded_from_the_master() {
+        let probe = distil(
+            &serde_json::from_str(
+                r#"{"title":"News livestream","is_live":true,"formats":[
+                  {"format_id":"233","ext":"mp4","protocol":"m3u8_native",
+                   "vcodec":"none","acodec":"mp4a.40.2",
+                   "url":"https://c.example/audio.m3u8",
+                   "manifest_url":"https://c.example/master.m3u8"},
+                  {"format_id":"231","ext":"mp4","protocol":"m3u8_native",
+                   "height":480,"vcodec":"avc1.4D401F","acodec":"none",
+                   "url":"https://c.example/video-480.m3u8",
+                   "manifest_url":"https://c.example/master.m3u8"}]}"#,
+            )
+            .expect("the fixture parses"),
+        );
+
+        assert!(probe.live, "a broadcast");
+        let row = probe
+            .formats
+            .iter()
+            .find(|row| row.height == Some(480))
+            .expect("480p is offered");
+        assert_eq!(row.source, FormatSource::Stream);
+        assert_eq!(
+            row.url.as_deref(),
+            Some("https://c.example/master.m3u8"),
+            "recording the video-only rendition would have no sound in it"
+        );
+    }
+
+    /// ...and a rendition that does carry its own sound is still recorded
+    /// directly, because opening the master would make ffmpeg choose again.
+    #[test]
+    fn a_complete_live_rendition_is_recorded_as_it_is() {
+        let probe = distil(
+            &serde_json::from_str(
+                r#"{"title":"Channel","is_live":true,"formats":[
+                  {"format_id":"hls-1200","ext":"mp4","protocol":"m3u8_native",
+                   "height":720,"vcodec":"avc1.4D401F","acodec":"mp4a.40.2",
+                   "url":"https://c.example/720-with-sound.m3u8",
+                   "manifest_url":"https://c.example/master.m3u8"}]}"#,
+            )
+            .expect("the fixture parses"),
+        );
+        assert_eq!(
+            probe.formats[0].url.as_deref(),
+            Some("https://c.example/720-with-sound.m3u8")
+        );
+    }
 
     /// A real `yt-dlp -J` listing, cut down to the formats that decide each
     /// rule below. Captured from yt-dlp 2026.08.19.

@@ -44,9 +44,9 @@ const GUI_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 ///
 /// This has to outlast the slowest question the GUI can be asked, which is
 /// listing what a page offers. That walks a chain, and every step of it has
-/// its own cap: yt-dlp 30s, then streamlink 20s, then ffprobe 25s on a
+/// its own cap: yt-dlp 30s, then streamlink 20s, then ffprobe 30s on a
 /// playlist. Nothing takes all three -- the first answer wins -- but a page
-/// where everything refuses does, and 75 seconds of that is a page that is
+/// where everything refuses does, and 80 seconds of that is a page that is
 /// working, not a page that has hung.
 ///
 /// Giving up first is worse than waiting: the reader gets "Snatch is not

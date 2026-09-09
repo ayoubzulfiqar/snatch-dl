@@ -161,12 +161,30 @@ fn parse_stderr(line: &str) -> Line {
     // `[downloader.http][warning] '404 …' for '…'` / `[download][error] …`
     let lowered = trimmed.to_ascii_lowercase();
     if lowered.contains("[error]") {
-        return Line::Failed(crate::network::explain_failure(&strip_tags(trimmed)));
+        return Line::Failed(explain(&strip_tags(trimmed)));
     }
     if lowered.contains("[warning]") {
         return Line::Warning(strip_tags(trimmed));
     }
     Line::Ignored
+}
+
+/// Turn gallery-dl's own words into something worth acting on.
+///
+/// "Unsupported URL" is the message anyone pointing this at an ordinary web
+/// page gets, and on its own it reads as a dead end. It is not one: gallery-dl
+/// knows a few hundred gallery sites and nothing else, while Snatch's own
+/// sniffer reads the page itself and does not need to have heard of it. The
+/// answer is one menu item away, so it is worth naming.
+fn explain(message: &str) -> String {
+    if message.to_ascii_lowercase().contains("unsupported url") {
+        return format!(
+            "{message} -- gallery-dl only knows the gallery sites it has been \
+             taught. Try \"Find all media on the page\" instead, which reads \
+             the page itself."
+        );
+    }
+    crate::network::explain_failure(message)
 }
 
 /// Drop gallery-dl's leading `[tag][level]` markers for display.
@@ -532,6 +550,32 @@ pub fn destination_for(base: &Path, url: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The message anyone gets for pointing a scrape at an ordinary page.
+    #[test]
+    fn an_unsupported_site_names_the_thing_that_would_work() {
+        let Line::Failed(shown) = parse_stderr(
+            "[gallery-dl][error] Unsupported URL 'https://www.youtube.com/watch?v=abc'",
+        ) else {
+            panic!("an [error] line is a failure");
+        };
+        assert!(shown.starts_with("Unsupported URL"), "{shown}");
+        assert!(
+            shown.contains("Find all media on the page"),
+            "it has to say what to do instead: {shown}"
+        );
+    }
+
+    /// ...and an ordinary failure is not buried under advice that does not
+    /// apply to it.
+    #[test]
+    fn a_real_failure_is_left_to_speak_for_itself() {
+        let Line::Failed(shown) = parse_stderr("[download][error] 404 Not Found for 'x.jpg'")
+        else {
+            panic!("an [error] line is a failure");
+        };
+        assert!(!shown.contains("Find all media"), "{shown}");
+    }
 
     // The fixtures below are literal lines captured from gallery-dl 1.32.9.
 

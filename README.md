@@ -430,6 +430,19 @@ leaves a file you can play.
 This used to be the weak spot. `yt-dlp` refusing meant no download at all,
 even though the stream was right there. It no longer does.
 
+**Paste a stream address and it is recorded, not fetched.** An IPTV `.m3u8`,
+a `.mpd`, an `rtmp://` or `rtsp://` camera — Snatch now recognises all of
+those and records them. Before, "Detect automatically" treated them as
+ordinary files, so what landed was the playlist: a hundred and fifty bytes of
+text naming the video, with none of the video in it, reported as a finished
+download.
+
+**A recording keeps going when the connection does not.** A broadcast is
+hours of somebody else's network and it will drop — an edge rotates, a
+segment goes missing for a moment, the wifi hands over. Snatch reconnects and
+carries on, backing off up to half a minute. Before, the first hiccup ended
+the recording and left whatever had arrived.
+
 ---
 
 ## Looking like a browser
