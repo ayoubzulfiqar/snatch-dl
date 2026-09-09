@@ -384,11 +384,20 @@ fn present_finds(
     );
     body.append(&scroller);
 
+    // A header bar, because that is what carries the close button. Without
+    // one an AdwDialog is a box with no way out of it but the Escape key,
+    // which is not a way out anybody can see.
+    let header = adw::HeaderBar::builder()
+        .title_widget(&adw::WindowTitle::new("Found on this page", ""))
+        .build();
+    let toolbar = adw::ToolbarView::builder().content(&body).build();
+    toolbar.add_top_bar(&header);
+
     let dialog = adw::Dialog::builder()
         .title("Found on this page")
         .content_width(620)
         .content_height(480)
-        .child(&body)
+        .child(&toolbar)
         .build();
     dialog.present(Some(anchor));
 }
