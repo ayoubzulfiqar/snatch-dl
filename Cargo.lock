@@ -3848,6 +3848,7 @@ dependencies = [
  "libadwaita",
  "librqbit",
  "log",
+ "regex",
  "rusqlite",
  "scraper",
  "serde",

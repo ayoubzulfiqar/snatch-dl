@@ -12,6 +12,8 @@
 //! every row.
 
 #[cfg(feature = "webview")]
+mod blocklist;
+#[cfg(feature = "webview")]
 mod browser;
 mod deps;
 mod downloads;
@@ -195,7 +197,7 @@ pub struct Ui {
     backend: Backend,
     downloads: downloads::DownloadsPage,
     #[cfg(feature = "webview")]
-    browser: browser::BrowserPage,
+    browser: Rc<browser::BrowserPage>,
     torrents: torrents::TorrentsPage,
     scraper: scraper::ScraperPage,
     history: history::HistoryPage,

@@ -93,6 +93,12 @@ default = ["webview"]
 # and takes the Browse window with them.
 webview = ["dep:webkit6"]
 
+[dev-dependencies]
+# Tests only: runs the ad-block rules exactly as written against real
+# addresses, so what is checked is the text WebKit is handed rather than a
+# re-implementation of it. Already in the tree through other crates.
+regex = "1"
+
 # --- Debian / Ubuntu -------------------------------------------------------
 # `cargo deb -p snatch-gui`
 [package.metadata.deb]

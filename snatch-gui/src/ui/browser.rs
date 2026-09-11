@@ -28,9 +28,9 @@
 //! engines the moment it is picked, and they outlive the page the same way
 //! they outlive the dialog that started them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use webkit6::prelude::*;
@@ -96,31 +96,56 @@ struct Hit {
     page: String,
 }
 
-/// The Browse page: an address bar, a real browser, and what it found.
-pub struct BrowserPage {
-    root: gtk::Box,
+/// What a tab has found, and which of it has been queued, shared with the
+/// dialog that lists it.
+type Finds = (Rc<RefCell<Vec<Hit>>>, Rc<RefCell<Vec<String>>>);
+
+/// One tab: a browser, and what that page has played.
+///
+/// Finds are kept per tab because they belong to a page. A stream found on
+/// one channel should not be offered while looking at another.
+struct Tab {
     view: webkit6::WebView,
-    address: gtk::Entry,
-    /// Says how many things are on offer, and opens the list when pressed.
-    ///
-    /// A counter rather than a list down the side of the page: the page is
-    /// what the reader is looking at, and a list that is empty most of the
-    /// time should not be taking a fifth of the height to say so.
-    found: gtk::Button,
-    /// What has been found, in the order it was found.
-    ///
-    /// Kept as data rather than as rows, so the dialog can be opened, closed
-    /// and opened again without losing anything -- and so an address already
-    /// queued still says so the second time it is looked at.
     hits: Rc<RefCell<Vec<Hit>>>,
-    /// Addresses already handed to the engines.
     queued: Rc<RefCell<Vec<String>>>,
 }
 
+/// The Browse page: tabs of real browsers, and what each one found.
+pub struct BrowserPage {
+    root: gtk::Box,
+    tabs: adw::TabView,
+    address: gtk::Entry,
+    back: gtk::Button,
+    forward: gtk::Button,
+    /// Says how many things the tab on show has played, and opens the list.
+    ///
+    /// A counter rather than a list down the side: the page is what the
+    /// reader is looking at, and a list that is empty most of the time
+    /// should not take a fifth of the height to say so.
+    found: gtk::Button,
+    /// How many popups this session has refused, so blocking is visible
+    /// rather than something that might or might not be happening.
+    blocked: gtk::Label,
+    popups_blocked: Cell<u32>,
+    /// Shared by every tab, and carrying the ad-block rules -- so a filter
+    /// compiled once applies everywhere, including to a tab opened later.
+    content: webkit6::UserContentManager,
+    open_tabs: RefCell<Vec<Tab>>,
+    /// For queuing. Set by `attach`, once the rest of the window exists.
+    ui: RefCell<Option<Weak<Ui>>>,
+}
+
 impl BrowserPage {
-    pub fn new() -> Self {
-        let view = webkit6::WebView::new();
-        view.set_vexpand(true);
+    pub fn new() -> Rc<Self> {
+        let content = webkit6::UserContentManager::new();
+        install_blocklist(&content);
+
+        let tabs = adw::TabView::new();
+        tabs.set_vexpand(true);
+        let tab_bar = adw::TabBar::builder().view(&tabs).autohide(false).build();
+        let new_tab = gtk::Button::from_icon_name("tab-new-symbolic");
+        new_tab.set_tooltip_text(Some("New tab"));
+        tab_bar.set_end_action_widget(Some(&new_tab));
 
         let address = gtk::Entry::builder()
             .placeholder_text("Type a web address and press Enter")
@@ -135,6 +160,17 @@ impl BrowserPage {
         let reload = gtk::Button::from_icon_name("view-refresh-symbolic");
         reload.set_tooltip_text(Some("Reload"));
 
+        let found = gtk::Button::builder()
+            .label(FOUND_NOTHING)
+            .sensitive(false)
+            .tooltip_text("What this page has played so far")
+            .build();
+
+        let blocked = gtk::Label::builder()
+            .css_classes(["dim-label", "caption"])
+            .visible(false)
+            .build();
+
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -147,183 +183,493 @@ impl BrowserPage {
         bar.append(&forward);
         bar.append(&reload);
         bar.append(&address);
-
-        let found = gtk::Button::builder()
-            .label(FOUND_NOTHING)
-            .sensitive(false)
-            .tooltip_text("What this page has played so far")
-            .build();
+        bar.append(&blocked);
         bar.append(&found);
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
         root.append(&bar);
-        root.append(&view);
+        root.append(&tab_bar);
+        root.append(&tabs);
 
-        // Navigation needs nothing from the rest of the app, so it is wired
-        // here; only the part that queues a download waits for `attach`.
-        {
-            let view = view.clone();
-            address.connect_activate(move |entry| {
-                let typed = entry.text().trim().to_owned();
-                if !typed.is_empty() {
-                    view.load_uri(&normalise(&typed));
-                }
-            });
-        }
-        for (button, action) in [
-            (&back, Navigate::Back),
-            (&forward, Navigate::Forward),
-            (&reload, Navigate::Reload),
-        ] {
-            let view = view.clone();
-            button.connect_clicked(move |_| match action {
-                Navigate::Back => view.go_back(),
-                Navigate::Forward => view.go_forward(),
-                Navigate::Reload => view.reload(),
-            });
-        }
-        // Keep the address bar showing where the page actually went, which is
-        // not always where it was sent -- a redirect, or a link it followed.
-        {
-            let address = address.clone();
-            view.connect_uri_notify(move |view| {
-                if let Some(uri) = view.uri() {
-                    address.set_text(&uri);
-                }
-            });
-        }
-        // Grey the arrows out when there is nowhere to go.
-        {
-            let back = back.clone();
-            let forward = forward.clone();
-            let update = move |view: &webkit6::WebView| {
-                back.set_sensitive(view.can_go_back());
-                forward.set_sensitive(view.can_go_forward());
-            };
-            update(&view);
-            view.connect_load_changed(move |view, _| update(view));
-        }
-
-        Self {
+        let page = Rc::new(Self {
             root,
-            view,
+            tabs,
             address,
+            back,
+            forward,
             found,
-            hits: Rc::new(RefCell::new(Vec::new())),
-            queued: Rc::new(RefCell::new(Vec::new())),
-        }
+            blocked,
+            popups_blocked: Cell::new(0),
+            content,
+            open_tabs: RefCell::new(Vec::new()),
+            ui: RefCell::new(None),
+        });
+
+        page.wire(&reload, &new_tab);
+        // There is always a tab to type into.
+        page.open_tab(None, None);
+        page
     }
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
     }
 
-    /// Start watching, now that there is something to hand a download to.
+    /// Start queuing, now that there is a `Ui` to queue through.
     ///
     /// Separate from `new` because the page is built while `Ui` is still
-    /// being assembled, and queuing needs the finished thing.
+    /// being assembled.
     pub fn attach(&self, ui: &Rc<Ui>) {
-        // Pressing the counter opens what has been found.
-        {
-            let ui = Rc::clone(ui);
-            let hits = Rc::clone(&self.hits);
-            let queued = Rc::clone(&self.queued);
-            self.found.connect_clicked(move |button| {
-                present_finds(&ui, button, &hits, &queued);
-            });
-        }
-
-        let hits = Rc::clone(&self.hits);
-        let found = self.found.clone();
-
-        self.view
-            .connect_resource_load_started(move |view, resource, request| {
-                // The page the request belongs to, for the referer a CDN
-                // checks.
-                let page = view.uri().map(|uri| uri.to_string()).unwrap_or_default();
-                let headers = copy_headers(request.http_headers().as_ref());
-
-                let hits = Rc::clone(&hits);
-                let found = found.clone();
-
-                // Waiting for the answer rather than acting on the request
-                // means the server's own content type decides what this is.
-                // Plenty of media addresses carry no extension to guess from
-                // -- a signed CDN URL ending in a token is the usual shape --
-                // and the answer is the only thing that knows.
-                //
-                // The answer is read off the resource rather than taken from
-                // the `sent-request` signal. That signal's second argument is
-                // the *redirected* response, which C leaves null for the
-                // ordinary request that was not redirected -- and the binding
-                // dereferences it without checking, inside a callback that
-                // cannot unwind. The result is not an error a caller could
-                // handle: the process aborts, on the first page that loads.
-                // Asked for this way it is an `Option`, and the notification
-                // arrives as soon as the headers do rather than waiting for a
-                // body that, on a live stream, never ends.
-                resource.connect_response_notify(move |resource| {
-                    let Some(response) = resource.response() else {
-                        return;
-                    };
-                    if !(200..400).contains(&response.status_code()) {
-                        return;
-                    }
-                    let Some(url) = resource.uri().map(|uri| uri.to_string()) else {
-                        return;
-                    };
-                    let mime = response
-                        .mime_type()
-                        .map(|mime| mime.to_string())
-                        .unwrap_or_default();
-                    let Some(hit) =
-                        classify(&url, &mime, response.content_length(), &page, &headers)
-                    else {
-                        return;
-                    };
-
-                    let total = {
-                        let mut hits = hits.borrow_mut();
-                        // A live playlist is re-fetched every few seconds, so
-                        // without this the same broadcast is counted forever.
-                        if hits.iter().any(|known| known.url == hit.url) || hits.len() >= MAX_FINDS
-                        {
-                            return;
-                        }
-                        log::info!(
-                            "browse: found {} {} ({} header(s) copied)",
-                            match hit.kind {
-                                Found::Stream => "stream",
-                                Found::File => "file",
-                            },
-                            hit.url,
-                            hit.headers.len()
-                        );
-                        hits.push(hit);
-                        hits.len()
-                    };
-
-                    found.set_label(&count_label(total));
-                    found.set_sensitive(true);
-                    found.add_css_class("suggested-action");
-                });
-            });
+        *self.ui.borrow_mut() = Some(Rc::downgrade(ui));
     }
 
-    /// Go to an address, or just focus the bar when there is none.
+    /// Go to an address in the tab on show, or just focus the bar.
     pub fn open(&self, url: Option<&str>) {
         match url.map(str::trim).filter(|url| !url.is_empty()) {
             Some(url) => {
                 self.address.set_text(url);
-                self.view.load_uri(&normalise(url));
+                if let Some(view) = self.current_view() {
+                    view.load_uri(&normalise(url));
+                }
             }
             None => {
                 self.address.grab_focus();
             }
         }
     }
+
+    /// The browser in the tab on show.
+    fn current_view(&self) -> Option<webkit6::WebView> {
+        let selected = self.tabs.selected_page()?.child();
+        self.open_tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.view.upcast_ref::<gtk::Widget>() == &selected)
+            .map(|tab| tab.view.clone())
+    }
+
+    /// The finds that belong to a browser.
+    fn tab_state(&self, view: &webkit6::WebView) -> Option<Finds> {
+        self.open_tabs
+            .borrow()
+            .iter()
+            .find(|tab| &tab.view == view)
+            .map(|tab| (Rc::clone(&tab.hits), Rc::clone(&tab.queued)))
+    }
+
+    /// Connect the toolbar and the tab strip. Called once, from `new`.
+    fn wire(self: &Rc<Self>, reload: &gtk::Button, new_tab: &gtk::Button) {
+        let weak = Rc::downgrade(self);
+        self.address.connect_activate(move |entry| {
+            let Some(page) = weak.upgrade() else { return };
+            let typed = entry.text().trim().to_owned();
+            if let (false, Some(view)) = (typed.is_empty(), page.current_view()) {
+                view.load_uri(&normalise(&typed));
+            }
+        });
+
+        for (button, go) in [
+            (&self.back, Go::Back),
+            (&self.forward, Go::Forward),
+            (reload, Go::Reload),
+        ] {
+            let weak = Rc::downgrade(self);
+            button.connect_clicked(move |_| {
+                let Some(view) = weak.upgrade().and_then(|page| page.current_view()) else {
+                    return;
+                };
+                match go {
+                    Go::Back => view.go_back(),
+                    Go::Forward => view.go_forward(),
+                    Go::Reload => view.reload(),
+                }
+            });
+        }
+
+        {
+            let weak = Rc::downgrade(self);
+            new_tab.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.open_tab(None, None);
+                    page.address.grab_focus();
+                }
+            });
+        }
+
+        // The toolbar always describes the tab on show.
+        {
+            let weak = Rc::downgrade(self);
+            self.tabs.connect_selected_page_notify(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.sync_toolbar();
+                }
+            });
+        }
+
+        // Forget a closed tab's browser and finds, and never leave the page
+        // with no tab at all.
+        {
+            let weak = Rc::downgrade(self);
+            self.tabs.connect_close_page(move |tabs, closing| {
+                if let Some(page) = weak.upgrade() {
+                    let child = closing.child();
+                    page.open_tabs
+                        .borrow_mut()
+                        .retain(|tab| tab.view.upcast_ref::<gtk::Widget>() != &child);
+                    // Closed last: open a fresh one once this finishes.
+                    if tabs.n_pages() <= 1 {
+                        let weak = Rc::downgrade(&page);
+                        glib::idle_add_local_once(move || {
+                            if let Some(page) = weak.upgrade()
+                                && page.tabs.n_pages() == 0
+                            {
+                                page.open_tab(None, None);
+                            }
+                        });
+                    }
+                }
+                tabs.close_page_finish(closing, true);
+                glib::Propagation::Stop
+            });
+        }
+
+        {
+            let weak = Rc::downgrade(self);
+            self.found.connect_clicked(move |button| {
+                let Some(page) = weak.upgrade() else { return };
+                let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) else {
+                    return;
+                };
+                let Some((hits, queued)) = page.current_view().and_then(|v| page.tab_state(&v))
+                else {
+                    return;
+                };
+                present_finds(&ui, button, &hits, &queued);
+            });
+        }
+    }
+
+    /// Open a tab, optionally at an address, and show it.
+    ///
+    /// `opener` is the browser a popup came from. WebKit requires a popup to
+    /// be *related* to the page that opened it -- the same web process, the
+    /// same session -- or it will not hand the popup its content.
+    fn open_tab(
+        self: &Rc<Self>,
+        url: Option<&str>,
+        opener: Option<&webkit6::WebView>,
+    ) -> webkit6::WebView {
+        let view = match opener {
+            Some(opener) => webkit6::WebView::builder().related_view(opener).build(),
+            None => webkit6::WebView::builder()
+                .user_content_manager(&self.content)
+                .build(),
+        };
+        view.set_vexpand(true);
+
+        // Send every popup through `guard_popups`, including the ones WebKit
+        // would otherwise drop by itself. Left at its default, WebKit refuses
+        // a `window.open` with no click behind it before the `create` signal
+        // is ever emitted -- which blocks it, but silently, so a page that
+        // tried six popunders read "0 popups blocked". One policy in one
+        // place, tested, decides all of them; the outcome is the same, and
+        // the count is true. Anything it does let through opens as a tab,
+        // never as a stray window.
+        if let Some(settings) = WebViewExt::settings(&view) {
+            settings.set_javascript_can_open_windows_automatically(true);
+        }
+
+        let hits: Rc<RefCell<Vec<Hit>>> = Rc::new(RefCell::new(Vec::new()));
+        let queued: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        self.open_tabs.borrow_mut().push(Tab {
+            view: view.clone(),
+            hits: Rc::clone(&hits),
+            queued,
+        });
+
+        let tab = self.tabs.append(&view);
+        tab.set_title("New tab");
+
+        self.watch_media(&view, &hits);
+        self.watch_tab(&view, &tab);
+        self.guard_popups(&view);
+
+        self.tabs.set_selected_page(&tab);
+        if let Some(url) = url {
+            view.load_uri(&normalise(url));
+        }
+        view
+    }
+
+    /// Keep a tab's title, spinner and the toolbar in step with its page.
+    fn watch_tab(self: &Rc<Self>, view: &webkit6::WebView, tab: &adw::TabPage) {
+        {
+            let tab = tab.clone();
+            view.connect_title_notify(move |view| {
+                let title = view.title().map(|t| t.to_string()).unwrap_or_default();
+                tab.set_title(if title.trim().is_empty() {
+                    "Untitled"
+                } else {
+                    &title
+                });
+            });
+        }
+        {
+            let tab = tab.clone();
+            view.connect_is_loading_notify(move |view| tab.set_loading(view.is_loading()));
+        }
+        // A page that calls `window.close()` closes its own tab.
+        {
+            let weak = Rc::downgrade(self);
+            let tab = tab.clone();
+            view.connect_close(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.tabs.close_page(&tab);
+                }
+            });
+        }
+        for signal in [Refresh::Uri, Refresh::Load] {
+            let weak = Rc::downgrade(self);
+            let watched = view.clone();
+            let refresh = move || {
+                let Some(page) = weak.upgrade() else { return };
+                // Only the tab on show writes the toolbar.
+                if page.current_view().as_ref() == Some(&watched) {
+                    page.sync_toolbar();
+                }
+            };
+            match signal {
+                Refresh::Uri => {
+                    view.connect_uri_notify(move |_| refresh());
+                }
+                Refresh::Load => {
+                    view.connect_load_changed(move |_, _| refresh());
+                }
+            }
+        }
+    }
+
+    /// Refuse the popups nobody asked for, and open the rest as tabs.
+    fn guard_popups(self: &Rc<Self>, view: &webkit6::WebView) {
+        let weak = Rc::downgrade(self);
+        view.connect_create(move |opener, action| {
+            let page = weak.upgrade()?;
+            let allowed = allow_popup(action.is_user_gesture(), action.navigation_type());
+            if !allowed {
+                let refused = page.popups_blocked.get() + 1;
+                page.popups_blocked.set(refused);
+                page.blocked.set_label(&blocked_label(refused));
+                page.blocked.set_visible(true);
+                log::info!(
+                    "browse: refused a popup to {}",
+                    action
+                        .request()
+                        .and_then(|request| request.uri())
+                        .map(|uri| uri.to_string())
+                        .unwrap_or_default()
+                );
+                return None;
+            }
+            let tab = page.open_tab(None, Some(opener));
+            Some(tab.upcast())
+        });
+    }
+
+    /// Make the toolbar describe the tab on show.
+    fn sync_toolbar(&self) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        self.address
+            .set_text(&view.uri().map(|uri| uri.to_string()).unwrap_or_default());
+        self.back.set_sensitive(view.can_go_back());
+        self.forward.set_sensitive(view.can_go_forward());
+        let total = self
+            .tab_state(&view)
+            .map(|(hits, _)| hits.borrow().len())
+            .unwrap_or(0);
+        self.show_count(total);
+    }
+
+    fn show_count(&self, total: usize) {
+        self.found.set_label(&count_label(total));
+        self.found.set_sensitive(total > 0);
+        if total > 0 {
+            self.found.add_css_class("suggested-action");
+        } else {
+            self.found.remove_css_class("suggested-action");
+        }
+    }
+
+    /// Watch what a tab fetches and remember anything worth downloading.
+    fn watch_media(self: &Rc<Self>, view: &webkit6::WebView, hits: &Rc<RefCell<Vec<Hit>>>) {
+        let weak = Rc::downgrade(self);
+        let hits = Rc::clone(hits);
+        let watched = view.clone();
+
+        view.connect_resource_load_started(move |view, resource, request| {
+            // Every request that actually went out. A request the content
+            // blocker stopped never gets here, which makes this the plainest
+            // way to see what was blocked: `RUST_LOG=snatch_gui::ui::browser=trace`.
+            log::trace!(
+                "browse: requesting {}",
+                request.uri().map(|uri| uri.to_string()).unwrap_or_default()
+            );
+            // The page the request belongs to, for the referer a CDN checks.
+            let page_url = view.uri().map(|uri| uri.to_string()).unwrap_or_default();
+            let headers = copy_headers(request.http_headers().as_ref());
+
+            let weak = weak.clone();
+            let hits = Rc::clone(&hits);
+            let watched = watched.clone();
+
+            // Waiting for the answer rather than acting on the request means
+            // the server's own content type decides what this is. Plenty of
+            // media addresses carry no extension to guess from -- a signed
+            // CDN URL ending in a token is the usual shape -- and the answer
+            // is the only thing that knows.
+            //
+            // The answer is read off the resource rather than taken from the
+            // `sent-request` signal. That signal's second argument is the
+            // *redirected* response, which C leaves null for the ordinary
+            // request that was not redirected -- and the binding dereferences
+            // it without checking, inside a callback that cannot unwind. The
+            // result is not an error a caller could handle: the process
+            // aborts, on the first page that loads.
+            resource.connect_response_notify(move |resource| {
+                let Some(response) = resource.response() else {
+                    return;
+                };
+                if !(200..400).contains(&response.status_code()) {
+                    return;
+                }
+                let Some(url) = resource.uri().map(|uri| uri.to_string()) else {
+                    return;
+                };
+                let mime = response
+                    .mime_type()
+                    .map(|mime| mime.to_string())
+                    .unwrap_or_default();
+                let Some(hit) =
+                    classify(&url, &mime, response.content_length(), &page_url, &headers)
+                else {
+                    return;
+                };
+
+                let total = {
+                    let mut hits = hits.borrow_mut();
+                    // A live playlist is re-fetched every few seconds, so
+                    // without this the same broadcast is counted forever.
+                    if hits.iter().any(|known| known.url == hit.url) || hits.len() >= MAX_FINDS {
+                        return;
+                    }
+                    log::info!(
+                        "browse: found {} {} ({} header(s) copied)",
+                        match hit.kind {
+                            Found::Stream => "stream",
+                            Found::File => "file",
+                        },
+                        hit.url,
+                        hit.headers.len()
+                    );
+                    hits.push(hit);
+                    hits.len()
+                };
+
+                // A background tab finding something must not repaint the
+                // counter of the tab on show.
+                if let Some(page) = weak.upgrade()
+                    && page.current_view().as_ref() == Some(&watched)
+                {
+                    page.show_count(total);
+                }
+            });
+        });
+    }
+}
+
+/// Which way a navigation button goes.
+#[derive(Clone, Copy)]
+enum Go {
+    Back,
+    Forward,
+    Reload,
+}
+
+/// Which change to a page should repaint the toolbar.
+#[derive(Clone, Copy)]
+enum Refresh {
+    Uri,
+    Load,
+}
+
+/// Whether a page may open a new window.
+///
+/// Two conditions, and a popunder fails the second even when it passes the
+/// first:
+///
+/// * **Somebody asked.** A popup opened with no click behind it -- on load,
+///   on a timer -- is an ad, every time.
+/// * **They clicked a link.** Popunder networks hijack the first click
+///   anywhere on the page, so they *do* arrive with a user gesture. But that
+///   click was on a video player or an invisible overlay, and the window is
+///   opened from script -- which WebKit reports as `Other`. A genuine "open
+///   in a new tab" is a click on an `<a target="_blank">`, and arrives as
+///   `LinkClicked`.
+///
+/// What slips through -- a script that builds a link and clicks it for you
+/// -- is what the content blocker is for: the networks that do it are on the
+/// list, so their scripts never load.
+fn allow_popup(user_gesture: bool, kind: webkit6::NavigationType) -> bool {
+    user_gesture && kind == webkit6::NavigationType::LinkClicked
+}
+
+/// "3 popups blocked", and "1 popup blocked".
+fn blocked_label(refused: u32) -> String {
+    match refused {
+        1 => "1 popup blocked".to_owned(),
+        many => format!("{many} popups blocked"),
+    }
+}
+
+/// Compile the ad-block rules and give them to every tab.
+///
+/// WebKit compiles a rule list into a matcher and caches it on disk, so this
+/// costs something once and next to nothing after. It is asynchronous: the
+/// first page may load before it is ready, and that page is simply not
+/// filtered, which is better than holding the window up for it.
+fn install_blocklist(content: &webkit6::UserContentManager) {
+    let Some(cache) = dirs::cache_dir().map(|dir| dir.join("snatch-dl").join("content-filters"))
+    else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&cache) {
+        log::warn!(
+            "browse: no ad blocking, cannot create {}: {error}",
+            cache.display()
+        );
+        return;
+    }
+    let store = webkit6::UserContentFilterStore::new(&cache.to_string_lossy());
+    let rules = glib::Bytes::from_owned(super::blocklist::rules_json().into_bytes());
+    let content = content.clone();
+    store.save(
+        "snatch-blocklist",
+        &rules,
+        None::<&gtk::gio::Cancellable>,
+        move |result| match result {
+            Ok(filter) => {
+                content.add_filter(&filter);
+                log::info!(
+                    "browse: ad blocking on ({} networks)",
+                    super::blocklist::blocked_domains().count()
+                );
+            }
+            Err(error) => log::warn!("browse: ad blocking unavailable: {error}"),
+        },
+    );
 }
 
 /// "3 found", and "1 found" rather than "1 founds".
@@ -400,14 +746,6 @@ fn present_finds(
         .child(&toolbar)
         .build();
     dialog.present(Some(anchor));
-}
-
-/// Which way a navigation button goes.
-#[derive(Clone, Copy)]
-enum Navigate {
-    Back,
-    Forward,
-    Reload,
 }
 
 /// Give a typed word a scheme, so "example.com" goes somewhere.
@@ -598,6 +936,41 @@ fn request_for(hit: &Hit) -> DownloadRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use webkit6::NavigationType;
+
+    /// A popup opened with nobody clicking is an ad, every time.
+    #[test]
+    fn a_popup_nobody_asked_for_is_refused() {
+        for kind in [
+            NavigationType::LinkClicked,
+            NavigationType::Other,
+            NavigationType::FormSubmitted,
+        ] {
+            assert!(!allow_popup(false, kind), "{kind:?} with no gesture");
+        }
+    }
+
+    /// The popunder trick: it hijacks the first click anywhere on the page,
+    /// so it *has* a user gesture -- but the window comes from script, not
+    /// from a link, and that is what gives it away.
+    #[test]
+    fn a_popunder_riding_a_real_click_is_still_refused() {
+        assert!(!allow_popup(true, NavigationType::Other));
+        assert!(!allow_popup(true, NavigationType::FormSubmitted));
+    }
+
+    /// A genuine "open in a new tab" is a click on a link, and gets a tab.
+    #[test]
+    fn a_link_the_reader_clicked_opens_as_a_tab() {
+        assert!(allow_popup(true, NavigationType::LinkClicked));
+    }
+
+    #[test]
+    fn the_blocked_count_reads_properly() {
+        assert_eq!(blocked_label(1), "1 popup blocked");
+        assert_eq!(blocked_label(4), "4 popups blocked");
+    }
 
     #[test]
     fn the_counter_says_how_many_and_says_one_properly() {

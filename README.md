@@ -426,6 +426,18 @@ It works because it is a browser: the page's own code runs, and Snatch watches
 the requests that code makes, headers included, so what it saves is what the
 player was watching.
 
+**Tabs.** Open as many as you like with the **+** button. Each tab keeps its
+own list of what it found, so a stream from one channel is never offered
+while you are looking at another.
+
+**Popups and ads are blocked.** Streaming sites pay for themselves with
+popunders — a script that grabs your first click anywhere on the page and
+opens an ad window behind it. Snatch refuses a new window unless you clicked
+an actual link, and says how many it stopped. It also refuses to load the
+scripts of about sixty ad and popunder networks at all, so most of those
+windows are never even tried. The list names ad companies only, never the
+sites that serve the video, so it cannot break what you came to record.
+
 Go anywhere else in Snatch straight after pressing the button. The download
 has already been handed over and carries on without the page.
 
