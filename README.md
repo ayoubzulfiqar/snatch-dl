@@ -481,8 +481,22 @@ download.
 **A recording keeps going when the connection does not.** A broadcast is
 hours of somebody else's network and it will drop — an edge rotates, a
 segment goes missing for a moment, the wifi hands over. Snatch reconnects and
-carries on, backing off up to half a minute. Before, the first hiccup ended
-the recording and left whatever had arrived.
+carries on, backing off up to half a minute.
+
+If the stream goes away for longer than that, Snatch waits and tries again,
+and stitches the pieces together at the end. It only gives up once a few tries
+in a row come back with nothing, which means the broadcast really is over.
+Tested with a stream that went away for 45 seconds and came back: the file
+holds both halves. Before, it would have stopped at the first drop.
+
+**Live streams are saved as `.ts`.** That is the format live TV is already
+sent in, and it copes with the jumps an ad break causes, where other formats
+drift out of sync. Streams in formats `.ts` cannot hold are saved as `.mkv`
+instead.
+
+**Streams that disguise themselves still work.** Many live sites name each
+piece of video like a picture — `.jpg`, `.png` — to slip past filters. FFmpeg
+refuses those by default. Snatch tells it not to.
 
 ---
 

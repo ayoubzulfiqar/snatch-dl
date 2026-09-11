@@ -1052,6 +1052,54 @@ pub fn unique_path(directory: &Path, name: &str, extension: &str) -> PathBuf {
 /// ffmpeg is asked to finish, so the file is closed properly and plays. The
 /// task can still be aborted outright, which kills ffmpeg mid-write -- which
 /// is the other reason a live recording goes to Matroska.
+/// A continuation that captured at least this much was a real stretch of
+/// broadcast, so the stream is still going and is worth picking up again.
+const MEANINGFUL_PART: Duration = Duration::from_secs(10);
+
+/// Continuations in a row that captured less than `MEANINGFUL_PART` before
+/// the recording accepts that the broadcast is over. A stream that has truly
+/// ended, or a signed address that has expired, fails fast every time; three
+/// of those in a row is not a hiccup.
+const GIVE_UP_AFTER: u32 = 3;
+
+/// What to do when a part of a recording ends on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Continuation {
+    /// It was meant to end: a file, or a length that has been reached.
+    Done,
+    /// It kept coming back empty; the broadcast is over.
+    Over(u32),
+    /// Pick it up again, carrying this many empty continuations in a row.
+    Again(u32),
+}
+
+/// Decide whether a part that ended by itself is the end of the recording.
+///
+/// Only an open-ended recording of a live stream is ever continued: anything
+/// with an end, or with a length asked for, ended because it was meant to.
+/// A part that captured a real stretch resets the count, because the stream
+/// was plainly still going; a run of near-empty ones means it is not.
+fn keep_recording(
+    live: bool,
+    open_ended: bool,
+    captured: Duration,
+    empty_so_far: u32,
+) -> Continuation {
+    if !live || !open_ended {
+        return Continuation::Done;
+    }
+    let empty = if captured >= MEANINGFUL_PART {
+        0
+    } else {
+        empty_so_far + 1
+    };
+    if empty >= GIVE_UP_AFTER {
+        Continuation::Over(empty)
+    } else {
+        Continuation::Again(empty)
+    }
+}
+
 /// What ended one part of a recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PartEnd {
@@ -1189,8 +1237,11 @@ pub async fn record(
     let mut parts: Vec<PathBuf> = Vec::new();
     let mut progress = VideoProgress::default();
     let mut recorded = Duration::ZERO;
+    // Continuations in a row that came back with nothing. See `PartEnd::Source`.
+    let mut empty_continuations = 0u32;
 
     loop {
+        let recorded_before = recorded;
         // The length asked for covers the recording, not the wall clock, so
         // what a paused stretch missed does not count against it.
         let remaining = match limit {
@@ -1225,27 +1276,121 @@ pub async fn record(
         // whether they can be used.
         parts.push(part);
 
+        // Whether this part failed partway, rather than finishing or being
+        // told to stop.
+        let mut failed = false;
         let ended = match outcome {
             Ok(ended) => ended,
             // Nothing has been recorded yet, so the reason it failed is the
             // whole answer.
             Err(error) if usable(&parts).is_empty() => return Err(error),
-            // Something has. A broadcast that ended while the recording was
-            // paused must not cost the hour that was already captured.
+            // Something has. That must not be lost -- and for an open-ended
+            // broadcast, an error partway is what a dropped connection looks
+            // like: ffmpeg does not exit cleanly when the network goes, it
+            // exits with "connection reset" or an HTTP error. Counting it as
+            // the part ending on its own is what lets the drop be picked up
+            // again, instead of only the rarer clean stop.
             Err(error) => {
-                log::warn!("stream job {job_id} ended early: {error:#}");
-                let _ = events
-                    .send(VideoEvent::Title {
-                        job_id,
-                        title: format!("{name} (the stream ended)"),
-                    })
-                    .await;
-                break;
+                log::warn!("stream job {job_id}: this part ended with an error: {error:#}");
+                failed = true;
+                PartEnd::Source
             }
         };
 
         match ended {
-            PartEnd::Source | PartEnd::Stopped => break,
+            PartEnd::Stopped => break,
+            // ffmpeg exited cleanly. With a length asked for, that is the
+            // length being reached, and the recording is done. Without one it
+            // means something else: a broadcast is not over because Snatch
+            // is finished with it, it is over because the stream stopped
+            // arriving -- a playlist that stalled, an edge that went away, a
+            // CDN that dropped the connection and would have taken a fresh
+            // one. Treating that as the end is how an open-ended recording of
+            // a three-hour event quietly became forty minutes.
+            //
+            // So a live one is picked up again as a new part, which the join
+            // stitches back together. It stops being picked up once
+            // continuations keep coming back empty: that is a broadcast that
+            // really has ended, or a signed address that has expired and
+            // will not work again however often it is asked.
+            PartEnd::Source => {
+                let open_ended = limit.is_none_or(|limit| limit.is_zero());
+                let captured = recorded.saturating_sub(recorded_before);
+                match keep_recording(info.is_live(), open_ended, captured, empty_continuations) {
+                    Continuation::Done => {
+                        // Not a broadcast to pick up again, but it did stop
+                        // before it should have, and the row should say so.
+                        if failed {
+                            let _ = events
+                                .send(VideoEvent::Title {
+                                    job_id,
+                                    title: format!("{name} (the stream ended)"),
+                                })
+                                .await;
+                        }
+                        break;
+                    }
+                    Continuation::Over(tries) => {
+                        log::info!(
+                            "stream job {job_id}: {tries} empty continuations in a row; \
+                             the broadcast has ended"
+                        );
+                        let _ = events
+                            .send(VideoEvent::Title {
+                                job_id,
+                                title: format!("{name} (the stream ended)"),
+                            })
+                            .await;
+                        break;
+                    }
+                    Continuation::Again(empty) => empty_continuations = empty,
+                }
+                log::info!(
+                    "stream job {job_id}: the stream stopped arriving after {}s of this part; \
+                     picking it up again",
+                    captured.as_secs()
+                );
+                let _ = events
+                    .send(VideoEvent::Title {
+                        job_id,
+                        title: format!("{name} (reconnecting)"),
+                    })
+                    .await;
+                // Long enough for an edge to come back, and still something
+                // the buttons can interrupt. Pause has to be honoured here as
+                // well as Stop: someone who pauses a recording while it is
+                // reconnecting means it, and would otherwise find it had
+                // quietly started again behind their back.
+                let wait = Duration::from_secs(2 + 3 * u64::from(empty_continuations));
+                tokio::select! {
+                    _ = sleep(wait) => {}
+                    command = control.recv() => match command {
+                        Some(Control::Stop) | None => break,
+                        Some(Control::Pause) => {
+                            let _ = events
+                                .send(VideoEvent::Title {
+                                    job_id,
+                                    title: format!("{name} (paused)"),
+                                })
+                                .await;
+                            match control.recv().await {
+                                Some(Control::Resume) => {
+                                    let _ = events
+                                        .send(VideoEvent::Title {
+                                            job_id,
+                                            title: format!("{name} ({described})"),
+                                        })
+                                        .await;
+                                }
+                                _ => break,
+                            }
+                        }
+                        // Not paused, so there is nothing to resume.
+                        Some(Control::Resume) => {}
+                    },
+                }
+                continue;
+            }
             PartEnd::Paused => {
                 let _ = events
                     .send(VideoEvent::Title {
@@ -2094,6 +2239,65 @@ mod tests {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+
+    /// An open-ended live recording that stops arriving is picked up again
+    /// -- the three-hour event that used to end as forty minutes.
+    #[test]
+    fn a_broadcast_that_stops_arriving_is_picked_up_again() {
+        // It had been recording happily, then the stream dropped.
+        assert_eq!(
+            keep_recording(true, true, Duration::from_secs(2400), 0),
+            Continuation::Again(0)
+        );
+    }
+
+    /// A stream that recovers only briefly each time is still broadcasting,
+    /// and a real stretch resets the count of empty tries.
+    #[test]
+    fn a_real_stretch_resets_the_count() {
+        assert_eq!(
+            keep_recording(true, true, Duration::from_secs(30), 2),
+            Continuation::Again(0)
+        );
+    }
+
+    /// A broadcast that has truly ended, or an address that has expired,
+    /// fails fast every time. Three of those is not a hiccup.
+    #[test]
+    fn a_run_of_empty_continuations_is_the_end() {
+        let mut empty = 0;
+        for attempt in 1..=GIVE_UP_AFTER {
+            match keep_recording(true, true, Duration::from_millis(300), empty) {
+                Continuation::Again(next) => {
+                    assert!(attempt < GIVE_UP_AFTER, "should have given up by now");
+                    empty = next;
+                }
+                Continuation::Over(tries) => {
+                    assert_eq!(attempt, GIVE_UP_AFTER);
+                    assert_eq!(tries, GIVE_UP_AFTER);
+                    return;
+                }
+                Continuation::Done => panic!("a live open-ended stream is not simply done"),
+            }
+        }
+        panic!("it never gave up on a stream that keeps coming back empty");
+    }
+
+    /// Only an open-ended live recording is continued. A length that has been
+    /// reached, or a recording of something with an end, is finished.
+    #[test]
+    fn a_finished_length_or_a_file_is_simply_done() {
+        // A length was asked for and reached.
+        assert_eq!(
+            keep_recording(true, false, Duration::from_secs(600), 0),
+            Continuation::Done
+        );
+        // Not live at all.
+        assert_eq!(
+            keep_recording(false, true, Duration::from_secs(600), 0),
+            Continuation::Done
+        );
+    }
 
     /// The row that appears because ffprobe could not describe a stream has
     /// to be recordable, or offering it was a lie.
