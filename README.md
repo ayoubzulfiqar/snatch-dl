@@ -443,6 +443,14 @@ has already been handed over and carries on without the page.
 
 From a terminal: `snatch-gui --browse https://example.com/live`.
 
+**It captures video the page builds itself.** Some players never send a whole
+file over the network — they fetch pieces, sometimes decrypt or reassemble
+them in the page, and feed them to the video a chunk at a time. There is
+nothing on the network to grab. Snatch watches the video being fed inside the
+page and can save it: press the **found** button, choose **Capture**, and when
+you have enough press **Save**. Video and sound, which players usually feed
+separately, are joined into one file for you.
+
 **It cannot open DRM.** A page locked with DRM hands its key to a part of the
 browser that never gives it back, and there is no such part here — so those
 pages will not play. That is not a limit of Snatch: no download tool can save

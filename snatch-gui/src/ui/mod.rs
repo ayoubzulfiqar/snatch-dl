@@ -20,6 +20,8 @@ mod downloads;
 mod format;
 mod graph;
 mod history;
+#[cfg(feature = "webview")]
+mod mse;
 mod proxy;
 mod scraper;
 mod settings;

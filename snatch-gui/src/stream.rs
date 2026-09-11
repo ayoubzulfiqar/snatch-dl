@@ -124,7 +124,7 @@ pub fn normalise_url(url: &str) -> String {
     }
 }
 
-fn ffmpeg_binary() -> String {
+pub fn ffmpeg_binary() -> String {
     std::env::var("SNATCH_FFMPEG")
         .ok()
         .filter(|value| !value.trim().is_empty())

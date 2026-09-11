@@ -52,6 +52,10 @@ wreq = { version = "0.16", default-features = false, features = [
 # The browser profiles themselves: Chrome, Firefox, Safari and their versions.
 wreq-util = "0.2"
 
+# Decodes the base64 the in-page capture hook sends its media chunks as. Only
+# needed with the browser, so it rides the same feature.
+base64 = { version = "0.22", optional = true }
+
 # Reads a DASH manifest properly, so `MPD@type` answers "is this live?"
 # instead of it being inferred from whether ffprobe reported a duration.
 # Parser only -- `default-features = false` drops its own HTTP stack, which
@@ -91,7 +95,7 @@ default = ["webview"]
 # The in-app browser. Needs the `webkitgtk-6.0` development files to build
 # and the WebKitGTK runtime to run; `--no-default-features` leaves both out
 # and takes the Browse window with them.
-webview = ["dep:webkit6"]
+webview = ["dep:webkit6", "dep:base64"]
 
 [dev-dependencies]
 # Tests only: runs the ad-block rules exactly as written against real

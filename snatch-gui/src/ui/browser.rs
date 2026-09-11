@@ -108,6 +108,12 @@ struct Tab {
     view: webkit6::WebView,
     hits: Rc<RefCell<Vec<Hit>>>,
     queued: Rc<RefCell<Vec<String>>>,
+    /// Video this tab's player assembled in JavaScript. See `mse.rs`.
+    mse: Rc<RefCell<super::mse::MseCapture>>,
+    /// The tab's own content manager, kept so it -- and the ad-block filter
+    /// and capture handler on it -- is freed when the tab closes rather than
+    /// living for the session.
+    content: webkit6::UserContentManager,
 }
 
 /// The Browse page: tabs of real browsers, and what each one found.
@@ -127,19 +133,20 @@ pub struct BrowserPage {
     /// rather than something that might or might not be happening.
     blocked: gtk::Label,
     popups_blocked: Cell<u32>,
-    /// Shared by every tab, and carrying the ad-block rules -- so a filter
-    /// compiled once applies everywhere, including to a tab opened later.
-    content: webkit6::UserContentManager,
+    /// The ad-block rules, compiled once and shared. Each tab has its own
+    /// content manager -- so that a script message can be told which tab sent
+    /// it -- and the one compiled filter is added to every one of them.
+    blocklist: Rc<RefCell<Option<webkit6::UserContentFilter>>>,
     open_tabs: RefCell<Vec<Tab>>,
     /// For queuing. Set by `attach`, once the rest of the window exists.
     ui: RefCell<Option<Weak<Ui>>>,
 }
 
+/// The page-world script that captures in-page video. See `mse.rs`.
+const MSE_HOOK: &str = include_str!("mse-hook.js");
+
 impl BrowserPage {
     pub fn new() -> Rc<Self> {
-        let content = webkit6::UserContentManager::new();
-        install_blocklist(&content);
-
         let tabs = adw::TabView::new();
         tabs.set_vexpand(true);
         let tab_bar = adw::TabBar::builder().view(&tabs).autohide(false).build();
@@ -202,11 +209,12 @@ impl BrowserPage {
             found,
             blocked,
             popups_blocked: Cell::new(0),
-            content,
+            blocklist: Rc::new(RefCell::new(None)),
             open_tabs: RefCell::new(Vec::new()),
             ui: RefCell::new(None),
         });
 
+        page.compile_blocklist();
         page.wire(&reload, &new_tab);
         // There is always a tab to type into.
         page.open_tab(None, None);
@@ -223,6 +231,99 @@ impl BrowserPage {
     /// being assembled.
     pub fn attach(&self, ui: &Rc<Ui>) {
         *self.ui.borrow_mut() = Some(Rc::downgrade(ui));
+    }
+
+    /// Compile the ad-block rules once, then add them to every tab.
+    ///
+    /// WebKit compiles a rule list into a matcher and caches it on disk, so
+    /// this costs something the first time and next to nothing after. It is
+    /// asynchronous: a tab that opens before it finishes gets the filter the
+    /// moment it is ready, and the first page it loads is simply unfiltered,
+    /// which is better than holding the window up for it.
+    fn compile_blocklist(self: &Rc<Self>) {
+        let Some(cache) =
+            dirs::cache_dir().map(|dir| dir.join("snatch-dl").join("content-filters"))
+        else {
+            return;
+        };
+        if let Err(error) = std::fs::create_dir_all(&cache) {
+            log::warn!(
+                "browse: no ad blocking, cannot create {}: {error}",
+                cache.display()
+            );
+            return;
+        }
+        let store = webkit6::UserContentFilterStore::new(&cache.to_string_lossy());
+        let rules = glib::Bytes::from_owned(super::blocklist::rules_json().into_bytes());
+        let weak = Rc::downgrade(self);
+        store.save(
+            "snatch-blocklist",
+            &rules,
+            None::<&gtk::gio::Cancellable>,
+            move |result| match result {
+                Ok(filter) => {
+                    let Some(page) = weak.upgrade() else { return };
+                    // Every tab that already exists, and every one to come.
+                    for tab in page.open_tabs.borrow().iter() {
+                        tab.content.add_filter(&filter);
+                    }
+                    *page.blocklist.borrow_mut() = Some(filter);
+                    log::info!(
+                        "browse: ad blocking on ({} networks)",
+                        super::blocklist::blocked_domains().count()
+                    );
+                }
+                Err(error) => log::warn!("browse: ad blocking unavailable: {error}"),
+            },
+        );
+    }
+
+    /// Install the in-page capture hook on a tab's content manager and route
+    /// what it sends into that tab's capture.
+    fn wire_capture(
+        self: &Rc<Self>,
+        content: &webkit6::UserContentManager,
+        mse: &Rc<RefCell<super::mse::MseCapture>>,
+    ) {
+        content.register_script_message_handler("snatchMse", None);
+
+        let weak = Rc::downgrade(self);
+        let mse = Rc::clone(mse);
+        content.connect_script_message_received(Some("snatchMse"), move |_cm, value| {
+            let update = mse.borrow_mut().handle(&value.to_str());
+            if let super::mse::Update::Present { ms, bytes: 0 } = update {
+                log::info!("browse: in-page video detected (ms {ms})");
+            }
+            // A stream appearing or growing may change the counter, but only
+            // for the tab on show -- a background tab must not repaint it.
+            if let super::mse::Update::Present { .. } | super::mse::Update::Ended { .. } = update
+                && let Some(page) = weak.upgrade()
+                && page
+                    .current_capture()
+                    .is_some_and(|current| Rc::ptr_eq(&current, &mse))
+            {
+                page.sync_toolbar();
+            }
+        });
+
+        let script = webkit6::UserScript::new(
+            MSE_HOOK,
+            webkit6::UserContentInjectedFrames::AllFrames,
+            webkit6::UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        );
+        content.add_script(&script);
+    }
+
+    /// The capture belonging to the tab on show.
+    fn current_capture(&self) -> Option<Rc<RefCell<super::mse::MseCapture>>> {
+        let view = self.current_view()?;
+        self.open_tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.view == view)
+            .map(|tab| Rc::clone(&tab.mse))
     }
 
     /// Go to an address in the tab on show, or just focus the bar.
@@ -342,11 +443,16 @@ impl BrowserPage {
                 let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) else {
                     return;
                 };
-                let Some((hits, queued)) = page.current_view().and_then(|v| page.tab_state(&v))
-                else {
+                let Some(view) = page.current_view() else {
                     return;
                 };
-                present_finds(&ui, button, &hits, &queued);
+                let Some((hits, queued)) = page.tab_state(&view) else {
+                    return;
+                };
+                let Some(mse) = page.current_capture() else {
+                    return;
+                };
+                present_finds(&ui, button, &view, &hits, &queued, &mse);
             });
         }
     }
@@ -361,12 +467,24 @@ impl BrowserPage {
         url: Option<&str>,
         opener: Option<&webkit6::WebView>,
     ) -> webkit6::WebView {
-        let view = match opener {
-            Some(opener) => webkit6::WebView::builder().related_view(opener).build(),
-            None => webkit6::WebView::builder()
-                .user_content_manager(&self.content)
-                .build(),
-        };
+        // Each tab has its own content manager, so a script message can be
+        // attributed to the tab it came from: the received signal names no
+        // WebView, and the hook's stream ids restart at one per page, so a
+        // shared manager could not tell two tabs' captures apart.
+        let content = webkit6::UserContentManager::new();
+        let mse = Rc::new(RefCell::new(super::mse::MseCapture::new(capture_dir())));
+        self.wire_capture(&content, &mse);
+        if let Some(filter) = self.blocklist.borrow().as_ref() {
+            content.add_filter(filter);
+        }
+
+        let mut builder = webkit6::WebView::builder().user_content_manager(&content);
+        // A popup must be related to the page that opened it, or WebKit will
+        // not hand it its content.
+        if let Some(opener) = opener {
+            builder = builder.related_view(opener);
+        }
+        let view = builder.build();
         view.set_vexpand(true);
 
         // Send every popup through `guard_popups`, including the ones WebKit
@@ -387,6 +505,8 @@ impl BrowserPage {
             view: view.clone(),
             hits: Rc::clone(&hits),
             queued,
+            mse: Rc::clone(&mse),
+            content,
         });
 
         let tab = self.tabs.append(&view);
@@ -486,11 +606,16 @@ impl BrowserPage {
             .set_text(&view.uri().map(|uri| uri.to_string()).unwrap_or_default());
         self.back.set_sensitive(view.can_go_back());
         self.forward.set_sensitive(view.can_go_forward());
-        let total = self
+        let network = self
             .tab_state(&view)
             .map(|(hits, _)| hits.borrow().len())
             .unwrap_or(0);
-        self.show_count(total);
+        // Video the page assembled in JavaScript counts too.
+        let in_page = self
+            .current_capture()
+            .map(|mse| mse.borrow().sources().len())
+            .unwrap_or(0);
+        self.show_count(network + in_page);
     }
 
     fn show_count(&self, total: usize) {
@@ -640,36 +765,12 @@ fn blocked_label(refused: u32) -> String {
 /// costs something once and next to nothing after. It is asynchronous: the
 /// first page may load before it is ready, and that page is simply not
 /// filtered, which is better than holding the window up for it.
-fn install_blocklist(content: &webkit6::UserContentManager) {
-    let Some(cache) = dirs::cache_dir().map(|dir| dir.join("snatch-dl").join("content-filters"))
-    else {
-        return;
-    };
-    if let Err(error) = std::fs::create_dir_all(&cache) {
-        log::warn!(
-            "browse: no ad blocking, cannot create {}: {error}",
-            cache.display()
-        );
-        return;
-    }
-    let store = webkit6::UserContentFilterStore::new(&cache.to_string_lossy());
-    let rules = glib::Bytes::from_owned(super::blocklist::rules_json().into_bytes());
-    let content = content.clone();
-    store.save(
-        "snatch-blocklist",
-        &rules,
-        None::<&gtk::gio::Cancellable>,
-        move |result| match result {
-            Ok(filter) => {
-                content.add_filter(&filter);
-                log::info!(
-                    "browse: ad blocking on ({} networks)",
-                    super::blocklist::blocked_domains().count()
-                );
-            }
-            Err(error) => log::warn!("browse: ad blocking unavailable: {error}"),
-        },
-    );
+/// A fresh temp directory for one tab's in-page captures.
+fn capture_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("snatch-mse-{}-{n}", std::process::id()))
 }
 
 /// "3 found", and "1 found" rather than "1 founds".
@@ -688,13 +789,21 @@ fn count_label(total: usize) -> String {
 fn present_finds(
     ui: &Rc<Ui>,
     anchor: &gtk::Button,
+    view: &webkit6::WebView,
     hits: &Rc<RefCell<Vec<Hit>>>,
     queued: &Rc<RefCell<Vec<String>>>,
+    mse: &Rc<RefCell<super::mse::MseCapture>>,
 ) {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
+
+    // Video the page assembled in JavaScript comes first: it is the thing
+    // that nothing else could get, which is the reason to be here.
+    for ms in mse.borrow().sources() {
+        list.append(&mse_row(ui, view, mse, ms));
+    }
 
     // Newest first: on a page that has been browsed for a while, the thing
     // just played is the thing being asked for.
@@ -846,6 +955,135 @@ fn copy_headers(headers: Option<&webkit6::soup::MessageHeaders>) -> BTreeMap<Str
 }
 
 /// One row, with the button that queues it.
+/// A row for video the page is assembling in JavaScript.
+///
+/// Capture is two steps on purpose. The first arms it: from then on every
+/// piece the player appends is kept, and for a live stream that is what you
+/// want -- capture now, save when you have enough. The second saves what has
+/// been kept so far into one file. A row opened before arming offers Capture;
+/// after, once there are bytes, it offers Save.
+fn mse_row(
+    ui: &Rc<Ui>,
+    view: &webkit6::WebView,
+    mse: &Rc<RefCell<super::mse::MseCapture>>,
+    ms: i64,
+) -> gtk::ListBoxRow {
+    let (armed, bytes, has_data) = {
+        let capture = mse.borrow();
+        (
+            capture.is_armed(ms),
+            capture.bytes(ms),
+            capture.has_data(ms),
+        )
+    };
+
+    let size = if bytes > 0 {
+        format!(" · {}", super::format::human_bytes(bytes))
+    } else {
+        String::new()
+    };
+    let title = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .label(format!("In-page video{size}"))
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+
+    let action = gtk::Button::builder()
+        .css_classes(["suggested-action"])
+        .valign(gtk::Align::Center)
+        .build();
+
+    if !armed {
+        action.set_label("Capture");
+        let ui = Rc::clone(ui);
+        let view = view.clone();
+        let mse = Rc::clone(mse);
+        action.connect_clicked(move |button| {
+            mse.borrow_mut().arm(ms);
+            // Tell the page to start sending the pieces it has been holding.
+            view.evaluate_javascript(
+                &format!("window.__snatchArm({ms})"),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                |_| {},
+            );
+            button.set_label("Capturing…");
+            button.set_sensitive(false);
+            ui.toast("Capturing the video — open the list again to save it");
+        });
+    } else if has_data {
+        action.set_label("Save");
+        let ui = Rc::clone(ui);
+        let mse = Rc::clone(mse);
+        let name = capture_name(view);
+        action.connect_clicked(move |button| {
+            let Some(plan) = mse.borrow().plan(ms) else {
+                return;
+            };
+            button.set_label("Saving…");
+            button.set_sensitive(false);
+            let dest = crate::ytdlp::destination_for(&ui.backend().download_dir);
+            let name = name.clone();
+            let ui = Rc::clone(&ui);
+            glib::spawn_future_local(async move {
+                let result = ui
+                    .backend()
+                    .offload(async move { plan.mux(&dest, &name).await })
+                    .await;
+                match result {
+                    Ok(path) => ui.toast(&format!(
+                        "Saved {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                    Err(error) => ui.toast(&format!("Could not save the capture: {error:#}")),
+                }
+            });
+        });
+    } else {
+        action.set_label("Capturing…");
+        action.set_sensitive(false);
+    }
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    content.append(&title);
+    content.append(&action);
+
+    gtk::ListBoxRow::builder()
+        .child(&content)
+        .activatable(false)
+        .build()
+}
+
+/// A filename for a capture, from the page's title.
+fn capture_name(view: &webkit6::WebView) -> String {
+    let title = view.title().map(|t| t.to_string()).unwrap_or_default();
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "capture".to_owned()
+    } else {
+        cleaned.chars().take(120).collect()
+    }
+}
+
 fn row(ui: &Rc<Ui>, hit: &Hit, queued: &Rc<RefCell<Vec<String>>>) -> gtk::ListBoxRow {
     let already = queued.borrow().iter().any(|url| url == &hit.url);
     let title = gtk::Label::builder()
