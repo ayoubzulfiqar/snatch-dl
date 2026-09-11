@@ -294,6 +294,21 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    /// What to record from when nothing could describe the stream.
+    ///
+    /// A broadcast, because a stream nothing could measure in the time
+    /// allowed is overwhelmingly a live one, and because treating it as live
+    /// is the safe error: it records into Matroska, which survives being
+    /// stopped mid-write, where treating a broadcast as a file would write an
+    /// MP4 whose index is only written at the end -- and a live stream has no
+    /// end.
+    pub fn undescribed() -> Self {
+        Self {
+            live: Some(true),
+            ..Self::default()
+        }
+    }
+
     /// A stream with no duration is one that has not finished happening --
     /// unless something authoritative already said otherwise.
     ///
@@ -386,8 +401,51 @@ impl StreamInfo {
     }
 
     /// Matroska for a live recording; see the module docs.
+    /// The file a recording of this should be written as.
+    ///
+    /// MP4 for something with an end: it is what everything plays, and its
+    /// index can be written once the end arrives.
+    ///
+    /// A broadcast has no end, so it needs a container that survives being
+    /// stopped mid-write -- and that also survives the broadcast itself.
+    /// Matroska was the answer here until the VideoHelp forum's long-running
+    /// experience said otherwise: a live HLS stream carries
+    /// `EXT-X-DISCONTINUITY` at every ad break and encoder restart, and its
+    /// timestamps jump there. Remuxing that into Matroska produced audio that
+    /// went high-pitched, dropped to silence and drifted out of sync, where
+    /// writing the same stream as MPEG-TS "stayed synced up" across a whole
+    /// day. That is not a coincidence: HLS segments already *are* MPEG-TS, a
+    /// broadcast container built to carry exactly those jumps.
+    ///
+    /// So TS, when TS can hold what is coming. It cannot hold everything --
+    /// VP9, AV1 and Opus from a DASH broadcast have no proper place in it --
+    /// and those still go to Matroska, which takes any codec.
     pub fn container(&self) -> &'static str {
-        if self.is_live() { "mkv" } else { "mp4" }
+        if !self.is_live() {
+            return "mp4";
+        }
+        if self.fits_transport_stream() {
+            "ts"
+        } else {
+            "mkv"
+        }
+    }
+
+    /// Whether every codec already known here has a place in MPEG-TS.
+    ///
+    /// A codec that is not known yet is not held against it: the one case
+    /// with nothing known at all is decided by the caller, which has the
+    /// address and so knows whether it is HLS.
+    fn fits_transport_stream(&self) -> bool {
+        const VIDEO: [&str; 4] = ["h264", "hevc", "mpeg2video", "mpeg1video"];
+        const AUDIO: [&str; 5] = ["aac", "mp3", "mp2", "ac3", "eac3"];
+        self.video_codec
+            .as_deref()
+            .is_none_or(|codec| VIDEO.contains(&codec))
+            && self
+                .audio_codec
+                .as_deref()
+                .is_none_or(|codec| AUDIO.contains(&codec))
     }
 }
 
@@ -477,6 +535,7 @@ pub async fn probe(url: &str, headers: &Headers) -> Result<StreamInfo> {
         // with its own sound rather than another variant's.
         .arg("-show_programs");
     apply_headers(&mut command, headers);
+    apply_hls_tolerance(&mut command, url);
     command
         .arg("-i")
         .arg(url)
@@ -774,6 +833,43 @@ pub fn extension_of(url: &str) -> Option<String> {
     Some(extension.to_ascii_lowercase())
 }
 
+/// Whether an address names an HLS playlist.
+pub fn is_hls(url: &str) -> bool {
+    matches!(extension_of(url).as_deref(), Some("m3u8" | "m3u"))
+}
+
+/// Let ffmpeg and ffprobe read the HLS streams that live sites actually serve.
+///
+/// Two of the HLS demuxer's defaults are wrong for live television, and both
+/// fail silently from the reader's side:
+///
+/// * `extension_picky` is on, and the segment extensions it allows do not
+///   include `jpg`, `png`, `gif`, `webp` or `txt`. A great many live sites
+///   serve their segments under exactly those names, to slip past CDN
+///   filtering and ad blockers. ffmpeg 8 refuses every one of them --
+///   "is not in allowed_segment_extensions", then "Invalid data found when
+///   processing input" -- and that same refusal from ffprobe is what made a
+///   stream that played perfectly in the browser fail the moment it was
+///   clicked. Checked against a stream built the same way: nothing at all
+///   with the default, 979 KB with this off.
+/// * `seg_max_retry` is zero, so a segment that fails once is never asked for
+///   again. At the live edge a segment briefly 404s as a matter of routine.
+///
+/// These are options of the HLS demuxer *only*. Given to ffmpeg for an MP4 or
+/// an RTSP camera they are not ignored: "Option extension_picky not found",
+/// and the input fails to open. So they are passed only when the address is a
+/// playlist, and never otherwise.
+fn apply_hls_tolerance(command: &mut Command, url: &str) {
+    if !is_hls(url) {
+        return;
+    }
+    command
+        .arg("-extension_picky")
+        .arg("0")
+        .arg("-seg_max_retry")
+        .arg("10");
+}
+
 /// Keep a recording alive across the things that happen to long ones.
 ///
 /// A broadcast is not a file: it is hours of somebody else's network, and it
@@ -1035,7 +1131,30 @@ pub async fn record(
 
     // Probing decides the container and which quality to take, and turns the
     // row in the window from "stream" into "1080p live" before a byte lands.
-    let info = probe(url, headers).await?;
+    //
+    // It must not decide whether there is a recording at all. ffprobe has to
+    // fetch every variant of a master and part of a segment from each before
+    // it answers, inside a fixed budget, and on a slow or awkward live stream
+    // it often cannot -- while ffmpeg, which only has to start reading, can.
+    // This line used to end in `?`, so a stream the listing had offered as
+    // "Live stream" precisely because ffprobe could not describe it was then
+    // refused the moment it was clicked, by the same ffprobe, for the same
+    // reason. Nothing could record the one kind of stream the listing had
+    // gone out of its way to keep.
+    //
+    // Undescribed, it is recorded as what it almost certainly is: a
+    // broadcast, into Matroska so Stop leaves a playable file, with no `-map`
+    // so ffmpeg chooses the best video and audio itself.
+    let info = match probe(url, headers).await {
+        Ok(info) => info,
+        Err(error) => {
+            log::warn!(
+                "stream job {job_id}: ffprobe could not describe {url} ({error:#}); \
+                 recording it anyway"
+            );
+            StreamInfo::undescribed()
+        }
+    };
     let chosen = info.choose(*height);
     let described = match &chosen {
         Some(rendition) => info.label_for(rendition),
@@ -1050,7 +1169,16 @@ pub async fn record(
 
     std::fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
-    let extension = info.container();
+    // With nothing described, the codecs are unknown. For HLS that is still
+    // almost certainly H.264 and AAC, which TS carries; for anything else it
+    // could be VP9 or Opus, which it does not, so the container that takes
+    // any codec is the safe choice there.
+    let described_nothing = info.video_codec.is_none() && info.audio_codec.is_none();
+    let extension = if described_nothing && !is_hls(url) {
+        "mkv"
+    } else {
+        info.container()
+    };
     // Chosen up front so every part of one recording shares a stem, even if
     // another recording of the same programme is running beside it.
     let stem = unique_path(directory.as_path(), &name, extension)
@@ -1321,6 +1449,11 @@ async fn run_part(
     command.arg("-hide_banner").arg("-loglevel").arg("error");
     apply_headers(&mut command, headers);
     apply_reconnect(&mut command);
+    apply_hls_tolerance(&mut command, url);
+    // Fill in a timestamp a broadcast left out, and drop a frame that arrived
+    // broken rather than writing it: a live edge produces both. Safe for any
+    // input, unlike the HLS options above.
+    command.arg("-fflags").arg("+genpts+discardcorrupt");
     // Seeking before the input is the fast kind: ffmpeg jumps to the nearest
     // keyframe rather than decoding its way there. With `-c copy` that is the
     // only kind available, and a keyframe is where a copied stream has to
@@ -1527,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_playlist_has_no_duration_and_records_to_matroska() {
+    fn a_live_playlist_has_no_duration_and_records_to_transport_stream() {
         // ffprobe omits `duration` entirely for a live HLS playlist.
         let info = probe_of(
             r#"{"streams":[{"codec_type":"video","codec_name":"h264","height":1080},
@@ -1536,9 +1669,73 @@ mod tests {
         );
         assert!(info.is_live());
         assert_eq!(info.label(), "1080p live");
-        // An MP4 written without a moov atom will not open, and stopping the
-        // recording is the only way a live one ever ends.
-        assert_eq!(info.container(), "mkv");
+        // Not MP4: its index is written at the end, and a broadcast is only
+        // ever ended by stopping it. Not Matroska either: across an ad
+        // break's discontinuity it drifts out of sync, where TS -- which the
+        // segments already are -- holds it.
+        assert_eq!(info.container(), "ts");
+    }
+
+    /// TS cannot carry everything, and a broadcast that sends what it cannot
+    /// still has to be recordable.
+    #[test]
+    fn a_broadcast_in_codecs_ts_cannot_hold_goes_to_matroska() {
+        for (video, audio) in [("vp9", "opus"), ("av1", "aac"), ("h264", "opus")] {
+            let json = format!(
+                r#"{{"streams":[{{"codec_type":"video","codec_name":"{video}","height":720}},
+                               {{"codec_type":"audio","codec_name":"{audio}"}}],
+                    "format":{{}}}}"#
+            );
+            let info = probe_of(&json);
+            assert!(info.is_live());
+            assert_eq!(
+                info.container(),
+                "mkv",
+                "{video}+{audio} has no place in TS"
+            );
+        }
+    }
+
+    /// Something with an end is still an MP4, whatever it is carrying.
+    #[test]
+    fn a_recording_with_an_end_is_still_an_mp4() {
+        let info = probe_of(
+            r#"{"streams":[{"codec_type":"video","codec_name":"vp9","height":720}],
+                "format":{"duration":"120.0"}}"#,
+        );
+        assert!(!info.is_live());
+        assert_eq!(info.container(), "mp4");
+    }
+
+    /// The HLS demuxer's options open an MP4 with "Option not found", so they
+    /// go only where the address is a playlist.
+    #[test]
+    fn hls_options_are_given_only_to_a_playlist() {
+        let args = |url: &str| -> Vec<String> {
+            let mut command = Command::new("ffmpeg");
+            apply_hls_tolerance(&mut command, url);
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let hls = args("https://c.example/live/master.m3u8?token=abc");
+        assert!(hls.windows(2).any(|pair| pair == ["-extension_picky", "0"]));
+        assert!(hls.windows(2).any(|pair| pair == ["-seg_max_retry", "10"]));
+
+        for other in [
+            "https://c.example/film.mp4",
+            "rtsp://camera.local/stream1",
+            "rtmp://live.example/app/key",
+            "https://c.example/manifest.mpd",
+        ] {
+            assert!(
+                args(other).is_empty(),
+                "{other} would fail to open with them"
+            );
+        }
     }
 
     #[test]
@@ -1897,6 +2094,69 @@ mod tests {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+
+    /// The row that appears because ffprobe could not describe a stream has
+    /// to be recordable, or offering it was a lie.
+    ///
+    /// This is the address that refuses every connection, so ffprobe fails
+    /// outright. The recording is allowed to fail too -- there is genuinely
+    /// nothing to read -- but it must fail in ffmpeg, having tried, and not
+    /// be turned away at the door by the probe the listing already knew had
+    /// failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_ffprobe_cannot_describe_is_still_attempted() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: ffmpeg is not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("snatch-undescribed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut job = Recording::new(
+            "http://127.0.0.1:1/live/master.m3u8".to_owned(),
+            dir.clone(),
+        );
+        job.limit = Some(Duration::from_secs(2));
+        let proxies = crate::network::ProxyManager::load(dir.join("proxies.json"));
+        let (_control, commands) = mpsc::channel(1);
+        let (events, mut rx) = mpsc::channel(64);
+
+        let error = record(1, &job, &proxies, commands, &events)
+            .await
+            .expect_err("nothing is listening, so nothing can be recorded");
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("ffprobe"),
+            "it was refused by the probe instead of attempted: {message}"
+        );
+
+        // It said what it was going to try, as a broadcast.
+        let mut titled = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, VideoEvent::Title { .. }) {
+                titled = true;
+            }
+        }
+        assert!(titled, "the row should have been named before ffmpeg ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_undescribed_stream_is_recorded_as_a_broadcast() {
+        let info = StreamInfo::undescribed();
+        assert!(info.is_live());
+        // Not MP4: its index is written at the end, and a broadcast has no
+        // end, so a stopped one would be unplayable. TS when nothing says
+        // otherwise; `record` sends a non-HLS address to Matroska instead,
+        // since there the codecs could be anything.
+        assert_eq!(info.container(), "ts");
+        // No rendition to name, so ffmpeg picks the best streams itself.
+        assert!(info.choose(Some(720)).is_none());
+    }
 
     /// A recording has to survive the network, not just start on it.
     ///

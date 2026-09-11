@@ -1287,17 +1287,17 @@ impl Ui {
             match result {
                 Ok(gid) => {
                     log::info!("queued '{name}' as gid {gid}");
-                    match start_at {
+                    let message = match start_at {
                         Some(start_at) => {
                             ui.remember_scheduled_start(gid, name.clone(), start_at);
-                            ui.toast(&format!(
+                            format!(
                                 "{name} will start at {}",
                                 crate::settings::format_local_hhmm(local_minute_of(start_at))
-                            ));
+                            )
                         }
-                        None => ui.toast(&format!("Added {name}")),
-                    }
-                    ui.select_page(PAGE_DOWNLOADS);
+                        None => format!("Added {name}"),
+                    };
+                    ui.announce_started(&message);
                 }
                 Err(error) => ui.toast(&format!("Could not add {name}: {error:#}")),
             }
@@ -1444,7 +1444,7 @@ impl Ui {
 
             let Some(ui) = weak.upgrade() else { return };
             match result {
-                Ok(_) => ui.stack.set_visible_child_name(PAGE_DOWNLOADS),
+                Ok(_) => ui.reveal_started("Recording started"),
                 Err(error) => ui.toast(&format!("Could not start the recording: {error:#}")),
             }
         });
@@ -1465,7 +1465,7 @@ impl Ui {
 
             let Some(ui) = weak.upgrade() else { return };
             match result {
-                Ok(_) => ui.stack.set_visible_child_name(PAGE_DOWNLOADS),
+                Ok(_) => ui.reveal_started("Download started"),
                 Err(error) => ui.toast(&format!("Could not start the extraction: {error:#}")),
             }
         });
@@ -1483,10 +1483,7 @@ impl Ui {
             backend.wget_events.clone(),
         );
         match outcome {
-            Ok(_) => {
-                self.toast(&format!("Added {name}"));
-                self.select_page(PAGE_DOWNLOADS);
-            }
+            Ok(_) => self.announce_started(&format!("Added {name}")),
             Err(error) => self.toast(&format!("Could not add {name}: {error:#}")),
         }
     }
@@ -2675,6 +2672,55 @@ impl Ui {
 
     pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
+    }
+
+    /// Show where a job that has just started went.
+    ///
+    /// Normally that means going to the Downloads page, which is where it is.
+    /// Not from Browse. There, queuing is part of browsing -- somebody working
+    /// through a page picks one stream, then another -- and being thrown onto
+    /// a different page after every pick is being thrown out of the page
+    /// they were using. Worse, it landed them on Downloads before the job had
+    /// registered, so what they saw was the empty "No Downloads Yet" screen,
+    /// with Browse still highlighted in the sidebar because the switch went
+    /// round `select_page`. So on Browse it says so and offers the way there,
+    /// and stays put.
+    /// Say that a job started and take the reader to it.
+    ///
+    /// The toast and the move belong together: from Browse the toast *is* the
+    /// way there, and anywhere else the page switch is. Called from every
+    /// place that starts a job, so none of them can do one without the other.
+    fn announce_started(self: &Rc<Self>, message: &str) {
+        #[cfg(feature = "webview")]
+        if self.stack.visible_child_name().as_deref() == Some(PAGE_BROWSE) {
+            self.reveal_started(message);
+            return;
+        }
+        self.toast(message);
+        self.select_page(PAGE_DOWNLOADS);
+    }
+
+    fn reveal_started(self: &Rc<Self>, message: &str) {
+        #[cfg(feature = "webview")]
+        if self.stack.visible_child_name().as_deref() == Some(PAGE_BROWSE) {
+            let toast = adw::Toast::builder()
+                .title(message)
+                .button_label("Show")
+                .timeout(4)
+                .build();
+            let weak = Rc::downgrade(self);
+            toast.connect_button_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.select_page(PAGE_DOWNLOADS);
+                }
+            });
+            self.toasts.add_toast(toast);
+            return;
+        }
+        let _ = message;
+        // Through `select_page`, so the sidebar moves with the content
+        // instead of staying highlighted on the page that was left.
+        self.select_page(PAGE_DOWNLOADS);
     }
 
     pub fn backend(&self) -> &Backend {

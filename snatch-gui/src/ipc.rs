@@ -485,9 +485,15 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
             // No quality is claimed, because none was measured. Saying
             // "1080p" here on a guess would be worse than saying nothing.
             label: "Live stream".to_owned(),
-            // Stopping a recording has to leave a playable file, and only
-            // Matroska survives being cut off mid-write.
-            ext: "mkv".to_owned(),
+            // What `stream::record` will actually write for it, so the row
+            // and the file agree: TS for a playlist, Matroska for anything
+            // whose codecs nothing has seen.
+            ext: if crate::stream::is_hls(url) {
+                "ts"
+            } else {
+                "mkv"
+            }
+            .to_owned(),
             size: None,
             estimated: false,
             height: None,
@@ -659,8 +665,10 @@ mod fallback_tests {
             row.url.as_deref(),
             Some("http://127.0.0.1:1/live/master.m3u8")
         );
-        // Matroska, because stopping a recording has to leave a playable file.
-        assert_eq!(row.ext, "mkv");
+        // TS, because it is a playlist -- and the same container the
+        // recording will actually write, so the row does not promise one
+        // file and deliver another.
+        assert_eq!(row.ext, "ts");
         // Nothing measured it, so it must not claim a size.
         assert_eq!(row.size, None);
         assert!(
