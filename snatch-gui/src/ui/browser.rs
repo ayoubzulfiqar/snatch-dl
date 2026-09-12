@@ -133,6 +133,14 @@ pub struct BrowserPage {
     /// rather than something that might or might not be happening.
     blocked: gtk::Label,
     popups_blocked: Cell<u32>,
+    /// The live status of an in-page capture: a spinner, how much has been
+    /// saved so far, and the button that writes it to a file. Hidden until a
+    /// capture is running on the tab on show, so "it is working" is something
+    /// the reader can see rather than guess.
+    capturing: gtk::Box,
+    capturing_spinner: gtk::Spinner,
+    capturing_label: gtk::Label,
+    capturing_save: gtk::Button,
     /// The ad-block rules, compiled once and shared. Each tab has its own
     /// content manager -- so that a script message can be told which tab sent
     /// it -- and the one compiled filter is added to every one of them.
@@ -178,6 +186,24 @@ impl BrowserPage {
             .visible(false)
             .build();
 
+        // The live capture indicator: spinner + amount + Save, shown only
+        // while a capture is running on the tab in front.
+        let capturing_spinner = gtk::Spinner::new();
+        let capturing_label = gtk::Label::builder().css_classes(["caption"]).build();
+        let capturing_save = gtk::Button::builder()
+            .label("Save")
+            .css_classes(["suggested-action"])
+            .build();
+        let capturing = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .visible(false)
+            .css_classes(["snatch-capturing"])
+            .build();
+        capturing.append(&capturing_spinner);
+        capturing.append(&capturing_label);
+        capturing.append(&capturing_save);
+
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -191,6 +217,7 @@ impl BrowserPage {
         bar.append(&reload);
         bar.append(&address);
         bar.append(&blocked);
+        bar.append(&capturing);
         bar.append(&found);
 
         let root = gtk::Box::builder()
@@ -209,13 +236,20 @@ impl BrowserPage {
             found,
             blocked,
             popups_blocked: Cell::new(0),
+            capturing,
+            capturing_spinner,
+            capturing_label,
+            capturing_save,
             blocklist: Rc::new(RefCell::new(None)),
             open_tabs: RefCell::new(Vec::new()),
             ui: RefCell::new(None),
         });
 
         page.compile_blocklist();
-        page.wire(&reload, &new_tab);
+        {
+            let save = page.capturing_save.clone();
+            page.wire(&reload, &new_tab, &save);
+        }
         // There is always a tab to type into.
         page.open_tab(None, None);
         page
@@ -326,6 +360,78 @@ impl BrowserPage {
             .map(|tab| Rc::clone(&tab.mse))
     }
 
+    /// Write every armed capture on the tab in front to a file.
+    ///
+    /// Each armed MediaSource becomes one muxed file. The capture is left
+    /// running, so a live stream can be saved again later with more of it; the
+    /// button re-enables when the mux is done.
+    fn save_captures(self: &Rc<Self>) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        let Some(mse) = self.current_capture() else {
+            return;
+        };
+        let Some(ui) = self.ui.borrow().as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+
+        // Everything needed for the mux, gathered before any await so no
+        // borrow of the capture is held across it.
+        let plans: Vec<super::mse::SavePlan> = {
+            let capture = mse.borrow();
+            capture
+                .armed_sources()
+                .into_iter()
+                .filter_map(|ms| capture.plan(ms))
+                .collect()
+        };
+        if plans.is_empty() {
+            ui.toast("Nothing has been captured yet");
+            return;
+        }
+
+        let name = capture_name(&view);
+        let count = plans.len();
+        self.capturing_save.set_sensitive(false);
+        self.capturing_save.set_label("Saving…");
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let dest = crate::ytdlp::destination_for(&ui.backend().download_dir);
+            let mut saved: Vec<std::path::PathBuf> = Vec::new();
+            let mut failure: Option<String> = None;
+            for (index, plan) in plans.into_iter().enumerate() {
+                // One programme, several MediaSources: number them apart.
+                let stem = if count > 1 {
+                    format!("{name} ({})", index + 1)
+                } else {
+                    name.clone()
+                };
+                let dest = dest.clone();
+                match ui
+                    .backend()
+                    .offload(async move { plan.mux(&dest, &stem).await })
+                    .await
+                {
+                    Ok(path) => saved.push(path),
+                    Err(error) => failure = Some(format!("{error:#}")),
+                }
+            }
+
+            if let Some(page) = weak.upgrade() {
+                page.capturing_save.set_label("Save");
+                page.capturing_save.set_sensitive(true);
+            }
+            match (saved.as_slice(), failure) {
+                ([], Some(error)) => ui.toast(&format!("Could not save the capture: {error}")),
+                ([], None) => ui.toast("Nothing has been captured yet"),
+                ([one], _) => ui.toast(&format!("Saved {}", saved_name(one, &name))),
+                (many, _) => ui.toast(&format!("Saved {} videos", many.len())),
+            }
+        });
+    }
+
     /// Go to an address in the tab on show, or just focus the bar.
     pub fn open(&self, url: Option<&str>) {
         match url.map(str::trim).filter(|url| !url.is_empty()) {
@@ -361,7 +467,22 @@ impl BrowserPage {
     }
 
     /// Connect the toolbar and the tab strip. Called once, from `new`.
-    fn wire(self: &Rc<Self>, reload: &gtk::Button, new_tab: &gtk::Button) {
+    fn wire(
+        self: &Rc<Self>,
+        reload: &gtk::Button,
+        new_tab: &gtk::Button,
+        capturing_save: &gtk::Button,
+    ) {
+        // The live bar's Save writes every armed capture on the tab in front.
+        {
+            let weak = Rc::downgrade(self);
+            capturing_save.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.save_captures();
+                }
+            });
+        }
+
         let weak = Rc::downgrade(self);
         self.address.connect_activate(move |entry| {
             let Some(page) = weak.upgrade() else { return };
@@ -513,6 +634,7 @@ impl BrowserPage {
         tab.set_title("New tab");
 
         self.watch_media(&view, &hits);
+        self.watch_navigation(&view, &hits, &mse);
         self.watch_tab(&view, &tab);
         self.guard_popups(&view);
 
@@ -521,6 +643,42 @@ impl BrowserPage {
             view.load_uri(&normalise(url));
         }
         view
+    }
+
+    /// Forget a tab's finds when it navigates to a new page.
+    ///
+    /// What a page offered belongs to that page. Without this, moving from a
+    /// listing full of clips to the one you picked kept all the listing's
+    /// finds alongside the new page's -- so the count only ever grew, and most
+    /// of it was stale. The in-page capture is reset for the same reason, and
+    /// because the next page's stream ids restart at one and would otherwise
+    /// land on top of the last page's.
+    fn watch_navigation(
+        self: &Rc<Self>,
+        view: &webkit6::WebView,
+        hits: &Rc<RefCell<Vec<Hit>>>,
+        mse: &Rc<RefCell<super::mse::MseCapture>>,
+    ) {
+        let weak = Rc::downgrade(self);
+        let hits = Rc::clone(hits);
+        let mse = Rc::clone(mse);
+        let watched = view.clone();
+        view.connect_load_changed(move |_, event| {
+            if event != webkit6::LoadEvent::Started {
+                return;
+            }
+            let had = hits.borrow().len() + mse.borrow().sources().len();
+            hits.borrow_mut().clear();
+            mse.borrow_mut().reset();
+            if had > 0 {
+                log::info!("browse: navigated; cleared {had} find(s) from the last page");
+            }
+            if let Some(page) = weak.upgrade()
+                && page.current_view().as_ref() == Some(&watched)
+            {
+                page.sync_toolbar();
+            }
+        });
     }
 
     /// Keep a tab's title, spinner and the toolbar in step with its page.
@@ -606,16 +764,42 @@ impl BrowserPage {
             .set_text(&view.uri().map(|uri| uri.to_string()).unwrap_or_default());
         self.back.set_sensitive(view.can_go_back());
         self.forward.set_sensitive(view.can_go_forward());
+
         let network = self
             .tab_state(&view)
             .map(|(hits, _)| hits.borrow().len())
             .unwrap_or(0);
-        // Video the page assembled in JavaScript counts too.
-        let in_page = self
-            .current_capture()
-            .map(|mse| mse.borrow().sources().len())
+        let capture = self.current_capture();
+        // The counter offers what can still be started. A stream already
+        // being captured has moved to the live bar, so it is not counted
+        // twice.
+        let waiting = capture
+            .as_ref()
+            .map(|mse| mse.borrow().unarmed_sources().len())
             .unwrap_or(0);
-        self.show_count(network + in_page);
+        self.show_count(network + waiting);
+
+        // The live bar reflects whatever is being captured on this tab.
+        let (armed, bytes) = capture
+            .map(|mse| {
+                let mse = mse.borrow();
+                (mse.armed_sources().len(), mse.armed_bytes())
+            })
+            .unwrap_or((0, 0));
+        if armed > 0 {
+            let amount = if bytes > 0 {
+                super::format::human_bytes(bytes)
+            } else {
+                "starting…".to_owned()
+            };
+            self.capturing_label
+                .set_label(&format!("Capturing {amount}"));
+            self.capturing_spinner.start();
+            self.capturing.set_visible(true);
+        } else {
+            self.capturing_spinner.stop();
+            self.capturing.set_visible(false);
+        }
     }
 
     fn show_count(&self, total: usize) {
@@ -968,24 +1152,12 @@ fn mse_row(
     mse: &Rc<RefCell<super::mse::MseCapture>>,
     ms: i64,
 ) -> gtk::ListBoxRow {
-    let (armed, bytes, has_data) = {
-        let capture = mse.borrow();
-        (
-            capture.is_armed(ms),
-            capture.bytes(ms),
-            capture.has_data(ms),
-        )
-    };
+    let armed = mse.borrow().is_armed(ms);
 
-    let size = if bytes > 0 {
-        format!(" · {}", super::format::human_bytes(bytes))
-    } else {
-        String::new()
-    };
     let title = gtk::Label::builder()
         .xalign(0.0)
         .hexpand(true)
-        .label(format!("In-page video{size}"))
+        .label("In-page video")
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
         .build();
 
@@ -994,14 +1166,20 @@ fn mse_row(
         .valign(gtk::Align::Center)
         .build();
 
-    if !armed {
+    if armed {
+        // Already being captured: its live status and its Save button are in
+        // the toolbar, so here it is only a note.
+        action.set_label("Capturing…");
+        action.set_sensitive(false);
+    } else {
         action.set_label("Capture");
         let ui = Rc::clone(ui);
         let view = view.clone();
         let mse = Rc::clone(mse);
         action.connect_clicked(move |button| {
             mse.borrow_mut().arm(ms);
-            // Tell the page to start sending the pieces it has been holding.
+            // Tell the page to send the pieces it has been holding, and
+            // everything from here on.
             view.evaluate_javascript(
                 &format!("window.__snatchArm({ms})"),
                 None,
@@ -1009,41 +1187,16 @@ fn mse_row(
                 gtk::gio::Cancellable::NONE,
                 |_| {},
             );
-            button.set_label("Capturing…");
-            button.set_sensitive(false);
-            ui.toast("Capturing the video — open the list again to save it");
+            // Close the list so the live capture bar in the toolbar -- which
+            // shows the size climbing and carries Save -- is what is in view.
+            if let Some(dialog) = button
+                .ancestor(adw::Dialog::static_type())
+                .and_downcast::<adw::Dialog>()
+            {
+                dialog.close();
+            }
+            ui.toast("Capturing — use Save in the toolbar when you have enough");
         });
-    } else if has_data {
-        action.set_label("Save");
-        let ui = Rc::clone(ui);
-        let mse = Rc::clone(mse);
-        let name = capture_name(view);
-        action.connect_clicked(move |button| {
-            let Some(plan) = mse.borrow().plan(ms) else {
-                return;
-            };
-            button.set_label("Saving…");
-            button.set_sensitive(false);
-            let dest = crate::ytdlp::destination_for(&ui.backend().download_dir);
-            let name = name.clone();
-            let ui = Rc::clone(&ui);
-            glib::spawn_future_local(async move {
-                let result = ui
-                    .backend()
-                    .offload(async move { plan.mux(&dest, &name).await })
-                    .await;
-                match result {
-                    Ok(path) => ui.toast(&format!(
-                        "Saved {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    )),
-                    Err(error) => ui.toast(&format!("Could not save the capture: {error:#}")),
-                }
-            });
-        });
-    } else {
-        action.set_label("Capturing…");
-        action.set_sensitive(false);
     }
 
     let content = gtk::Box::builder()
@@ -1061,6 +1214,18 @@ fn mse_row(
         .child(&content)
         .activatable(false)
         .build()
+}
+
+/// The name to report in a "Saved …" message.
+///
+/// The muxed file's own name normally, but never an empty string: an earlier
+/// version showed a blank toast because `file_name()` came back empty on some
+/// paths. The capture's own name is the fallback, and it is never empty.
+fn saved_name(path: &std::path::Path, fallback: &str) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 /// A filename for a capture, from the page's title.
@@ -1174,6 +1339,20 @@ fn request_for(hit: &Hit) -> DownloadRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_name_is_never_empty() {
+        use std::path::Path;
+        // The muxed file's own name normally.
+        assert_eq!(
+            saved_name(Path::new("/x/Snatch Video/clip.mp4"), "fallback"),
+            "clip.mp4"
+        );
+        // A path with no file name falls back to the capture's name, which is
+        // itself never empty -- the bug this guards showed a blank toast.
+        assert_eq!(saved_name(Path::new("/"), "My Stream"), "My Stream");
+        assert_eq!(saved_name(Path::new(""), "My Stream"), "My Stream");
+    }
 
     use webkit6::NavigationType;
 

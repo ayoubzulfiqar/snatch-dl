@@ -134,6 +134,45 @@ impl MseCapture {
         }
     }
 
+    /// The streams still waiting to be captured, for the "found" counter.
+    pub fn unarmed_sources(&self) -> Vec<i64> {
+        self.sources
+            .iter()
+            .filter(|(_, source)| !source.armed)
+            .map(|(ms, _)| *ms)
+            .collect()
+    }
+
+    /// The streams being captured now, for the live status bar.
+    pub fn armed_sources(&self) -> Vec<i64> {
+        self.sources
+            .iter()
+            .filter(|(_, source)| source.armed)
+            .map(|(ms, _)| *ms)
+            .collect()
+    }
+
+    /// Bytes captured so far across every armed stream.
+    pub fn armed_bytes(&self) -> u64 {
+        self.armed_sources().iter().map(|ms| self.bytes(*ms)).sum()
+    }
+
+    /// Forget everything, for when a tab navigates to a new page.
+    ///
+    /// The old page's MediaSources are gone with its JavaScript world, and its
+    /// ids restart at one on the next page -- so without this a new page's
+    /// stream would land on top of the old one's. The temp files go too; an
+    /// ffmpeg mux already reading them keeps its own open handles, so a save
+    /// in flight when the reader navigates still finishes (the inode outlives
+    /// the name on Linux).
+    pub fn reset(&mut self) {
+        if self.dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+        self.sources.clear();
+        self.tracks.clear();
+    }
+
     /// Take one message from the hook and act on it.
     ///
     /// Returns what, if anything, the UI should do about it. A malformed
@@ -276,11 +315,6 @@ impl MseCapture {
     /// The MediaSources worth offering to capture, oldest first.
     pub fn sources(&self) -> Vec<i64> {
         self.sources.keys().copied().collect()
-    }
-
-    /// Whether a MediaSource has anything worth saving yet.
-    pub fn has_data(&self, ms: i64) -> bool {
-        !self.written_tracks(ms).is_empty()
     }
 
     /// What it would take to save a MediaSource's capture.
@@ -496,7 +530,7 @@ mod tests {
         capture.handle(r#"{"t":"track","ms":1,"sb":1,"mime":"video/mp4"}"#);
         capture.arm(1);
         capture.handle(&format!(r#"{{"t":"data","sb":1,"b64":"{b64}"}}"#));
-        assert!(capture.has_data(1));
+        assert!(capture.plan(1).is_some());
 
         let plan = capture.plan(1).expect("a plan once there is data");
         let dest = dir.join("out");
@@ -525,6 +559,29 @@ mod tests {
             .unwrap_or(0.0);
         assert!(duration > 0.5, "muxed file has no duration: {duration}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_forgets_streams_and_files() {
+        let dir = scratch("reset");
+        let mut capture = MseCapture::new(dir.clone());
+        capture.handle(r#"{"t":"open","ms":1}"#);
+        capture.handle(r#"{"t":"track","ms":1,"sb":1,"mime":"video/mp4"}"#);
+        capture.arm(1);
+        capture.handle(r#"{"t":"data","sb":1,"b64":"aGVsbG8="}"#);
+        assert!(!capture.armed_sources().is_empty());
+        assert!(dir.exists());
+
+        capture.reset();
+        assert!(capture.sources().is_empty());
+        assert!(capture.armed_sources().is_empty());
+        assert!(capture.unarmed_sources().is_empty());
+        assert!(!dir.exists(), "the temp files should be gone");
+
+        // A new page's stream starts clean on the same capture.
+        capture.handle(r#"{"t":"open","ms":1}"#);
+        assert_eq!(capture.sources(), vec![1]);
+        assert!(!capture.is_armed(1));
     }
 
     #[test]

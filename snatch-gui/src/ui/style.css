@@ -145,3 +145,13 @@
 .snatch-graph {
   padding: 8px 4px 0 4px;
 }
+
+/* The live in-page-capture indicator in the Browse toolbar. */
+.snatch-capturing {
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: alpha(@accent_color, 0.12);
+}
+.snatch-capturing label {
+  color: @accent_color;
+}
