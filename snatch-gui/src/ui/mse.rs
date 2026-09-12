@@ -678,7 +678,10 @@ mod tests {
         assert!(input.exists(), "the detached file survives a reset");
         assert_eq!(std::fs::read(&input).unwrap(), b"hello");
         drop(capture);
-        assert!(input.exists(), "the detached file survives the engine dropping");
+        assert!(
+            input.exists(),
+            "the detached file survives the engine dropping"
+        );
 
         // Dropping the plan cleans up after itself.
         let owned = input.parent().unwrap().to_path_buf();
@@ -695,7 +698,10 @@ mod tests {
         // Armed but nothing appended yet.
         capture.arm(1);
         assert!(capture.detach(1).is_none());
-        assert!(capture.sources().is_empty(), "the source is still forgotten");
+        assert!(
+            capture.sources().is_empty(),
+            "the source is still forgotten"
+        );
     }
 
     #[test]
