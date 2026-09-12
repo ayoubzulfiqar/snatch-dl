@@ -48,12 +48,38 @@
   // }
   var buffers = new Map();
 
-  // How much media to hold per track before capture is armed. Bounds memory
-  // on a page merely being previewed, and is how much lead-in a capture keeps
-  // when it is armed part way through: everything still in the ring, plus the
-  // init segment, comes out first. 64 MB is a comfortable minute of most
-  // streams and nothing on a modern machine.
-  var RING_BYTES = 64 * 1024 * 1024;
+  // How much media to hold, across the WHOLE page, before a capture is armed.
+  //
+  // A budget for everything, not per track. A video-heavy feed opens many
+  // MediaSources at once, each with a video and an audio track, and a
+  // per-track allowance times all of them is hundreds of megabytes to a
+  // gigabyte held in the page -- which is what was crashing the web process
+  // on exactly those sites. This caps the total the page can ever hold: the
+  // oldest media anywhere is dropped once it is reached. Init segments are
+  // kept apart and never counted, because media without one cannot be played.
+  var RING_BYTES = 32 * 1024 * 1024;
+  // Media chunks held for capture, page-wide: the SourceBuffer id of each, in
+  // arrival order, so the globally-oldest can be found to evict.
+  var heldOrder = [];
+  var heldTotal = 0;
+
+  // A hard ceiling on how many tracks are followed at once. A pathological
+  // page cannot make the maps grow without end.
+  var MAX_TRACKS = 256;
+
+  // Drop the oldest media anywhere until the page is back under budget. The
+  // init segment is never here, so it is never dropped.
+  function evict() {
+    while (heldTotal > RING_BYTES && heldOrder.length > 0) {
+      var sb = heldOrder.shift();
+      var s = buffers.get(sb);
+      if (s && s.ring.length > 0) {
+        heldTotal -= s.ring[0].length;
+        s.held -= s.ring[0].length;
+        s.ring.shift();
+      }
+    }
+  }
 
   function post(message) {
     try {
@@ -123,9 +149,12 @@
     return false;
   }
 
-  // Keep an init segment small even if the classifier is fooled: a real one
-  // is a few kilobytes, so this only ever trips on a stream we misread.
-  var MAX_INIT_BYTES = 4 * 1024 * 1024;
+  // Keep an init segment small even if the classifier is fooled. A real one
+  // is a few kilobytes; this ceiling only ever trips on a stream we misread,
+  // and it is kept low because init segments are held outside the page-wide
+  // budget -- one per track, up to MAX_TRACKS of them -- so an over-generous
+  // ceiling times many tracks would be its own way to grow without bound.
+  var MAX_INIT_BYTES = 512 * 1024;
 
   function onAppend(sbId, data) {
     var state = buffers.get(sbId);
@@ -147,7 +176,8 @@
 
     // Not armed: hold it, so arming later still captures the lead-in. The
     // init segment is kept apart and never evicted -- media without it cannot
-    // be decoded. Media goes in a ring that drops its oldest once it is full.
+    // be decoded. Media joins the page-wide ring, and the oldest anywhere is
+    // dropped once the whole page is over budget.
     if (isInit(bytes) && state.ring.length === 0) {
       if (state.initBytes + bytes.length <= MAX_INIT_BYTES) {
         state.init.push(bytes);
@@ -156,9 +186,9 @@
     } else {
       state.ring.push(bytes);
       state.held += bytes.length;
-      while (state.held > RING_BYTES && state.ring.length > 1) {
-        state.held -= state.ring.shift().length;
-      }
+      heldTotal += bytes.length;
+      heldOrder.push(sbId);
+      evict();
     }
     post({ t: "grow", ms: state.ms, sb: sbId, bytes: state.initBytes + state.held });
   }
@@ -166,6 +196,10 @@
   var addSourceBuffer = window.MediaSource.prototype.addSourceBuffer;
   window.MediaSource.prototype.addSourceBuffer = function (mime) {
     var sb = addSourceBuffer.apply(this, arguments);
+    // A page cannot make us track without limit.
+    if (buffers.size >= MAX_TRACKS) {
+      return sb;
+    }
     try {
       if (this.__snatchId === undefined) {
         this.__snatchId = nextMs++;
@@ -234,6 +268,11 @@
       // order it arrived -- so what is written begins with a decodable head.
       state.init.concat(state.ring).forEach(function (part) {
         post({ t: "data", sb: sbId, seq: state.seq++, b64: base64(part) });
+      });
+      // Give the page-wide ring back what this track was holding.
+      heldTotal -= state.held;
+      heldOrder = heldOrder.filter(function (id) {
+        return id !== sbId;
       });
       state.init = [];
       state.ring = [];

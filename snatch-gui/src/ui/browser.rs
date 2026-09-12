@@ -635,6 +635,7 @@ impl BrowserPage {
 
         self.watch_media(&view, &hits);
         self.watch_navigation(&view, &hits, &mse);
+        self.watch_crashes(&view, &tab, &hits, &mse);
         self.watch_tab(&view, &tab);
         self.guard_popups(&view);
 
@@ -672,6 +673,73 @@ impl BrowserPage {
             mse.borrow_mut().reset();
             if had > 0 {
                 log::info!("browse: navigated; cleared {had} find(s) from the last page");
+            }
+            if let Some(page) = weak.upgrade()
+                && page.current_view().as_ref() == Some(&watched)
+            {
+                page.sync_toolbar();
+            }
+        });
+    }
+
+    /// Bring a tab back when its web process dies.
+    ///
+    /// WebKit runs each page in its own process, and a heavy stream site can
+    /// take that process down -- most often by running it out of memory. The
+    /// page turns into WebKit's "encountered an error" screen and the tab goes
+    /// blank, with no way back but retyping the address. This catches that,
+    /// drops the dead page's finds, and reloads once.
+    ///
+    /// Reloading a page that crashes on load would loop forever, so it is
+    /// tried only while the page has managed at least one clean load since the
+    /// last run of crashes. A page that keeps dying without ever finishing --
+    /// three times over -- is left on its error screen instead of fought,
+    /// however long apart the crashes are. A page that loads, works, and
+    /// crashes later starts with a clean slate and is reloaded again.
+    fn watch_crashes(
+        self: &Rc<Self>,
+        view: &webkit6::WebView,
+        tab: &adw::TabPage,
+        hits: &Rc<RefCell<Vec<Hit>>>,
+        mse: &Rc<RefCell<super::mse::MseCapture>>,
+    ) {
+        // Crashes in a row with no successful load between them.
+        let in_a_row: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+
+        // A clean load means the page is healthy again; forget past crashes.
+        {
+            let in_a_row = Rc::clone(&in_a_row);
+            view.connect_load_changed(move |_, event| {
+                if event == webkit6::LoadEvent::Finished {
+                    in_a_row.set(0);
+                }
+            });
+        }
+
+        let weak = Rc::downgrade(self);
+        let hits = Rc::clone(hits);
+        let mse = Rc::clone(mse);
+        let tab = tab.clone();
+        let watched = view.clone();
+        view.connect_web_process_terminated(move |view, reason| {
+            let why = match reason {
+                webkit6::WebProcessTerminationReason::ExceededMemoryLimit => "ran out of memory",
+                webkit6::WebProcessTerminationReason::Crashed => "crashed",
+                _ => "stopped",
+            };
+            // The page is gone; so is anything it had offered.
+            hits.borrow_mut().clear();
+            mse.borrow_mut().reset();
+
+            let count = in_a_row.get() + 1;
+            in_a_row.set(count);
+            if count > 3 {
+                log::warn!("browse: the page {why} {count} times over; leaving the error page up");
+                tab.set_title("Page keeps crashing");
+            } else {
+                log::warn!("browse: the page {why}; reloading it");
+                tab.set_title("Reloading…");
+                view.reload();
             }
             if let Some(page) = weak.upgrade()
                 && page.current_view().as_ref() == Some(&watched)
