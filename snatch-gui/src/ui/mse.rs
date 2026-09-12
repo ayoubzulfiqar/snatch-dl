@@ -143,20 +143,6 @@ impl MseCapture {
             .collect()
     }
 
-    /// The streams being captured now, for the live status bar.
-    pub fn armed_sources(&self) -> Vec<i64> {
-        self.sources
-            .iter()
-            .filter(|(_, source)| source.armed)
-            .map(|(ms, _)| *ms)
-            .collect()
-    }
-
-    /// Bytes captured so far across every armed stream.
-    pub fn armed_bytes(&self) -> u64 {
-        self.armed_sources().iter().map(|ms| self.bytes(*ms)).sum()
-    }
-
     /// Forget everything, for when a tab navigates to a new page.
     ///
     /// The old page's MediaSources are gone with its JavaScript world, and its
@@ -323,6 +309,10 @@ impl MseCapture {
     /// holding a borrow of the capture across the await -- the tracks keep
     /// growing while it runs, and a partial live capture muxes fine because
     /// the files are always a valid prefix.
+    ///
+    /// The files stay owned by this engine: the plan reads them where they
+    /// lie, so this is only safe while the engine is alive. Use `detach` for a
+    /// capture that must outlive its tab.
     pub fn plan(&self, ms: i64) -> Option<SavePlan> {
         let tracks = self.written_tracks(ms);
         if tracks.is_empty() {
@@ -331,8 +321,70 @@ impl MseCapture {
         Some(SavePlan {
             inputs: tracks.iter().map(|track| track.path.clone()).collect(),
             container: Self::container_for(&tracks),
+            owned_dir: None,
         })
     }
+
+    /// Stop following a MediaSource and take its captured tracks out into a
+    /// self-contained plan.
+    ///
+    /// This is how a capture ends. Its files are moved to a directory the plan
+    /// owns, apart from this engine's, so resetting or dropping the engine --
+    /// which happens the instant a tab navigates, crashes or closes -- cannot
+    /// delete a capture that is on its way to a file. The source is then
+    /// forgotten, so any later chunk the page sends for it is ignored: that is
+    /// what stops a live capture.
+    ///
+    /// `None` when nothing was captured, but the source is forgotten either
+    /// way, so a stop always stops.
+    pub fn detach(&mut self, ms: i64) -> Option<SavePlan> {
+        // What there is to save, gathered before the source is forgotten. This
+        // is the same plan a live save would make; `detach` then moves its
+        // files somewhere the engine can no longer reach.
+        let plan = self.plan(ms);
+        // Forget the source and its tracks whether or not anything was
+        // captured, so it stops being followed: a later chunk for a source
+        // that is gone is ignored, which is what stops a live capture.
+        if let Some(source) = self.sources.remove(&ms) {
+            for sb in source.tracks {
+                self.tracks.remove(&sb);
+            }
+        }
+        let mut plan = plan?;
+
+        // A directory the plan owns, so this engine resetting or dropping
+        // leaves the files being saved alone. If even a temp directory cannot
+        // be made, the plan keeps the originals -- a save that might race the
+        // reset, which is far better than refusing to save at all.
+        let owned = save_dir();
+        if std::fs::create_dir_all(&owned).is_ok() {
+            let mut moved = Vec::with_capacity(plan.inputs.len());
+            for (index, path) in plan.inputs.iter().enumerate() {
+                // A rename is free within a filesystem; a copy covers the rare
+                // cross-device case; if both fail the original path is kept.
+                let dest = owned.join(format!("track-{index}.bin"));
+                let out = match std::fs::rename(path, &dest) {
+                    Ok(()) => dest,
+                    Err(_) => match std::fs::copy(path, &dest) {
+                        Ok(_) => dest,
+                        Err(_) => path.clone(),
+                    },
+                };
+                moved.push(out);
+            }
+            plan.inputs = moved;
+            plan.owned_dir = Some(owned);
+        }
+        Some(plan)
+    }
+}
+
+/// A fresh directory a `SavePlan` owns, apart from any capture engine's.
+fn save_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("snatch-save-{}-{n}", std::process::id()))
 }
 
 /// A capture ready to be muxed to a file. Owns its inputs, so it holds nothing
@@ -340,6 +392,10 @@ impl MseCapture {
 pub struct SavePlan {
     inputs: Vec<PathBuf>,
     container: &'static str,
+    /// A directory this plan owns and must clean up, set when the files were
+    /// moved out of a capture engine by `detach`. `None` when the files still
+    /// belong to a live engine (from `plan`), which cleans up after itself.
+    owned_dir: Option<PathBuf>,
 }
 
 impl SavePlan {
@@ -408,6 +464,19 @@ impl Drop for MseCapture {
     fn drop(&mut self) {
         if self.dir.exists() {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+impl Drop for SavePlan {
+    /// A detached plan owns its files, so it deletes them once the mux that
+    /// read them is done -- which is when the plan is dropped. A plan from
+    /// `plan` owns nothing and touches nothing here.
+    fn drop(&mut self) {
+        if let Some(dir) = &self.owned_dir
+            && dir.exists()
+        {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -569,12 +638,11 @@ mod tests {
         capture.handle(r#"{"t":"track","ms":1,"sb":1,"mime":"video/mp4"}"#);
         capture.arm(1);
         capture.handle(r#"{"t":"data","sb":1,"b64":"aGVsbG8="}"#);
-        assert!(!capture.armed_sources().is_empty());
+        assert!(capture.is_armed(1));
         assert!(dir.exists());
 
         capture.reset();
         assert!(capture.sources().is_empty());
-        assert!(capture.armed_sources().is_empty());
         assert!(capture.unarmed_sources().is_empty());
         assert!(!dir.exists(), "the temp files should be gone");
 
@@ -582,6 +650,52 @@ mod tests {
         capture.handle(r#"{"t":"open","ms":1}"#);
         assert_eq!(capture.sources(), vec![1]);
         assert!(!capture.is_armed(1));
+    }
+
+    #[test]
+    fn a_detached_capture_survives_the_engine_resetting() {
+        let dir = scratch("detach");
+        let mut capture = MseCapture::new(dir.clone());
+        capture.handle(r#"{"t":"open","ms":1}"#);
+        capture.handle(r#"{"t":"track","ms":1,"sb":1,"mime":"video/mp4"}"#);
+        capture.arm(1);
+        capture.handle(r#"{"t":"data","sb":1,"b64":"aGVsbG8="}"#); // "hello"
+
+        let plan = capture.detach(1).expect("a plan once there is data");
+        // The source is forgotten, so the capture has stopped.
+        assert!(capture.sources().is_empty());
+        // A later chunk for the gone source is ignored, not written.
+        assert_eq!(
+            capture.handle(r#"{"t":"data","sb":1,"b64":"d29ybGQ="}"#),
+            Update::Quiet
+        );
+
+        // Resetting and dropping the engine must not touch the detached files:
+        // this is exactly what happens when the tab navigates or closes while a
+        // save is running.
+        let input = plan.inputs.first().cloned().expect("an input file");
+        capture.reset();
+        assert!(input.exists(), "the detached file survives a reset");
+        assert_eq!(std::fs::read(&input).unwrap(), b"hello");
+        drop(capture);
+        assert!(input.exists(), "the detached file survives the engine dropping");
+
+        // Dropping the plan cleans up after itself.
+        let owned = input.parent().unwrap().to_path_buf();
+        drop(plan);
+        assert!(!owned.exists(), "the plan deletes its own files when done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detaching_a_bare_source_stops_it_and_yields_no_plan() {
+        let mut capture = MseCapture::new(scratch("detach-empty"));
+        capture.handle(r#"{"t":"open","ms":1}"#);
+        capture.handle(r#"{"t":"track","ms":1,"sb":1,"mime":"video/mp4"}"#);
+        // Armed but nothing appended yet.
+        capture.arm(1);
+        assert!(capture.detach(1).is_none());
+        assert!(capture.sources().is_empty(), "the source is still forgotten");
     }
 
     #[test]

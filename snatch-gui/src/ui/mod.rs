@@ -839,6 +839,16 @@ impl Ui {
         self.stack.set_visible_child_name(name);
     }
 
+    /// Stop and save an in-page capture the Downloads page is showing.
+    ///
+    /// The capture lives in the browser -- it is the browser's message handler
+    /// that the bytes arrive through -- so the Downloads row's stop button
+    /// hands the request back to it.
+    #[cfg(feature = "webview")]
+    pub fn stop_capture(&self, id: u64) {
+        self.browser.save_capture(id);
+    }
+
     /// Put a count next to a sidebar entry, or hide it at zero.
     fn set_badge(&self, page: &str, count: usize) {
         for (name, badge) in &self.sidebar_rows {

@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 4.14.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 4.15.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_4.14.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-4.14.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-4.14.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_4.15.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-4.15.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-4.15.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -447,18 +447,21 @@ From a terminal: `snatch-gui --browse https://example.com/live`.
 file over the network — they fetch pieces, sometimes decrypt or reassemble
 them in the page, and feed them to the video a chunk at a time. There is
 nothing on the network to grab. Snatch watches the video being fed inside the
-page and can save it: press the **found** button, choose **Capture**, and a
-live indicator appears in the toolbar showing the size climbing, with a
-**Save** button. Save writes what has been captured so far — press it again
-later for more of a live stream. Video and sound, which players usually feed
-separately, are joined into one file for you.
+page and can save it: press the **found** button and choose **Capture**. The
+capture appears on the **Downloads page**, next to every other download, as a
+task with its size climbing and a **Stop** button. Snatch takes you there so
+it is in front of you. Stopping it writes what has been captured to a file —
+video and sound, which players usually feed separately, are joined into one
+file for you.
 
-If you close the tab mid-capture, what it had captured is **kept**, not lost —
-the toolbar goes on offering it to Save (or Discard). One limit worth knowing:
-this kind of stream can only be captured while its page is open, so closing
-the tab stops it there (you keep what you had). A stream that has a normal
-address keeps recording after the tab is gone, because that goes to the
-recorder rather than the page.
+It is a download like any other now, not a bar in the browser, so it stays put
+whatever you do with the tab. If you close the tab, navigate away, or the page
+crashes, the capture is **finished and saved** rather than lost — it simply
+stops where it was. One limit worth knowing: this kind of stream can only be
+captured while its page is open, because the video is built by the page's own
+code, so nothing more can be captured once the tab is gone (you keep what you
+had). A stream that has a normal address keeps recording after the tab is gone,
+because that goes to the recorder rather than the page.
 
 **It cannot open DRM.** A page locked with DRM hands its key to a part of the
 browser that never gives it back, and there is no such part here — so those

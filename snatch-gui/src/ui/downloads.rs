@@ -57,6 +57,11 @@ pub struct DownloadsPage {
     archive_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
     /// Crawls, keyed separately for the same reason.
     mirror_jobs: RefCell<HashMap<i64, Rc<JobRow>>>,
+    /// In-page video captures from the browser, keyed by the browser's own
+    /// capture id. Kept apart because those ids are unrelated to the database
+    /// ids the other jobs use.
+    #[cfg(feature = "webview")]
+    capture_jobs: RefCell<HashMap<u64, Rc<JobRow>>>,
     /// Recordings the user asked to have converted once they finish. The
     /// conversion cannot start any earlier: ffmpeg is still writing the file.
     convert_when_done: RefCell<HashSet<i64>>,
@@ -169,6 +174,8 @@ impl DownloadsPage {
             jobs: RefCell::new(HashMap::new()),
             archive_jobs: RefCell::new(HashMap::new()),
             mirror_jobs: RefCell::new(HashMap::new()),
+            #[cfg(feature = "webview")]
+            capture_jobs: RefCell::new(HashMap::new()),
             convert_when_done: RefCell::new(HashSet::new()),
             summary: RefCell::new(PageSummary::default()),
         }
@@ -489,6 +496,55 @@ impl DownloadsPage {
         }
     }
 
+    /// Show an in-page video capture from the browser as a task here, so a
+    /// recording lives with the other downloads rather than as a bar in the
+    /// browser that vanishes the moment the tab does.
+    ///
+    /// A capture has no known total -- a live stream never does -- so the bar
+    /// pulses and the byte count carries the real information. Stopping it
+    /// saves what has been captured, which is why the button reads that way.
+    #[cfg(feature = "webview")]
+    pub fn capture_started(&self, ui: &Rc<Ui>, id: u64, name: &str) {
+        let mut jobs = self.capture_jobs.borrow_mut();
+        let row = jobs.entry(id).or_insert_with(|| {
+            let row = JobRow::new("Capturing video");
+            row.on_stop_capture(ui, id);
+            self.jobs_list.append(&row.root);
+            row
+        });
+        row.set_subtitle(name);
+        row.start_capture();
+        drop(jobs);
+        self.refresh_page();
+    }
+
+    /// How much a capture has taken so far.
+    #[cfg(feature = "webview")]
+    pub fn capture_progress(&self, id: u64, bytes: u64) {
+        if let Some(row) = self.capture_jobs.borrow().get(&id) {
+            row.update_capture(bytes);
+        }
+    }
+
+    /// A capture finished being saved, one way or the other.
+    #[cfg(feature = "webview")]
+    pub fn capture_finished(&self, ui: &Rc<Ui>, id: u64, result: Result<PathBuf, String>) {
+        if let Some(row) = self.capture_jobs.borrow_mut().remove(&id) {
+            self.jobs_list.remove(&row.root);
+        }
+        match result {
+            Ok(path) => ui.toast(&format!(
+                "Saved {}",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| path.display().to_string())
+            )),
+            Err(error) => ui.toast(&format!("Could not save the capture: {error}")),
+        }
+        self.refresh_page();
+    }
+
     /// Reflect one wget event. aria2 downloads are reconciled from snapshots,
     /// but wget has no daemon to poll, so its rows are event-driven and live
     /// in the task list alongside conversions.
@@ -545,9 +601,12 @@ impl DownloadsPage {
     /// How many task rows the list is holding, across every engine that
     /// shares it: conversions and video jobs, unpacking, and site grabs.
     fn task_count(&self) -> usize {
-        self.jobs.borrow().len()
+        let count = self.jobs.borrow().len()
             + self.archive_jobs.borrow().len()
-            + self.mirror_jobs.borrow().len()
+            + self.mirror_jobs.borrow().len();
+        #[cfg(feature = "webview")]
+        let count = count + self.capture_jobs.borrow().len();
+        count
     }
 
     /// Show the empty page only when there is genuinely nothing here.
@@ -676,6 +735,45 @@ impl JobRow {
             } else {
                 "Recording again"
             });
+        });
+    }
+
+    /// Stop an in-page capture, keeping what has been captured.
+    ///
+    /// Like a recording, a capture is not a download that failed halfway:
+    /// everything already taken is watchable, and stopping is how it ends. So
+    /// the button saves rather than discards, and says so.
+    #[cfg(feature = "webview")]
+    fn on_stop_capture(&self, ui: &Rc<Ui>, id: u64) {
+        self.cancel
+            .set_tooltip_text(Some("Stop capturing and save what you have"));
+        let weak = Rc::downgrade(ui);
+        self.cancel.connect_clicked(move |button| {
+            let Some(ui) = weak.upgrade() else { return };
+            button.set_sensitive(false);
+            ui.stop_capture(id);
+            ui.toast("Saving the capture");
+        });
+    }
+
+    /// A capture that has just been armed, before its first bytes land.
+    #[cfg(feature = "webview")]
+    fn start_capture(&self) {
+        self.progress.pulse();
+        if self.detail.text().is_empty() {
+            self.detail.set_text("starting…");
+        }
+    }
+
+    /// A capture grew: a live stream has no total, so the bar pulses and the
+    /// count says how much is safe.
+    #[cfg(feature = "webview")]
+    fn update_capture(&self, bytes: u64) {
+        self.progress.pulse();
+        self.detail.set_text(&if bytes > 0 {
+            format!("{} captured", human_bytes(bytes))
+        } else {
+            "starting…".to_owned()
         });
     }
 
