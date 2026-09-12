@@ -149,6 +149,11 @@ pub struct BrowserPage {
     /// keep a heavy page from taking the machine down. See `browser_context`.
     context: webkit6::WebContext,
     open_tabs: RefCell<Vec<Tab>>,
+    /// WebViews of closed tabs that still have a capture running. Their page
+    /// goes on playing -- and feeding the capture -- because the view is kept
+    /// alive and mapped (see `Ui::hold_background`); each is dropped once its
+    /// capture is saved or deleted, which ends its page.
+    background: RefCell<Vec<BackgroundView>>,
     /// For queuing. Set by `attach`, once the rest of the window exists.
     ui: RefCell<Option<Weak<Ui>>>,
 }
@@ -168,6 +173,19 @@ struct ActiveCapture {
     ms: i64,
     /// The filename to save under, taken from the page title when armed.
     name: String,
+}
+
+/// A closed tab's WebView, kept alive so a capture on it goes on.
+///
+/// Everything the tab held that the capture needs: the view (whose page is
+/// still running), its content manager (which the hook still posts through),
+/// and the engine the bytes land in. Dropping this ends the page for good.
+struct BackgroundView {
+    view: webkit6::WebView,
+    // Kept alive alongside the view; the hook posts through it.
+    #[allow(dead_code)]
+    content: webkit6::UserContentManager,
+    mse: Rc<RefCell<super::mse::MseCapture>>,
 }
 
 /// A web context that tells WebKit to manage memory rather than let a page
@@ -269,6 +287,7 @@ impl BrowserPage {
             blocklist: Rc::new(RefCell::new(None)),
             context: browser_context(),
             open_tabs: RefCell::new(Vec::new()),
+            background: RefCell::new(Vec::new()),
             ui: RefCell::new(None),
         });
 
@@ -439,10 +458,14 @@ impl BrowserPage {
             return;
         };
         let name = capture.name.clone();
+        let mse = Rc::clone(&capture.mse);
         let plan = capture.mse.borrow_mut().detach(capture.ms);
         // The engine handle can go now: `detach` moved the files out from
         // under it.
         drop(capture);
+        // If this capture was the reason a closed tab was kept alive, and it
+        // was the last one on it, that page can end now.
+        self.release_background_if_done(&mse);
 
         let Some(plan) = plan else {
             ui.downloads
@@ -459,6 +482,76 @@ impl BrowserPage {
                 .map_err(|error| format!("{error:#}"));
             ui.downloads.capture_finished(&ui, id, result);
         });
+    }
+
+    /// Throw a capture away without saving it.
+    pub fn discard_capture(self: &Rc<Self>, id: u64) {
+        let ui = self.ui.borrow().as_ref().and_then(Weak::upgrade);
+        let Some(capture) = self.captures.borrow_mut().remove(&id) else {
+            return;
+        };
+        // `detach` forgets the source and hands back a plan that owns the temp
+        // files; dropping it deletes them -- a stop with nothing kept.
+        let mse = Rc::clone(&capture.mse);
+        let _ = capture.mse.borrow_mut().detach(capture.ms);
+        drop(capture);
+        self.release_background_if_done(&mse);
+        if let Some(ui) = ui {
+            ui.downloads.capture_removed(id);
+        }
+    }
+
+    /// Pause or resume a capture. Returns whether it was still running.
+    pub fn pause_capture(&self, id: u64, paused: bool) -> bool {
+        let captures = self.captures.borrow();
+        match captures.get(&id) {
+            Some(capture) => capture.mse.borrow_mut().set_paused(capture.ms, paused),
+            None => false,
+        }
+    }
+
+    /// Keep a closed tab's WebView alive so its capture goes on running.
+    ///
+    /// The page's own code is what feeds the capture, so the view cannot be
+    /// destroyed or the capture would stop. It is parked, mapped and out of
+    /// sight, and freed by `release_background_if_done` once its capture ends.
+    fn send_to_background(&self, tab: Tab) {
+        if let Some(ui) = self.ui.borrow().as_ref().and_then(Weak::upgrade) {
+            ui.hold_background(&tab.view);
+        }
+        self.background.borrow_mut().push(BackgroundView {
+            view: tab.view,
+            content: tab.content,
+            mse: tab.mse,
+        });
+    }
+
+    /// Free a backgrounded page once nothing is capturing on it any more.
+    fn release_background_if_done(&self, mse: &Rc<RefCell<super::mse::MseCapture>>) {
+        // A capture still on this engine means the page is still needed.
+        if self
+            .captures
+            .borrow()
+            .values()
+            .any(|capture| Rc::ptr_eq(&capture.mse, mse))
+        {
+            return;
+        }
+        let removed = {
+            let mut background = self.background.borrow_mut();
+            background
+                .iter()
+                .position(|held| Rc::ptr_eq(&held.mse, mse))
+                .map(|index| background.swap_remove(index))
+        };
+        if let Some(held) = removed {
+            if let Some(ui) = self.ui.borrow().as_ref().and_then(Weak::upgrade) {
+                ui.release_background(&held.view);
+            }
+            // Dropping `held` drops the last handle to the view, ending its
+            // page. Kept explicit so that intent is not mistaken for a leak.
+            drop(held);
+        }
     }
 
     /// Save every capture that belongs to a tab's engine, because the tab is
@@ -568,32 +661,43 @@ impl BrowserPage {
             self.tabs.connect_close_page(move |tabs, closing| {
                 if let Some(page) = weak.upgrade() {
                     let child = closing.child();
-                    // Take the tab out, but note the engine it was holding.
-                    let mut removed = None;
-                    page.open_tabs.borrow_mut().retain(|tab| {
-                        let keep = tab.view.upcast_ref::<gtk::Widget>() != &child;
-                        if !keep {
-                            removed = Some(Rc::clone(&tab.mse));
-                        }
-                        keep
-                    });
-                    // A capture must not die with its tab. The page's
-                    // JavaScript is gone, so it cannot go on capturing -- but
-                    // what it took is saved rather than lost, and the task on
-                    // the Downloads page finishes cleanly instead of hanging.
-                    if let Some(mse) = removed {
-                        let had = page
+                    // Take the tab out of the open list, keeping it whole so a
+                    // capture on it can be moved to the background rather than
+                    // dropped.
+                    let removed = {
+                        let mut tabs_vec = page.open_tabs.borrow_mut();
+                        tabs_vec
+                            .iter()
+                            .position(|tab| tab.view.upcast_ref::<gtk::Widget>() == &child)
+                            .map(|index| tabs_vec.swap_remove(index))
+                    };
+                    // Finish the close on the tab strip before anything is done
+                    // with the view, so it is out of the strip and free to be
+                    // re-parented.
+                    tabs.close_page_finish(closing, true);
+
+                    if let Some(tab) = removed {
+                        let capturing = page
                             .captures
                             .borrow()
                             .values()
-                            .any(|capture| Rc::ptr_eq(&capture.mse, &mse));
-                        page.finalize_tab_captures(&mse);
-                        if had && let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) {
-                            ui.toast("Tab closed — saving what was captured");
+                            .any(|capture| Rc::ptr_eq(&capture.mse, &tab.mse));
+                        if capturing {
+                            // Keep the page running in the background so its
+                            // capture goes on; the reader watches and stops it
+                            // from the Downloads page.
+                            page.send_to_background(tab);
+                            if let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) {
+                                ui.toast(
+                                    "Tab closed — its capture keeps running, on the Downloads page",
+                                );
+                            }
                         }
+                        // No capture: `tab` drops here and its view with it.
                     }
-                    // Closed last: open a fresh one once this finishes.
-                    if tabs.n_pages() <= 1 {
+
+                    // Never leave the browser with no tab at all.
+                    if tabs.n_pages() == 0 {
                         let weak = Rc::downgrade(&page);
                         glib::idle_add_local_once(move || {
                             if let Some(page) = weak.upgrade()
@@ -604,7 +708,6 @@ impl BrowserPage {
                         });
                     }
                 }
-                tabs.close_page_finish(closing, true);
                 glib::Propagation::Stop
             });
         }

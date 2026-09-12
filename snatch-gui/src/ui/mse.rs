@@ -79,6 +79,10 @@ struct Source {
     armed: bool,
     /// Bytes the hook is holding for it before it is armed.
     held: u64,
+    /// While paused, chunks that arrive are dropped rather than written, so the
+    /// saved file skips whatever played meanwhile -- the same as pausing a
+    /// recording. The page goes on sending; only this side stops keeping.
+    paused: bool,
 }
 
 /// Every in-page capture for one tab.
@@ -134,6 +138,19 @@ impl MseCapture {
         }
     }
 
+    /// Pause or resume a MediaSource's capture. While paused, chunks that
+    /// arrive are dropped rather than written. Returns whether the source was
+    /// still there to pause.
+    pub fn set_paused(&mut self, ms: i64, paused: bool) -> bool {
+        match self.sources.get_mut(&ms) {
+            Some(source) => {
+                source.paused = paused;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The streams still waiting to be captured, for the "found" counter.
     pub fn unarmed_sources(&self) -> Vec<i64> {
         self.sources
@@ -179,6 +196,7 @@ impl MseCapture {
                     tracks: Vec::new(),
                     armed: false,
                     held: 0,
+                    paused: false,
                 });
                 Update::Present { ms, bytes: 0 }
             }
@@ -187,6 +205,7 @@ impl MseCapture {
                     tracks: Vec::new(),
                     armed: false,
                     held: 0,
+                    paused: false,
                 });
                 if let Some(source) = self.sources.get_mut(&ms)
                     && !source.tracks.contains(&sb)
@@ -208,8 +227,16 @@ impl MseCapture {
                 Update::Present { ms, bytes }
             }
             Message::Data { sb, b64 } => {
-                self.write(sb, &b64);
-                match self.source_of(sb) {
+                let ms = self.source_of(sb);
+                let paused = ms
+                    .and_then(|ms| self.sources.get(&ms))
+                    .is_some_and(|source| source.paused);
+                // Paused: let the chunk go by unwritten, so the file skips what
+                // played while paused instead of stitching a gap into it.
+                if !paused {
+                    self.write(sb, &b64);
+                }
+                match ms {
                     Some(ms) => Update::Present {
                         ms,
                         bytes: self.bytes(ms),
@@ -687,6 +714,30 @@ mod tests {
         let owned = input.parent().unwrap().to_path_buf();
         drop(plan);
         assert!(!owned.exists(), "the plan deletes its own files when done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_paused_capture_drops_chunks_until_it_resumes() {
+        let dir = scratch("pause");
+        let mut capture = MseCapture::new(dir.clone());
+        capture.handle(r#"{"t":"open","ms":1}"#);
+        capture.handle(r#"{"t":"track","ms":1,"sb":1,"mime":"video/mp4"}"#);
+        capture.arm(1);
+        capture.handle(r#"{"t":"data","sb":1,"b64":"aGVsbG8="}"#); // "hello"
+        assert_eq!(capture.bytes(1), 5);
+
+        // Paused: the chunk is dropped, so the count does not move.
+        assert!(capture.set_paused(1, true));
+        capture.handle(r#"{"t":"data","sb":1,"b64":"d29ybGQ="}"#); // "world"
+        assert_eq!(capture.bytes(1), 5, "a paused capture keeps nothing new");
+
+        // Resumed: chunks are kept again.
+        assert!(capture.set_paused(1, false));
+        capture.handle(r#"{"t":"data","sb":1,"b64":"ISEh"}"#); // "!!!"
+        assert_eq!(capture.bytes(1), 8);
+        // What is on disk is the kept chunks only, with the paused one missing.
+        assert_eq!(std::fs::read(dir.join("track-1.bin")).unwrap(), b"hello!!!");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -200,6 +200,12 @@ pub struct Ui {
     downloads: downloads::DownloadsPage,
     #[cfg(feature = "webview")]
     browser: Rc<browser::BrowserPage>,
+    /// An always-mapped, out-of-sight home for the WebViews of closed tabs
+    /// whose capture is still running. It sits in an overlay over the page
+    /// stack, so it stays mapped whatever page is on show — which is what keeps
+    /// a backgrounded page's JavaScript running, and its capture with it.
+    #[cfg(feature = "webview")]
+    background_holder: gtk::Box,
     torrents: torrents::TorrentsPage,
     scraper: scraper::ScraperPage,
     history: history::HistoryPage,
@@ -385,6 +391,29 @@ impl Ui {
         sidebar_toolbar.add_bottom_bar(&quick_bar);
 
         let toasts = adw::ToastOverlay::new();
+        // A backgrounded capture's WebView is parked here. An overlay keeps
+        // every child mapped, so the parked page keeps running whatever page
+        // the reader is looking at; it takes no space and no input, so it is
+        // never seen. Only built with the browser that fills it.
+        #[cfg(feature = "webview")]
+        let background_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .width_request(1)
+            .height_request(1)
+            .can_target(false)
+            .overflow(gtk::Overflow::Hidden)
+            .opacity(0.0)
+            .build();
+        #[cfg(feature = "webview")]
+        {
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&stack));
+            overlay.add_overlay(&background_holder);
+            toasts.set_child(Some(&overlay));
+        }
+        #[cfg(not(feature = "webview"))]
         toasts.set_child(Some(&stack));
         let banner = adw::Banner::builder().revealed(false).build();
 
@@ -458,6 +487,8 @@ impl Ui {
             downloads,
             #[cfg(feature = "webview")]
             browser,
+            #[cfg(feature = "webview")]
+            background_holder,
             torrents,
             scraper,
             history,
@@ -847,6 +878,40 @@ impl Ui {
     #[cfg(feature = "webview")]
     pub fn stop_capture(&self, id: u64) {
         self.browser.save_capture(id);
+    }
+
+    /// Throw a capture away without saving.
+    #[cfg(feature = "webview")]
+    pub fn discard_capture(self: &Rc<Self>, id: u64) {
+        self.browser.discard_capture(id);
+    }
+
+    /// Pause or resume a capture. Returns whether it was still running.
+    #[cfg(feature = "webview")]
+    pub fn pause_capture(&self, id: u64, paused: bool) -> bool {
+        self.browser.pause_capture(id, paused)
+    }
+
+    /// Park a closed tab's WebView where it stays mapped -- and so keeps
+    /// running -- while its capture finishes in the background.
+    #[cfg(feature = "webview")]
+    pub fn hold_background(&self, view: &webkit6::WebView) {
+        use gtk::prelude::*;
+        let widget = view.upcast_ref::<gtk::Widget>();
+        if widget.parent().is_some() {
+            widget.unparent();
+        }
+        self.background_holder.append(widget);
+    }
+
+    /// Let a parked WebView go once its capture is done, which ends its page.
+    #[cfg(feature = "webview")]
+    pub fn release_background(&self, view: &webkit6::WebView) {
+        use gtk::prelude::*;
+        let widget = view.upcast_ref::<gtk::Widget>();
+        if widget.parent().as_ref() == Some(self.background_holder.upcast_ref::<gtk::Widget>()) {
+            self.background_holder.remove(widget);
+        }
     }
 
     /// Put a count next to a sidebar entry, or hide it at zero.

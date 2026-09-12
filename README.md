@@ -54,7 +54,7 @@ Want to change something?
 | What | Command |
 |---|---|
 | Skip the extra tools | <code>curl -fsSL …/get.sh &vert; sh -s -- --no-extras</code> |
-| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 4.15.0</code> |
+| Pick a version | <code>curl -fsSL …/get.sh &vert; sh -s -- --version 4.16.0</code> |
 | Remove Snatch | <code>curl -fsSL …/get.sh &vert; sh -s -- --uninstall</code> |
 
 Do not trust a script you have not read? Good. [Read it first](get.sh). It is
@@ -65,9 +65,9 @@ short and does nothing clever.
 Every release has one for each kind of Linux:
 
 ```bash
-sudo apt install ./snatch-dl_4.15.0-1_amd64.deb            # Debian, Ubuntu, Mint
-sudo dnf install ./snatch-dl-4.15.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
-sudo pacman -U ./snatch-dl-4.15.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
+sudo apt install ./snatch-dl_4.16.0-1_amd64.deb            # Debian, Ubuntu, Mint
+sudo dnf install ./snatch-dl-4.16.0-1.x86_64.rpm           # Fedora, RHEL, openSUSE
+sudo pacman -U ./snatch-dl-4.16.0-1-x86_64.pkg.tar.zst     # Arch, Manjaro
 ```
 
 There is a `.tar.gz` for anything else.
@@ -449,19 +449,28 @@ them in the page, and feed them to the video a chunk at a time. There is
 nothing on the network to grab. Snatch watches the video being fed inside the
 page and can save it: press the **found** button and choose **Capture**. The
 capture appears on the **Downloads page**, next to every other download, as a
-task with its size climbing and a **Stop** button. Snatch takes you there so
-it is in front of you. Stopping it writes what has been captured to a file —
-video and sound, which players usually feed separately, are joined into one
-file for you.
+task with its size climbing, and Snatch takes you there so it is in front of
+you. Video and sound, which players usually feed separately, are joined into
+one file when you save.
 
-It is a download like any other now, not a bar in the browser, so it stays put
-whatever you do with the tab. If you close the tab, navigate away, or the page
-crashes, the capture is **finished and saved** rather than lost — it simply
-stops where it was. One limit worth knowing: this kind of stream can only be
-captured while its page is open, because the video is built by the page's own
-code, so nothing more can be captured once the tab is gone (you keep what you
-had). A stream that has a normal address keeps recording after the tab is gone,
-because that goes to the recorder rather than the page.
+The task carries its own controls, so you decide when and whether to keep it:
+
+- **Save** writes what has been captured so far to a file and ends the task.
+- **Delete** throws the capture away — for when it turned out to be the wrong
+  stream.
+- **Pause** stops keeping for a while and picks up again when you press it
+  once more; whatever played while paused is simply left out of the file, the
+  same as pausing a recording.
+
+**It keeps going after you close the tab.** Close the tab a capture is running
+in and the capture does not stop: its page keeps running out of sight and the
+task on the Downloads page carries on climbing, so you can close the tab, or a
+dozen of them, and still walk away with every recording. The page ends only
+when you Save or Delete its capture. (One thing that genuinely cannot be worked
+around: a page that itself stops playing when it is not on screen will pause
+its own feed — that is the site's choice, not Snatch's. A stream with a normal
+address avoids all of this, because it records through the recorder, which
+never needed the page at all.)
 
 **It cannot open DRM.** A page locked with DRM hands its key to a part of the
 browser that never gives it back, and there is no such part here — so those

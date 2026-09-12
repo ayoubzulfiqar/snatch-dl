@@ -508,7 +508,7 @@ impl DownloadsPage {
         let mut jobs = self.capture_jobs.borrow_mut();
         let row = jobs.entry(id).or_insert_with(|| {
             let row = JobRow::new("Capturing video");
-            row.on_stop_capture(ui, id);
+            row.on_capture_controls(ui, id);
             self.jobs_list.append(&row.root);
             row
         });
@@ -541,6 +541,15 @@ impl DownloadsPage {
                     .unwrap_or_else(|| path.display().to_string())
             )),
             Err(error) => ui.toast(&format!("Could not save the capture: {error}")),
+        }
+        self.refresh_page();
+    }
+
+    /// A capture was thrown away without saving; just take its row off.
+    #[cfg(feature = "webview")]
+    pub fn capture_removed(&self, id: u64) {
+        if let Some(row) = self.capture_jobs.borrow_mut().remove(&id) {
+            self.jobs_list.remove(&row.root);
         }
         self.refresh_page();
     }
@@ -636,15 +645,40 @@ impl DownloadsPage {
     }
 }
 
+/// Weak handles to a capture row's buttons, so the click that starts a save or
+/// a delete can grey out all three while it runs.
+#[cfg(feature = "webview")]
+struct CaptureControls {
+    pause: glib::WeakRef<gtk::Button>,
+    discard: glib::WeakRef<gtk::Button>,
+    cancel: glib::WeakRef<gtk::Button>,
+}
+
+#[cfg(feature = "webview")]
+impl CaptureControls {
+    fn disable_all(&self) {
+        for button in [&self.pause, &self.discard, &self.cancel] {
+            if let Some(button) = button.upgrade() {
+                button.set_sensitive(false);
+            }
+        }
+    }
+}
+
 /// A conversion in progress.
 struct JobRow {
     root: gtk::ListBoxRow,
     title: gtk::Label,
     detail: gtk::Label,
     progress: gtk::ProgressBar,
-    /// Only a recording can be paused, so this stays hidden for every other
-    /// kind of job rather than sitting there doing nothing.
+    /// Only a recording or a capture can be paused, so this stays hidden for
+    /// every other kind of job rather than sitting there doing nothing.
     pause: gtk::Button,
+    /// Throw a capture away without saving. Hidden for every other job, whose
+    /// stop button already covers the only ending they have. Captures are a
+    /// browser feature, so this only exists with it.
+    #[cfg(feature = "webview")]
+    discard: gtk::Button,
     cancel: gtk::Button,
 }
 
@@ -658,11 +692,19 @@ impl JobRow {
         let progress = gtk::ProgressBar::builder().hexpand(true).build();
         let pause = control_button("media-playback-pause-symbolic", "Pause this recording");
         pause.set_visible(false);
+        #[cfg(feature = "webview")]
+        let discard = {
+            let discard = control_button("user-trash-symbolic", "Delete this capture");
+            discard.set_visible(false);
+            discard
+        };
         let cancel = control_button("process-stop-symbolic", "Stop this job");
 
         let heading = gtk::Box::builder().spacing(12).build();
         heading.append(&title);
         heading.append(&pause);
+        #[cfg(feature = "webview")]
+        heading.append(&discard);
         heading.append(&cancel);
 
         let body = row_body();
@@ -679,6 +721,8 @@ impl JobRow {
             detail,
             progress,
             pause,
+            #[cfg(feature = "webview")]
+            discard,
             cancel,
         })
     }
@@ -738,22 +782,85 @@ impl JobRow {
         });
     }
 
-    /// Stop an in-page capture, keeping what has been captured.
+    /// Wire the three things a capture can do: pause, save, and delete.
     ///
-    /// Like a recording, a capture is not a download that failed halfway:
-    /// everything already taken is watchable, and stopping is how it ends. So
-    /// the button saves rather than discards, and says so.
+    /// A capture is not a download that failed halfway — everything already
+    /// taken is watchable. So the stop button saves rather than discards, a
+    /// second button throws it away for when it was the wrong stream, and it
+    /// can be paused like a recording (what plays while paused is left out).
     #[cfg(feature = "webview")]
-    fn on_stop_capture(&self, ui: &Rc<Ui>, id: u64) {
+    fn on_capture_controls(&self, ui: &Rc<Ui>, id: u64) {
+        // Save: stop capturing and write what has been taken to a file.
+        self.cancel.set_icon_name("document-save-symbolic");
         self.cancel
-            .set_tooltip_text(Some("Stop capturing and save what you have"));
-        let weak = Rc::downgrade(ui);
-        self.cancel.connect_clicked(move |button| {
-            let Some(ui) = weak.upgrade() else { return };
-            button.set_sensitive(false);
-            ui.stop_capture(id);
-            ui.toast("Saving the capture");
-        });
+            .set_tooltip_text(Some("Save what has been captured"));
+        {
+            let weak = Rc::downgrade(ui);
+            let row = self.controls_weak();
+            self.cancel.connect_clicked(move |_| {
+                let Some(ui) = weak.upgrade() else { return };
+                row.disable_all();
+                ui.stop_capture(id);
+                ui.toast("Saving the capture");
+            });
+        }
+
+        // Delete: stop capturing and throw away what was taken.
+        self.discard.set_visible(true);
+        {
+            let weak = Rc::downgrade(ui);
+            let row = self.controls_weak();
+            self.discard.connect_clicked(move |_| {
+                let Some(ui) = weak.upgrade() else { return };
+                row.disable_all();
+                ui.discard_capture(id);
+                ui.toast("Deleted the capture");
+            });
+        }
+
+        // Pause / resume, exactly as a recording pauses: what plays while
+        // paused is simply not in the saved file.
+        self.pause.set_visible(true);
+        self.pause.set_tooltip_text(Some("Pause this capture"));
+        {
+            let weak = Rc::downgrade(ui);
+            let paused = std::cell::Cell::new(false);
+            self.pause.connect_clicked(move |button| {
+                let Some(ui) = weak.upgrade() else { return };
+                let wanted = !paused.get();
+                if !ui.pause_capture(id, wanted) {
+                    ui.toast("That capture has already finished");
+                    return;
+                }
+                paused.set(wanted);
+                button.set_icon_name(if wanted {
+                    "media-playback-start-symbolic"
+                } else {
+                    "media-playback-pause-symbolic"
+                });
+                button.set_tooltip_text(Some(if wanted {
+                    "Carry on capturing"
+                } else {
+                    "Pause this capture"
+                }));
+                ui.toast(if wanted {
+                    "Paused — what plays now will not be captured"
+                } else {
+                    "Capturing again"
+                });
+            });
+        }
+    }
+
+    /// A handle to a row's three buttons, so a click on one can disable them
+    /// all at once while the save or delete it started runs.
+    #[cfg(feature = "webview")]
+    fn controls_weak(&self) -> CaptureControls {
+        CaptureControls {
+            pause: self.pause.downgrade(),
+            discard: self.discard.downgrade(),
+            cancel: self.cancel.downgrade(),
+        }
     }
 
     /// A capture that has just been armed, before its first bytes land.
