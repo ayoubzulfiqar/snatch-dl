@@ -447,9 +447,18 @@ From a terminal: `snatch-gui --browse https://example.com/live`.
 file over the network — they fetch pieces, sometimes decrypt or reassemble
 them in the page, and feed them to the video a chunk at a time. There is
 nothing on the network to grab. Snatch watches the video being fed inside the
-page and can save it: press the **found** button, choose **Capture**, and when
-you have enough press **Save**. Video and sound, which players usually feed
+page and can save it: press the **found** button, choose **Capture**, and a
+live indicator appears in the toolbar showing the size climbing, with a
+**Save** button. Save writes what has been captured so far — press it again
+later for more of a live stream. Video and sound, which players usually feed
 separately, are joined into one file for you.
+
+If you close the tab mid-capture, what it had captured is **kept**, not lost —
+the toolbar goes on offering it to Save (or Discard). One limit worth knowing:
+this kind of stream can only be captured while its page is open, so closing
+the tab stops it there (you keep what you had). A stream that has a normal
+address keeps recording after the tab is gone, because that goes to the
+recorder rather than the page.
 
 **It cannot open DRM.** A page locked with DRM hands its key to a part of the
 browser that never gives it back, and there is no such part here — so those

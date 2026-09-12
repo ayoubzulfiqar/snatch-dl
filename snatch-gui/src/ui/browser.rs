@@ -141,17 +141,64 @@ pub struct BrowserPage {
     capturing_spinner: gtk::Spinner,
     capturing_label: gtk::Label,
     capturing_save: gtk::Button,
+    /// Throws away captures kept from closed tabs, shown only when there are
+    /// any -- a live capture on the tab in front is stopped by leaving it, not
+    /// by this.
+    capturing_discard: gtk::Button,
     /// The ad-block rules, compiled once and shared. Each tab has its own
     /// content manager -- so that a script message can be told which tab sent
     /// it -- and the one compiled filter is added to every one of them.
     blocklist: Rc<RefCell<Option<webkit6::UserContentFilter>>>,
+    /// Shared by every tab, and carrying the memory-pressure settings that
+    /// keep a heavy page from taking the machine down. See `browser_context`.
+    context: webkit6::WebContext,
     open_tabs: RefCell<Vec<Tab>>,
+    /// Captures whose tab was closed while they held video. Kept alive so the
+    /// bytes survive the tab going, and offered for saving in the toolbar.
+    /// See `Pending`.
+    pending: RefCell<Vec<Pending>>,
     /// For queuing. Set by `attach`, once the rest of the window exists.
     ui: RefCell<Option<Weak<Ui>>>,
 }
 
 /// The page-world script that captures in-page video. See `mse.rs`.
 const MSE_HOOK: &str = include_str!("mse-hook.js");
+
+/// A capture kept alive after its tab was closed, waiting to be saved.
+struct Pending {
+    name: String,
+    mse: Rc<RefCell<super::mse::MseCapture>>,
+}
+
+/// A web context that tells WebKit to manage memory rather than let a page
+/// grow until the machine is out of it.
+///
+/// A heavy stream site can allocate without end. Left alone, WebKit's process
+/// grows until the operating system kills something -- sometimes the whole
+/// session. These settings make it shed caches and run the collector as it
+/// climbs, and, past a ceiling, kill just its own content process -- which is
+/// recoverable, because `watch_crashes` reloads the tab, and which protects
+/// everything else running on the machine. The thresholds are gentle and the
+/// poll slow, because an aggressive limit with a fast poll makes WebKit spend
+/// its time collecting instead of rendering.
+fn browser_context() -> webkit6::WebContext {
+    let mut memory = webkit6::MemoryPressureSettings::new();
+    // Per content process, in MB. Generous: most pages sit far below it, and
+    // it exists to catch the one that runs away.
+    memory.set_memory_limit(3072);
+    // The three thresholds must stay in ascending order, and each setter
+    // checks the value against the neighbours already stored -- so they are
+    // set highest first, or the defaults reject the ones below them. Kill the
+    // content process past the ceiling before it can take the machine with
+    // it; that kill is a crash `watch_crashes` catches and reloads from.
+    memory.set_kill_threshold(0.85);
+    memory.set_strict_threshold(0.65);
+    memory.set_conservative_threshold(0.5);
+    memory.set_poll_interval(30.0);
+    webkit6::WebContext::builder()
+        .memory_pressure_settings(&memory)
+        .build()
+}
 
 impl BrowserPage {
     pub fn new() -> Rc<Self> {
@@ -194,6 +241,12 @@ impl BrowserPage {
             .label("Save")
             .css_classes(["suggested-action"])
             .build();
+        let capturing_discard = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Discard the captures kept from closed tabs")
+            .visible(false)
+            .css_classes(["flat"])
+            .build();
         let capturing = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -203,6 +256,7 @@ impl BrowserPage {
         capturing.append(&capturing_spinner);
         capturing.append(&capturing_label);
         capturing.append(&capturing_save);
+        capturing.append(&capturing_discard);
 
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -240,8 +294,11 @@ impl BrowserPage {
             capturing_spinner,
             capturing_label,
             capturing_save,
+            capturing_discard,
             blocklist: Rc::new(RefCell::new(None)),
+            context: browser_context(),
             open_tabs: RefCell::new(Vec::new()),
+            pending: RefCell::new(Vec::new()),
             ui: RefCell::new(None),
         });
 
@@ -366,48 +423,68 @@ impl BrowserPage {
     /// running, so a live stream can be saved again later with more of it; the
     /// button re-enables when the mux is done.
     fn save_captures(self: &Rc<Self>) {
-        let Some(view) = self.current_view() else {
-            return;
-        };
-        let Some(mse) = self.current_capture() else {
-            return;
-        };
         let Some(ui) = self.ui.borrow().as_ref().and_then(Weak::upgrade) else {
             return;
         };
 
-        // Everything needed for the mux, gathered before any await so no
-        // borrow of the capture is held across it.
-        let plans: Vec<super::mse::SavePlan> = {
+        // One (name, plan) per track to write, gathered before any await so no
+        // borrow of a capture is held across it. Two sources: the live capture
+        // on the tab in front, and every capture kept from a closed tab.
+        //
+        // A stem repeated across MediaSources is numbered apart.
+        let mut jobs: Vec<(String, super::mse::SavePlan)> = Vec::new();
+        let mut plan_for = |name: &str, mse: &Rc<RefCell<super::mse::MseCapture>>| {
             let capture = mse.borrow();
-            capture
-                .armed_sources()
-                .into_iter()
-                .filter_map(|ms| capture.plan(ms))
-                .collect()
+            let armed = capture.armed_sources();
+            let many = armed.len() > 1;
+            for (index, ms) in armed.into_iter().enumerate() {
+                if let Some(plan) = capture.plan(ms) {
+                    let stem = if many {
+                        format!("{name} ({})", index + 1)
+                    } else {
+                        name.to_owned()
+                    };
+                    jobs.push((stem, plan));
+                }
+            }
         };
-        if plans.is_empty() {
+
+        // The live capture stays where it is -- it keeps running, and its temp
+        // files stay held by the tab, so the mux reads them safely.
+        let live = self.current_view().zip(self.current_capture());
+        if let Some((view, mse)) = &live {
+            plan_for(&capture_name(view), mse);
+        }
+        // The kept captures are taken out of the pending list and held by the
+        // task, so their temp files survive until the mux has read them and
+        // are cleaned up only once it is done.
+        let taken: Vec<Pending> = std::mem::take(&mut *self.pending.borrow_mut());
+        for entry in &taken {
+            plan_for(&entry.name, &entry.mse);
+        }
+
+        if jobs.is_empty() {
             ui.toast("Nothing has been captured yet");
+            self.sync_toolbar();
             return;
         }
 
-        let name = capture_name(&view);
-        let count = plans.len();
         self.capturing_save.set_sensitive(false);
         self.capturing_save.set_label("Saving…");
 
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
+            // `taken` is held for the whole task; its captures' temp files are
+            // deleted when it drops, which is after every mux has finished.
+            let _keep_alive = taken;
             let dest = crate::ytdlp::destination_for(&ui.backend().download_dir);
             let mut saved: Vec<std::path::PathBuf> = Vec::new();
+            let mut first = String::new();
             let mut failure: Option<String> = None;
-            for (index, plan) in plans.into_iter().enumerate() {
-                // One programme, several MediaSources: number them apart.
-                let stem = if count > 1 {
-                    format!("{name} ({})", index + 1)
-                } else {
-                    name.clone()
-                };
+            for (stem, plan) in jobs {
+                if first.is_empty() {
+                    first = stem.clone();
+                }
                 let dest = dest.clone();
                 match ui
                     .backend()
@@ -422,11 +499,12 @@ impl BrowserPage {
             if let Some(page) = weak.upgrade() {
                 page.capturing_save.set_label("Save");
                 page.capturing_save.set_sensitive(true);
+                page.sync_toolbar();
             }
             match (saved.as_slice(), failure) {
                 ([], Some(error)) => ui.toast(&format!("Could not save the capture: {error}")),
                 ([], None) => ui.toast("Nothing has been captured yet"),
-                ([one], _) => ui.toast(&format!("Saved {}", saved_name(one, &name))),
+                ([one], _) => ui.toast(&format!("Saved {}", saved_name(one, &first))),
                 (many, _) => ui.toast(&format!("Saved {} videos", many.len())),
             }
         });
@@ -473,12 +551,28 @@ impl BrowserPage {
         new_tab: &gtk::Button,
         capturing_save: &gtk::Button,
     ) {
-        // The live bar's Save writes every armed capture on the tab in front.
+        // The live bar's Save writes every armed capture on the tab in front,
+        // and every capture kept from a closed tab.
         {
             let weak = Rc::downgrade(self);
             capturing_save.connect_clicked(move |_| {
                 if let Some(page) = weak.upgrade() {
                     page.save_captures();
+                }
+            });
+        }
+        // Discard throws away the kept captures without saving.
+        {
+            let weak = Rc::downgrade(self);
+            self.capturing_discard.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    // Dropping the Pending drops the last MseCapture handle,
+                    // which deletes its temp files.
+                    page.pending.borrow_mut().clear();
+                    page.sync_toolbar();
+                    if let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) {
+                        ui.toast("Discarded the kept captures");
+                    }
                 }
             });
         }
@@ -537,9 +631,36 @@ impl BrowserPage {
             self.tabs.connect_close_page(move |tabs, closing| {
                 if let Some(page) = weak.upgrade() {
                     let child = closing.child();
-                    page.open_tabs
-                        .borrow_mut()
-                        .retain(|tab| tab.view.upcast_ref::<gtk::Widget>() != &child);
+                    // Take the tab out, but keep any capture it was holding.
+                    let mut removed = None;
+                    page.open_tabs.borrow_mut().retain(|tab| {
+                        let keep = tab.view.upcast_ref::<gtk::Widget>() != &child;
+                        if !keep {
+                            removed = Some((tab.view.clone(), Rc::clone(&tab.mse)));
+                        }
+                        keep
+                    });
+                    // A capture with bytes on disk must not die with its tab.
+                    // The page's JavaScript is gone, so it cannot go on
+                    // capturing -- but what it captured is kept, and offered
+                    // for saving, instead of vanishing the instant the tab
+                    // closes.
+                    if let Some((view, mse)) = removed {
+                        let kept = !mse.borrow().armed_sources().is_empty()
+                            && mse.borrow().armed_bytes() > 0;
+                        if kept {
+                            let name = capture_name(&view);
+                            let bytes = mse.borrow().armed_bytes();
+                            page.pending.borrow_mut().push(Pending { name, mse });
+                            page.sync_toolbar();
+                            if let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) {
+                                ui.toast(&format!(
+                                    "Kept {} captured before the tab closed — Save it from the toolbar",
+                                    super::format::human_bytes(bytes)
+                                ));
+                            }
+                        }
+                    }
                     // Closed last: open a fresh one once this finishes.
                     if tabs.n_pages() <= 1 {
                         let weak = Rc::downgrade(&page);
@@ -599,7 +720,10 @@ impl BrowserPage {
             content.add_filter(filter);
         }
 
-        let mut builder = webkit6::WebView::builder().user_content_manager(&content);
+        let mut builder = webkit6::WebView::builder()
+            .user_content_manager(&content)
+            // The shared context carries the memory-pressure settings.
+            .web_context(&self.context);
         // A popup must be related to the page that opened it, or WebKit will
         // not hand it its content.
         if let Some(opener) = opener {
@@ -847,27 +971,48 @@ impl BrowserPage {
             .unwrap_or(0);
         self.show_count(network + waiting);
 
-        // The live bar reflects whatever is being captured on this tab.
-        let (armed, bytes) = capture
+        // The live bar reflects the capture on this tab, plus any kept from a
+        // closed tab.
+        let (armed, live_bytes) = capture
             .map(|mse| {
                 let mse = mse.borrow();
                 (mse.armed_sources().len(), mse.armed_bytes())
             })
             .unwrap_or((0, 0));
-        if armed > 0 {
-            let amount = if bytes > 0 {
-                super::format::human_bytes(bytes)
-            } else {
-                "starting…".to_owned()
-            };
-            self.capturing_label
-                .set_label(&format!("Capturing {amount}"));
-            self.capturing_spinner.start();
-            self.capturing.set_visible(true);
-        } else {
+        let (kept, kept_bytes) = {
+            let pending = self.pending.borrow();
+            let bytes: u64 = pending.iter().map(|p| p.mse.borrow().armed_bytes()).sum();
+            (pending.len(), bytes)
+        };
+
+        if armed == 0 && kept == 0 {
             self.capturing_spinner.stop();
             self.capturing.set_visible(false);
+            return;
         }
+
+        // Only a running capture spins; a kept-but-stopped one does not.
+        if armed > 0 {
+            self.capturing_spinner.start();
+        } else {
+            self.capturing_spinner.stop();
+        }
+        let label = match (armed > 0, kept > 0) {
+            (true, false) => format!("Capturing {}", live_or_starting(live_bytes)),
+            (true, true) => format!(
+                "Capturing {} · {} kept",
+                live_or_starting(live_bytes),
+                super::format::human_bytes(kept_bytes)
+            ),
+            (false, _) => format!(
+                "{kept} capture{} kept · {}",
+                if kept == 1 { "" } else { "s" },
+                super::format::human_bytes(kept_bytes)
+            ),
+        };
+        self.capturing_label.set_label(&label);
+        self.capturing_discard.set_visible(kept > 0);
+        self.capturing.set_visible(true);
     }
 
     fn show_count(&self, total: usize) {
@@ -1023,6 +1168,15 @@ fn capture_dir() -> std::path::PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("snatch-mse-{}-{n}", std::process::id()))
+}
+
+/// A byte amount, or "starting…" before the first chunk has landed.
+fn live_or_starting(bytes: u64) -> String {
+    if bytes > 0 {
+        super::format::human_bytes(bytes)
+    } else {
+        "starting…".to_owned()
+    }
 }
 
 /// "3 found", and "1 found" rather than "1 founds".
