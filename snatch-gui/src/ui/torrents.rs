@@ -121,6 +121,19 @@ impl TorrentsPage {
                     summary.active += 1;
                     summary.speed += torrent.download_bps;
                 }
+                // Still ours to finish: running, or paused before it was done.
+                // A paused torrent that already finished is just being kept.
+                if matches!(
+                    torrent.phase,
+                    TorrentPhase::Downloading | TorrentPhase::Seeding
+                ) || (!torrent.finished
+                    && matches!(
+                        torrent.phase,
+                        TorrentPhase::Initializing | TorrentPhase::Paused
+                    ))
+                {
+                    summary.pending += 1;
+                }
             }
 
             rows.retain(|id, row| {

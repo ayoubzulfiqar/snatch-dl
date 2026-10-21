@@ -60,23 +60,23 @@ fn host_from_url(url: &str) -> Option<String> {
     parsed.host_str().map(str::to_ascii_lowercase)
 }
 
-/// Check the finished file against the digest the request carried, if any.
+/// The digest a request asks the finished file to be checked against.
 ///
-/// An unreadable digest is reported rather than ignored. Unlike the aria2
-/// path — where a bad option would make aria2 reject the add and lose the
-/// download outright — nothing is at stake here but the message, and silently
-/// skipping a check the user asked for would be worse than saying so.
-async fn verify_if_requested(request: &DownloadRequest, path: &Path) -> Result<()> {
-    let Some(text) = request.checksum.as_deref().map(str::trim) else {
-        return Ok(());
-    };
+/// Read before anything is fetched, and an unreadable one is dropped with a
+/// warning -- the same as the aria2 path. It used to be parsed only after
+/// the transfer, and a parse failure was treated like a mismatch: the whole
+/// file was downloaded and then deleted over an optional field a web page
+/// controls.
+fn requested_checksum(request: &DownloadRequest) -> Option<crate::checksum::Checksum> {
+    let text = request.checksum.as_deref().map(str::trim)?;
     if text.is_empty() {
-        return Ok(());
+        return None;
     }
-    let Some(expected) = crate::checksum::parse(text) else {
-        bail!("'{text}' is not a checksum in any recognised form");
-    };
-    crate::checksum::verify_file(path, &expected).await
+    let parsed = crate::checksum::parse(text);
+    if parsed.is_none() {
+        log::warn!("ignoring '{text}': not a checksum in any recognised form");
+    }
+    parsed
 }
 
 /// A short-lived `.netrc` holding one machine's credentials.
@@ -198,6 +198,13 @@ pub async fn detect() -> Option<Flavour> {
 
 #[derive(Debug, Clone)]
 pub enum WgetEvent {
+    /// The download is holding until its own start time; a visible job that
+    /// can be cancelled, like a scheduled recording.
+    Waiting {
+        job_id: i64,
+        name: String,
+        start_at: i64,
+    },
     Started {
         job_id: i64,
         name: String,
@@ -223,6 +230,10 @@ pub enum WgetEvent {
 pub struct WgetEngine {
     download_dir: PathBuf,
     jobs: Mutex<HashMap<i64, JoinHandle<()>>>,
+    /// The file each running job is writing, so a cancel can remove it.
+    /// Aborting the task alone killed wget and left the partial file looking
+    /// like a finished download.
+    partials: Mutex<HashMap<i64, PathBuf>>,
     next_id: std::sync::atomic::AtomicI64,
 }
 
@@ -231,6 +242,7 @@ impl WgetEngine {
         Arc::new(Self {
             download_dir,
             jobs: Mutex::new(HashMap::new()),
+            partials: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicI64::new(1),
         })
     }
@@ -248,11 +260,25 @@ impl WgetEngine {
             .count()
     }
 
-    /// Abort a job. `kill_on_drop` turns the abort into a killed subprocess.
+    fn partials(&self) -> std::sync::MutexGuard<'_, HashMap<i64, PathBuf>> {
+        self.partials
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Abort a job. `kill_on_drop` turns the abort into a killed subprocess,
+    /// and whatever it had written so far is removed with it.
     pub fn cancel(&self, job_id: i64) {
         if let Some(task) = self.jobs().remove(&job_id) {
             task.abort();
             log::info!("cancelled wget job {job_id}");
+        }
+        if let Some(partial) = self.partials().remove(&job_id) {
+            match std::fs::remove_file(&partial) {
+                Ok(()) => log::info!("removed the partial file {}", partial.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => log::warn!("could not remove {}: {error}", partial.display()),
+            }
         }
     }
 
@@ -265,6 +291,7 @@ impl WgetEngine {
         events: mpsc::Sender<WgetEvent>,
     ) -> Result<i64> {
         request.validate()?;
+        let expected = requested_checksum(&request);
         let job_id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -280,7 +307,11 @@ impl WgetEngine {
                     // file is hashed here instead. A mismatch is a failure,
                     // not a warning: the point of asking for a digest is that
                     // the wrong bytes are worse than no bytes.
-                    match verify_if_requested(&request, &path).await {
+                    let verified = match &expected {
+                        Some(expected) => crate::checksum::verify_file(&path, expected).await,
+                        None => Ok(()),
+                    };
+                    match verified {
                         Ok(()) => {
                             let _ = events.send(WgetEvent::Finished { job_id, path }).await;
                         }
@@ -307,6 +338,7 @@ impl WgetEngine {
                 }
             }
             engine.jobs().remove(&job_id);
+            engine.partials().remove(&job_id);
         });
 
         self.jobs().insert(job_id, task);
@@ -332,13 +364,34 @@ impl WgetEngine {
             .sanitized_filename()
             .or_else(|| crate::types::name_from_url(&request.url))
             .unwrap_or_else(|| "download".to_owned());
+        // "Start later": wget has no paused queue to hold a download in, so
+        // the job itself waits, in view, until the time arrives. Before this
+        // the time was ignored and the download began at once.
+        if let Some(start_at) = request.start_at {
+            let now = crate::settings::now_unix();
+            if start_at > now {
+                let _ = events
+                    .send(WgetEvent::Waiting {
+                        job_id,
+                        name: name.clone(),
+                        start_at,
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_secs((start_at - now) as u64)).await;
+            }
+        }
+
         let target = unique_path(&self.download_dir, &name);
+        self.partials().insert(job_id, target.clone());
 
         // wget cannot report a total for a file it has not started, and the
         // on-disk size means nothing without one, so ask the server first.
         let task_key = format!("wget:{job_id}");
+        // `Engine::Wget`, not `Http`: wget speaks HTTP proxies only, and a
+        // SOCKS address handed to it failed with an opaque handshake error
+        // after the HEAD probe (which can speak SOCKS) had succeeded.
         let proxy = proxies
-            .resolve_for(&task_key, Engine::Http)
+            .resolve_for(&task_key, Engine::Wget)
             .context("the download cannot use the configured proxy")?;
         let total = head_length(&request.url, proxies, proxy.as_ref()).await;
 
@@ -357,8 +410,19 @@ impl WgetEngine {
             .arg("--progress=none")
             .arg("--tries")
             .arg(settings.download.retries.max(1).to_string())
+            // The browser's own user agent when the hand-off carried one: a
+            // cookie such as Cloudflare's clearance is bound to the agent that
+            // earned it, and presenting a different one gets a 403 on a site
+            // the aria2 engine fetches fine.
             .arg("--user-agent")
-            .arg(&settings.download.user_agent)
+            .arg(
+                request
+                    .user_agent
+                    .as_deref()
+                    .map(sanitise_header)
+                    .filter(|agent| !agent.trim().is_empty())
+                    .unwrap_or_else(|| settings.download.user_agent.clone()),
+            )
             .arg("-O")
             .arg(&target);
 
@@ -528,6 +592,7 @@ impl WgetEngine {
             bail!("wget exited with {code}: {detail}");
         }
 
+        self.partials().remove(&job_id);
         Ok(target)
     }
 }

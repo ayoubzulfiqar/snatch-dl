@@ -316,10 +316,19 @@ async fn fetch_candidate(
     {
         return None;
     }
-    let body = response.text().await.ok()?;
-    if body.len() > MAX_SUMS_BYTES {
-        return None;
+    // Read in pieces and stop at the cap: a chunked body carries no length
+    // to check up front, and nine of these run at once against a server the
+    // page chose, so reading whole bodies first was an open-ended buffer.
+    let mut collected = Vec::new();
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk.ok()?;
+        if collected.len() + chunk.len() > MAX_SUMS_BYTES {
+            return None;
+        }
+        collected.extend_from_slice(&chunk);
     }
+    let body = String::from_utf8_lossy(&collected).into_owned();
 
     // A `<file>.sha256` beside the download usually holds the digest alone,
     // with no name to match against.
@@ -390,10 +399,14 @@ pub async fn verify_file(path: &Path, expected: &Checksum) -> Result<()> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
+    // coreutils prefixes the line with `\\` when the file name needed
+    // escaping (a backslash or a line break in the path), which would
+    // otherwise read as a mismatch and get a good file deleted.
     let actual = text
         .split_whitespace()
         .next()
         .unwrap_or_default()
+        .trim_start_matches('\\')
         .to_ascii_lowercase();
     if actual != expected.hex {
         bail!(

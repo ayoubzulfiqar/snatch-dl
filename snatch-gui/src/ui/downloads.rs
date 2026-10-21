@@ -237,6 +237,8 @@ impl DownloadsPage {
                 }
                 if download.is_finished() {
                     finished += 1;
+                } else {
+                    summary.pending += 1;
                 }
             }
 
@@ -291,7 +293,14 @@ impl DownloadsPage {
             engine_id: format!("aria2:{}", download.gid),
             url: download.source_uri().unwrap_or_default().to_owned(),
             filename: download.display_name(),
-            path: download.path().map(PathBuf::from),
+            // A download that failed before writing anything has no file of
+            // its own; the path aria2 reports is only the name it would have
+            // used, which may belong to something else. Recording it would
+            // let History offer to delete that something else.
+            path: download
+                .path()
+                .filter(|_| download.completed_length > 0)
+                .map(PathBuf::from),
             size: download.total_length,
             origin: Origin::Aria2,
             state: if download.is_complete() {
@@ -563,6 +572,25 @@ impl DownloadsPage {
         let key = |job_id: i64| -(job_id.saturating_abs() + 1);
 
         match event {
+            WgetEvent::Waiting {
+                job_id,
+                name,
+                start_at,
+            } => {
+                let mut jobs = self.jobs.borrow_mut();
+                let row = jobs.entry(key(job_id)).or_insert_with(|| {
+                    let row = JobRow::new(&format!("Downloading {name}"));
+                    row.on_cancel_wget(ui, job_id);
+                    self.jobs_list.append(&row.root);
+                    row
+                });
+                row.set_subtitle(&format!(
+                    "starts at {}",
+                    crate::settings::format_local_hhmm(super::local_minute_of(start_at))
+                ));
+                drop(jobs);
+                self.refresh_page();
+            }
             WgetEvent::Started {
                 job_id,
                 name,
@@ -1018,6 +1046,14 @@ struct RowState {
     paused: bool,
     finished: bool,
     complete: bool,
+    /// Whether aria2 has put any bytes in `path`.
+    ///
+    /// Until it opens the file, the path aria2 reports is the name derived
+    /// from the address, before any `.1` renaming -- which can be an
+    /// unrelated file that happens to share the name. Deleting "the partial
+    /// download" would delete that. So nothing is offered for deletion, and
+    /// nothing is deleted on cancel, unless something was written.
+    written: bool,
     name: String,
     path: Option<String>,
     folder: Option<String>,
@@ -1168,7 +1204,13 @@ impl Row {
                 let Some(ui) = weak.upgrade() else { return };
                 let (finished, name, path) = {
                     let state = state.borrow();
-                    (state.finished, state.name.clone(), state.path.clone())
+                    (
+                        state.finished,
+                        state.name.clone(),
+                        // See `RowState::written`: a path nothing was written
+                        // to is not this download's to delete.
+                        state.path.clone().filter(|_| state.written),
+                    )
                 };
                 confirm_remove(&ui, &gid, &name, finished, path);
             }
@@ -1227,6 +1269,7 @@ impl Row {
             state.paused = download.is_paused();
             state.finished = download.is_finished();
             state.complete = download.is_complete();
+            state.written = download.completed_length > 0;
             state.name = name;
             state.path = download.path().map(str::to_owned);
             state.folder = download.folder().map(str::to_owned);
@@ -1446,8 +1489,8 @@ fn present_proxy_picker(ui: &Rc<Ui>, gid: &str) {
     let dialog = adw::AlertDialog::builder()
         .heading("Route This Download")
         .body(
-            "aria2 picks up a proxy when a download starts, so this applies from \
-             the next time it is queued or resumed.",
+            "Applies straight away. A download that is running is paused for a \
+             moment and resumed through the new route.",
         )
         .extra_child(&chooser)
         .build();
@@ -1468,16 +1511,33 @@ fn present_proxy_picker(ui: &Rc<Ui>, gid: &str) {
         } else {
             proxies.get(index - 1).map(|(proxy, _)| proxy.label.clone())
         };
-        match ui.backend().proxies.assign(&gid, choice.as_deref()) {
-            Ok(()) => {
-                let message = match &choice {
-                    Some(label) => format!("This download will use {label}"),
-                    None => "This download will connect directly".to_owned(),
-                };
-                ui.toast(&message);
-            }
-            Err(error) => ui.toast(&format!("{error:#}")),
+        if let Err(error) = ui.backend().proxies.assign(&gid, choice.as_deref()) {
+            ui.toast(&format!("{error:#}"));
+            return;
         }
+        // The assignment alone changed nothing before: aria2 reads its
+        // route per download, so it has to be told.
+        let endpoint = choice
+            .as_deref()
+            .and_then(|label| ui.backend().proxies.get(label));
+        let backend = ui.backend().clone();
+        let weak = Rc::downgrade(&ui);
+        let gid = gid.clone();
+        let message = match &choice {
+            Some(label) => format!("This download now uses {label}"),
+            None => "This download now connects directly".to_owned(),
+        };
+        glib::spawn_future_local(async move {
+            let client = backend.aria2.clone();
+            let outcome = backend
+                .offload(async move { client.route(&gid, endpoint.as_ref()).await })
+                .await;
+            let Some(ui) = weak.upgrade() else { return };
+            match outcome {
+                Ok(()) => ui.toast(&message),
+                Err(error) => ui.toast(&format!("Could not reroute it: {error:#}")),
+            }
+        });
     });
 
     dialog.present(Some(ui.window()));
@@ -1707,7 +1767,9 @@ fn parse_timecode(value: &str) -> Option<Duration> {
     if value.split(':').count() > 3 {
         return None;
     }
-    Some(Duration::from_secs_f64(seconds))
+    // `from_secs_f64` panics past what a Duration can hold, and `1e20` is a
+    // perfectly finite, non-negative number to the parser above.
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// Ask before throwing away data the user is still waiting for.
@@ -1754,6 +1816,12 @@ fn confirm_remove(ui: &Rc<Ui>, gid: &str, name: &str, finished: bool, path: Opti
         });
 
         dialog.present(Some(ui.window()));
+        return;
+    }
+
+    // The switch on the Settings page: off, a cancel is a cancel.
+    if !ui.backend().settings().interface.confirm_cancel {
+        remove_download(ui, gid.to_owned(), path);
         return;
     }
 
@@ -1898,5 +1966,23 @@ mod tests {
         // Offering "extract audio" on an archive would only produce an error.
         assert!(!is_media(Path::new("/x/archive.zip")));
         assert!(!is_media(Path::new("/x/no-extension")));
+    }
+}
+
+#[cfg(test)]
+mod timecode_tests {
+    use super::*;
+
+    #[test]
+    fn an_absurd_timecode_is_refused_rather_than_panicking() {
+        // `1e20` is finite and non-negative; `Duration::from_secs_f64`
+        // aborted the process on it.
+        assert_eq!(parse_timecode("1e20"), None);
+        assert_eq!(parse_timecode("1:1e20"), None);
+        assert_eq!(parse_timecode("1:30"), Some(Duration::from_secs(90)));
+        assert_eq!(
+            parse_timecode("01:02:03.5"),
+            Some(Duration::from_secs_f64(3723.5))
+        );
     }
 }

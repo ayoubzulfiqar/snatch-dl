@@ -176,7 +176,9 @@ impl MediaProgress {
         let total = self.total?;
         let speed = self.speed.filter(|value| *value > 0.0)?;
         let remaining = total.checked_sub(self.elapsed)?;
-        Some(Duration::from_secs_f64(remaining.as_secs_f64() / speed))
+        // A speed close to zero would make this larger than a Duration can
+        // hold, and `from_secs_f64` panics rather than saturating.
+        Duration::try_from_secs_f64(remaining.as_secs_f64() / speed).ok()
     }
 }
 
@@ -287,7 +289,7 @@ pub async fn probe_duration(path: &Path) -> Result<Option<Duration>> {
         .parse::<f64>()
         .ok()
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(Duration::from_secs_f64))
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok()))
 }
 
 /// Build the ffmpeg argument list for a job.

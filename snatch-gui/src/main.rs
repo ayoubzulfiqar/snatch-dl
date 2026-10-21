@@ -58,6 +58,13 @@ use crate::types::UiEvent;
 const EVENT_QUEUE: usize = 1024;
 
 fn main() -> glib::ExitCode {
+    // Answered before anything else starts. `snatch-gui --version` used to
+    // open the window -- GTK never sees argv (see `run`), so the flag was
+    // silently ignored and the question got a download manager for an answer.
+    if let Some(code) = answer_cli_flags() {
+        return code;
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
@@ -73,6 +80,14 @@ fn main() -> glib::ExitCode {
 }
 
 fn run() -> Result<glib::ExitCode> {
+    // Put Snatch-managed tools on PATH before anything spawns a subprocess,
+    // so every engine finds a self-installed yt-dlp or gallery-dl without the
+    // user having to touch their shell configuration. First of all, because
+    // changing the environment is only sound while this is the only thread.
+    if let Ok(managed) = paths::managed_bin_dir() {
+        prepend_to_path(&managed);
+    }
+
     // Four workers: aria2 RPC is idle-ish, but librqbit, gallery-dl and ffmpeg
     // all want to make progress at the same time.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -103,13 +118,6 @@ fn run() -> Result<glib::ExitCode> {
         }
     }
 
-    // Put Snatch-managed tools on PATH before anything spawns a subprocess,
-    // so every engine finds a self-installed yt-dlp or gallery-dl without the
-    // user having to touch their shell configuration.
-    if let Ok(managed) = paths::managed_bin_dir() {
-        prepend_to_path(&managed);
-    }
-
     // Settings are read before anything is configured by them.
     let settings_path = paths::settings_file()?;
     let settings = Arc::new(std::sync::RwLock::new(settings::Settings::load(
@@ -120,12 +128,20 @@ fn run() -> Result<glib::ExitCode> {
         .unwrap_or_else(|poison| poison.into_inner())
         .clone();
 
+    // A chosen folder that cannot be used falls back to the default rather
+    // than stopping the launch: the only way to repair the setting is from
+    // inside the window, which has to open for that.
     let download_dir = match current.download_dir_override() {
-        Some(chosen) => {
-            std::fs::create_dir_all(&chosen)
-                .with_context(|| format!("could not create {}", chosen.display()))?;
-            chosen
-        }
+        Some(chosen) => match settings::prepare_download_dir(&chosen) {
+            Ok(()) => chosen,
+            Err(error) => {
+                log::warn!(
+                    "ignoring the configured download folder {}: {error:#}; using the default",
+                    chosen.display()
+                );
+                paths::download_dir()?
+            }
+        },
         None => paths::download_dir()?,
     };
     let socket_path = paths::socket_path()?;
@@ -151,7 +167,11 @@ fn run() -> Result<glib::ExitCode> {
     }
 
     let aria2_options = Arc::new(std::sync::RwLock::new(current.aria2_download_options()));
-    let aria2_client = aria2::Aria2Client::new(download_dir.clone(), Arc::clone(&aria2_options))?;
+    let aria2_client = aria2::Aria2Client::new(
+        download_dir.clone(),
+        Arc::clone(&aria2_options),
+        Arc::clone(&proxies),
+    )?;
     aria2_client.set_categorise(current.download.categorise);
 
     // The BitTorrent session binds sockets and reads resume data, so it is
@@ -160,6 +180,7 @@ fn run() -> Result<glib::ExitCode> {
         download_dir.clone(),
         paths::torrent_state_dir()?,
         proxies.as_ref(),
+        &current.torrent,
     )) {
         Ok(engine) => Some(engine),
         Err(error) => {
@@ -230,6 +251,8 @@ fn run() -> Result<glib::ExitCode> {
     runtime.spawn(forward(wget_rx, events_tx.clone(), UiEvent::Wget));
     runtime.spawn(forward(archive_rx, events_tx.clone(), UiEvent::Archive));
     runtime.spawn(forward(mirror_rx, events_tx.clone(), UiEvent::Mirror));
+    // Once a week, a newer yt-dlp or gallery-dl if there is one.
+    runtime.spawn(deps::keep_tools_current(backend.clone(), events_tx.clone()));
     runtime.spawn(watch_for_shutdown(events_tx));
 
     app.connect_activate({
@@ -261,6 +284,33 @@ fn run() -> Result<glib::ExitCode> {
     }
 
     Ok(code)
+}
+
+/// Handle `--version` and `--help` without starting the application.
+///
+/// Returns `None` when the arguments are not a question, so the window opens
+/// as usual. `--browse` is deliberately left alone: the UI reads it itself.
+fn answer_cli_flags() -> Option<glib::ExitCode> {
+    let mut arguments = std::env::args().skip(1);
+    match arguments.next().as_deref() {
+        Some("--version" | "-V") => {
+            println!("snatch-gui {}", env!("CARGO_PKG_VERSION"));
+            Some(glib::ExitCode::SUCCESS)
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "Usage: snatch-gui [--browse [ADDRESS]]\n\n\
+                 Snatch, a download manager for Linux.\n\n\
+                 Options:\n\
+                   --browse [ADDRESS]  open the Browse page, at ADDRESS if given\n\
+                   -V, --version       print the version and exit\n\
+                   -h, --help          print this help and exit\n\n\
+                 A second launch raises the window of the running instance."
+            );
+            Some(glib::ExitCode::SUCCESS)
+        }
+        _ => None,
+    }
 }
 
 /// Pump one engine's channel into the shared UI channel.
@@ -316,8 +366,9 @@ fn prepend_to_path(directory: &std::path::Path) {
     entries.extend(std::env::split_paths(&existing));
     match std::env::join_paths(entries) {
         Ok(joined) => {
-            // SAFETY: called from main before any thread that reads PATH is
-            // spawned; the tokio runtime and GTK have not started yet.
+            // SAFETY: called from `run` before the tokio runtime is built and
+            // before GApplication registers on the bus, so no other thread
+            // exists yet to read the environment concurrently.
             unsafe { std::env::set_var("PATH", joined) };
         }
         Err(error) => log::warn!(

@@ -136,6 +136,19 @@ pub fn parse(command: &str) -> Result<DownloadRequest> {
     request.cookies = cookies.filter(|value| !value.trim().is_empty());
     request.user_agent = user_agent.filter(|value| !value.trim().is_empty());
     request.referer = referer.filter(|value| !value.trim().is_empty());
+    // Everything else the browser copied: the bearer token, the `Origin`,
+    // the site's own `X-` headers. These are the whole point of pasting the
+    // command rather than the address, and they used to be dropped here.
+    // `extra_headers` strips the connection headers and anything malformed.
+    request.headers = headers
+        .into_iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cookie" | "user-agent" | "referer" | "referrer"
+            )
+        })
+        .collect();
     request.username = username.filter(|value| !value.trim().is_empty());
     request.password = password;
     request.validate()?;
@@ -166,11 +179,14 @@ fn tokenise(command: &str) -> Vec<String> {
                     chars.next();
                 }
             }
-            '\\' if matches!(chars.peek(), Some('"')) => {
-                // `\"` inside an unquoted run.
-                current.push('"');
+            '\\' => {
+                // An escaped character in an unquoted run stands for itself.
+                // Chrome writes an embedded single quote as `'\''`: close,
+                // escaped quote, reopen -- and the middle piece lands here.
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
                 started = true;
-                chars.next();
             }
             '\'' => {
                 started = true;
@@ -354,5 +370,43 @@ mod tests {
     fn the_url_flag_is_honoured() {
         let request = parse("curl --url 'https://x.test/via-flag'").expect("parses");
         assert_eq!(request.url, "https://x.test/via-flag");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    /// The headers were parsed and then dropped, so a bearer token pasted
+    /// from the browser never reached the request.
+    #[test]
+    fn the_headers_a_browser_copied_survive() {
+        let request = parse(
+            "curl 'https://x.test/f.bin' -H 'authorization: Bearer abc' \
+             -H 'origin: https://x.test' -H 'cookie: s=1' -H 'user-agent: UA'",
+        )
+        .expect("parses");
+        let extra = request.extra_headers();
+        assert!(
+            extra.contains(&("authorization".to_owned(), "Bearer abc".to_owned())),
+            "{extra:?}"
+        );
+        assert!(extra.contains(&("origin".to_owned(), "https://x.test".to_owned())));
+        // The three with fields of their own stay out of the extra set.
+        assert!(
+            !extra
+                .iter()
+                .any(|(name, _)| name == "cookie" || name == "user-agent")
+        );
+        assert_eq!(request.cookies.as_deref(), Some("s=1"));
+        assert_eq!(request.user_agent.as_deref(), Some("UA"));
+    }
+
+    /// Chrome writes an embedded single quote as `'\''`.
+    #[test]
+    fn a_posix_escaped_single_quote_is_unescaped() {
+        let tokens = tokenise("curl 'https://x.test/' -b 'a='\\''b'\\''' -H 'x: it'\\''s'");
+        assert_eq!(tokens[3], "a='b'", "{tokens:?}");
+        assert_eq!(tokens[5], "x: it's", "{tokens:?}");
     }
 }

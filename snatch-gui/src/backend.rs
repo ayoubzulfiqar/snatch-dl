@@ -20,6 +20,9 @@ use crate::torrent::TorrentEngine;
 use crate::wget::WgetEngine;
 use crate::ytdlp::VideoEngine;
 
+/// How long a published-digest lookup may hold a download up.
+const CHECKSUM_LOOKUP: std::time::Duration = std::time::Duration::from_secs(8);
+
 #[derive(Clone)]
 pub struct Backend {
     pub aria2: Aria2Client,
@@ -137,6 +140,14 @@ impl Backend {
         let next = next.clamped();
         let previous = self.settings();
 
+        // A folder that cannot be used is refused here, with the reason,
+        // rather than saved and discovered at the next launch.
+        if let Some(chosen) = next.download_dir_override() {
+            crate::settings::prepare_download_dir(&chosen).with_context(|| {
+                format!("the download folder {} cannot be used", chosen.display())
+            })?;
+        }
+
         {
             let mut guard = self
                 .settings
@@ -160,6 +171,13 @@ impl Backend {
             log::warn!("could not apply live aria2 options: {error:#}");
         }
 
+        // The upload cap is the one torrent setting librqbit changes live.
+        if previous.torrent.max_upload_kib != next.torrent.max_upload_kib
+            && let Some(engine) = &self.torrents
+        {
+            engine.set_upload_limit_kib(next.torrent.max_upload_kib);
+        }
+
         // Anything read only at spawn time needs aria2 or the session
         // restarted; say which rather than silently doing nothing.
         let mut restart_needed = Vec::new();
@@ -177,8 +195,15 @@ impl Backend {
         if previous.download.check_certificate != next.download.check_certificate {
             restart_needed.push("certificate checking");
         }
+        // `--user-agent` is a spawn-time option too, and the one most likely
+        // to be changed to get past a site that refuses the default.
+        if previous.download.user_agent != next.download.user_agent {
+            restart_needed.push("the user agent");
+        }
         if previous.torrent.enable_dht != next.torrent.enable_dht
             || previous.torrent.accept_incoming != next.torrent.accept_incoming
+            || previous.torrent.max_peers != next.torrent.max_peers
+            || previous.torrent.seed_ratio != next.torrent.seed_ratio
         {
             restart_needed.push("BitTorrent networking");
         }
@@ -192,6 +217,7 @@ impl Backend {
     ///
     /// Used for incidental state such as the last-visited page, which must not
     /// re-apply aria2 options or claim a restart is needed.
+    #[allow(dead_code, reason = "kept for callers that already hold a full copy")]
     pub async fn persist_only(&self, next: crate::settings::Settings) -> Result<()> {
         {
             let mut guard = self
@@ -202,6 +228,71 @@ impl Backend {
         }
         next.save(&self.settings_path)
             .context("could not save settings")
+    }
+
+    /// Change one thing about the settings and save, atomically.
+    ///
+    /// The read, the change and the write all happen under the lock, so two
+    /// incidental updates in flight at once -- the page switch and the
+    /// drawer toggle fire together when the sidebar is collapsed -- cannot
+    /// overwrite each other's field. Nothing is written when the change
+    /// turned out to be a no-op.
+    pub fn update_settings(
+        &self,
+        change: impl FnOnce(&mut crate::settings::Settings),
+    ) -> Result<()> {
+        let mut guard = self
+            .settings
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut next = guard.clone();
+        change(&mut next);
+        if next == *guard {
+            return Ok(());
+        }
+        next.save(&self.settings_path)
+            .context("could not save settings")?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// Look for a digest published beside a file, before it is queued.
+    ///
+    /// One place for both entry points -- the window and the browser socket
+    /// -- so "Verify downloads" means the same thing whichever way a file
+    /// arrives. A miss is `None`, never an error: most downloads have no
+    /// published digest, and a server that never answers must not hold up
+    /// the download it was only ever going to annotate, which is what the
+    /// cap is for.
+    pub async fn discover_checksum(
+        &self,
+        url: &str,
+        filename: &str,
+    ) -> Option<(crate::checksum::Checksum, String)> {
+        let proxy = self
+            .proxies
+            .resolve_for("checksum", crate::network::Engine::Http)
+            .unwrap_or(None);
+        let client = match self.proxies.client(proxy.as_ref()) {
+            Ok(client) => client,
+            Err(error) => {
+                log::debug!("no checksum lookup: {error:#}");
+                return None;
+            }
+        };
+        tokio::time::timeout(
+            CHECKSUM_LOOKUP,
+            crate::checksum::discover(&client, url, filename),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Whether a download should be checked against a published digest:
+    /// the setting is on and nothing supplied one already.
+    pub fn wants_checksum_lookup(&self, request: &crate::types::DownloadRequest) -> bool {
+        request.checksum.is_none() && self.settings().download.verify_downloads
     }
 
     /// The torrent engine, or a readable error when it never started.

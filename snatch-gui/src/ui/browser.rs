@@ -169,10 +169,13 @@ const MSE_HOOK: &str = include_str!("mse-hook.js");
 struct ActiveCapture {
     /// The engine of the tab this capture came from.
     mse: Rc<RefCell<super::mse::MseCapture>>,
-    /// The hook's MediaSource id within that tab.
+    /// The engine's id for the MediaSource within that tab.
     ms: i64,
     /// The filename to save under, taken from the page title when armed.
     name: String,
+    /// The browser the page runs in, to tell its hook when to stop sending.
+    /// Weak: the capture must not keep a closed tab's view alive by itself.
+    view: glib::WeakRef<webkit6::WebView>,
 }
 
 /// A closed tab's WebView, kept alive so a capture on it goes on.
@@ -372,6 +375,26 @@ impl BrowserPage {
             if let super::mse::Update::Present { ms, bytes: 0 } = update {
                 log::info!("browse: in-page video detected (ms {ms})");
             }
+            // The frame answered the arming. A refusal means the stream the
+            // reader picked no longer exists there, and no bytes will ever
+            // come: say so now rather than let the row sit at "starting…".
+            if let super::mse::Update::Armed { ms, ok } = update {
+                log::info!(
+                    "browse: capture of ms {ms} {}",
+                    if ok { "armed" } else { "refused" }
+                );
+                if !ok && let Some(id) = page.capture_id_for(&mse, ms) {
+                    page.captures.borrow_mut().remove(&id);
+                    page.release_background_if_done(&mse);
+                    if let Some(ui) = page.ui.borrow().as_ref().and_then(Weak::upgrade) {
+                        ui.downloads.capture_finished(
+                            &ui,
+                            id,
+                            Err("the page no longer has that video".to_owned()),
+                        );
+                    }
+                }
+            }
             // A growing armed stream feeds the task that shows it on the
             // Downloads page, wherever its tab is -- a background tab's capture
             // must keep counting up too.
@@ -419,6 +442,7 @@ impl BrowserPage {
         mse: &Rc<RefCell<super::mse::MseCapture>>,
         ms: i64,
         name: String,
+        view: &webkit6::WebView,
     ) -> Option<u64> {
         let ui = self.ui.borrow().as_ref().and_then(Weak::upgrade)?;
         let id = self.next_capture_id.get();
@@ -429,6 +453,7 @@ impl BrowserPage {
                 mse: Rc::clone(mse),
                 ms,
                 name: name.clone(),
+                view: view.downgrade(),
             },
         );
         ui.downloads.capture_started(&ui, id, &name);
@@ -459,6 +484,7 @@ impl BrowserPage {
         };
         let name = capture.name.clone();
         let mse = Rc::clone(&capture.mse);
+        disarm(&capture);
         let plan = capture.mse.borrow_mut().detach(capture.ms);
         // The engine handle can go now: `detach` moved the files out from
         // under it.
@@ -475,9 +501,12 @@ impl BrowserPage {
 
         glib::spawn_future_local(async move {
             let dest = crate::ytdlp::destination_for(&ui.backend().download_dir);
+            // `mux_or_salvage`: a mux that fails -- no ffmpeg, a full disk --
+            // leaves the raw tracks beside where the file would have gone,
+            // instead of deleting the only copy of what was captured.
             let result = ui
                 .backend()
-                .offload(async move { plan.mux(&dest, &name).await })
+                .offload(async move { plan.mux_or_salvage(&dest, &name).await })
                 .await
                 .map_err(|error| format!("{error:#}"));
             ui.downloads.capture_finished(&ui, id, result);
@@ -493,6 +522,7 @@ impl BrowserPage {
         // `detach` forgets the source and hands back a plan that owns the temp
         // files; dropping it deletes them -- a stop with nothing kept.
         let mse = Rc::clone(&capture.mse);
+        disarm(&capture);
         let _ = capture.mse.borrow_mut().detach(capture.ms);
         drop(capture);
         self.release_background_if_done(&mse);
@@ -821,8 +851,11 @@ impl BrowserPage {
         let weak = Rc::downgrade(self);
         let hits = Rc::clone(hits);
         let mse = Rc::clone(mse);
-        let watched = view.clone();
-        view.connect_load_changed(move |_, event| {
+        // The view a handler is connected to is handed to it; holding a
+        // strong handle in its own closure made a cycle GObject never breaks,
+        // so every closed tab kept its WebView and web process for the life
+        // of the session.
+        view.connect_load_changed(move |watched, event| {
             if event != webkit6::LoadEvent::Started {
                 return;
             }
@@ -840,7 +873,7 @@ impl BrowserPage {
                 log::info!("browse: navigated; cleared {had} find(s) from the last page");
             }
             if let Some(page) = page
-                && page.current_view().as_ref() == Some(&watched)
+                && page.current_view().as_ref() == Some(watched)
             {
                 page.sync_toolbar();
             }
@@ -884,9 +917,10 @@ impl BrowserPage {
         let weak = Rc::downgrade(self);
         let hits = Rc::clone(hits);
         let mse = Rc::clone(mse);
-        let tab = tab.clone();
-        let watched = view.clone();
+        let tab = tab.downgrade();
         view.connect_web_process_terminated(move |view, reason| {
+            let Some(tab) = tab.upgrade() else { return };
+            let watched = view.clone();
             let why = match reason {
                 webkit6::WebProcessTerminationReason::ExceededMemoryLimit => "ran out of memory",
                 webkit6::WebProcessTerminationReason::Crashed => "crashed",
@@ -922,9 +956,12 @@ impl BrowserPage {
 
     /// Keep a tab's title, spinner and the toolbar in step with its page.
     fn watch_tab(self: &Rc<Self>, view: &webkit6::WebView, tab: &adw::TabPage) {
+        // Weak handles throughout: the tab page owns the view, so a view
+        // handler that owned the tab page would keep both alive forever.
         {
-            let tab = tab.clone();
+            let tab = tab.downgrade();
             view.connect_title_notify(move |view| {
+                let Some(tab) = tab.upgrade() else { return };
                 let title = view.title().map(|t| t.to_string()).unwrap_or_default();
                 tab.set_title(if title.trim().is_empty() {
                     "Untitled"
@@ -934,35 +971,38 @@ impl BrowserPage {
             });
         }
         {
-            let tab = tab.clone();
-            view.connect_is_loading_notify(move |view| tab.set_loading(view.is_loading()));
+            let tab = tab.downgrade();
+            view.connect_is_loading_notify(move |view| {
+                if let Some(tab) = tab.upgrade() {
+                    tab.set_loading(view.is_loading());
+                }
+            });
         }
         // A page that calls `window.close()` closes its own tab.
         {
             let weak = Rc::downgrade(self);
-            let tab = tab.clone();
+            let tab = tab.downgrade();
             view.connect_close(move |_| {
-                if let Some(page) = weak.upgrade() {
+                if let (Some(page), Some(tab)) = (weak.upgrade(), tab.upgrade()) {
                     page.tabs.close_page(&tab);
                 }
             });
         }
         for signal in [Refresh::Uri, Refresh::Load] {
             let weak = Rc::downgrade(self);
-            let watched = view.clone();
-            let refresh = move || {
+            let refresh = move |watched: &webkit6::WebView| {
                 let Some(page) = weak.upgrade() else { return };
                 // Only the tab on show writes the toolbar.
-                if page.current_view().as_ref() == Some(&watched) {
+                if page.current_view().as_ref() == Some(watched) {
                     page.sync_toolbar();
                 }
             };
             match signal {
                 Refresh::Uri => {
-                    view.connect_uri_notify(move |_| refresh());
+                    view.connect_uri_notify(move |view| refresh(view));
                 }
                 Refresh::Load => {
-                    view.connect_load_changed(move |_, _| refresh());
+                    view.connect_load_changed(move |view, _| refresh(view));
                 }
             }
         }
@@ -999,8 +1039,13 @@ impl BrowserPage {
         let Some(view) = self.current_view() else {
             return;
         };
-        self.address
-            .set_text(&view.uri().map(|uri| uri.to_string()).unwrap_or_default());
+        // Not while the reader is typing in it. This runs on every chunk a
+        // playing video appends, and resetting the entry mid-word made the
+        // bar unusable on any page with a player.
+        let current = view.uri().map(|uri| uri.to_string()).unwrap_or_default();
+        if !self.address.has_focus() && self.address.text() != current {
+            self.address.set_text(&current);
+        }
         self.back.set_sensitive(view.can_go_back());
         self.forward.set_sensitive(view.can_go_forward());
 
@@ -1032,9 +1077,10 @@ impl BrowserPage {
     fn watch_media(self: &Rc<Self>, view: &webkit6::WebView, hits: &Rc<RefCell<Vec<Hit>>>) {
         let weak = Rc::downgrade(self);
         let hits = Rc::clone(hits);
-        let watched = view.clone();
 
         view.connect_resource_load_started(move |view, resource, request| {
+            // Weak, for the same reason as every other handler on a view.
+            let watched = view.downgrade();
             // Every request that actually went out. A request the content
             // blocker stopped never gets here, which makes this the plainest
             // way to see what was blocked: `RUST_LOG=snatch_gui::ui::browser=trace`.
@@ -1106,7 +1152,9 @@ impl BrowserPage {
                 // A background tab finding something must not repaint the
                 // counter of the tab on show.
                 if let Some(page) = weak.upgrade()
-                    && page.current_view().as_ref() == Some(&watched)
+                    && watched
+                        .upgrade()
+                        .is_some_and(|watched| page.current_view().as_ref() == Some(&watched))
                 {
                     page.show_count(total);
                 }
@@ -1165,12 +1213,16 @@ fn blocked_label(refused: u32) -> String {
 /// costs something once and next to nothing after. It is asynchronous: the
 /// first page may load before it is ready, and that page is simply not
 /// filtered, which is better than holding the window up for it.
-/// A fresh temp directory for one tab's in-page captures.
+/// A fresh directory for one tab's in-page captures.
+///
+/// Under the data directory, not `/tmp`: on Fedora and most of its
+/// relatives `/tmp` is tmpfs, which is RAM, so a capture of a long stream
+/// was filling memory and then silently dropping chunks at ENOSPC.
 fn capture_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("snatch-mse-{}-{n}", std::process::id()))
+    super::mse::scratch_root().join(format!("snatch-mse-{}-{n}", std::process::id()))
 }
 
 /// "3 found", and "1 found" rather than "1 founds".
@@ -1397,11 +1449,20 @@ fn mse_row(
         let view = view.clone();
         let mse = Rc::clone(mse);
         action.connect_clicked(move |button| {
+            // The page knows the stream by its frame and its own number;
+            // the hook in the main frame relays the arming to that frame.
+            // Before this the arming only ever ran in the main frame, so a
+            // player inside an iframe -- Google Drive's, most embedded ones
+            // -- was never told, and Save found nothing captured.
+            let Some((frame, remote)) = mse.borrow().remote_source(ms) else {
+                ui.toast("That video is no longer on the page");
+                return;
+            };
             mse.borrow_mut().arm(ms);
             // Tell the page to send the pieces it has been holding, and
             // everything from here on.
             view.evaluate_javascript(
-                &format!("window.__snatchArm({ms})"),
+                &hook_call("__snatchArm", &frame, remote),
                 None,
                 None,
                 gtk::gio::Cancellable::NONE,
@@ -1410,7 +1471,7 @@ fn mse_row(
             // Show it as a task on the Downloads page, and take the reader
             // there so the capture they just started is in front of them.
             let started = page
-                .register_capture(&mse, ms, capture_name(&view))
+                .register_capture(&mse, ms, capture_name(&view), &view)
                 .is_some();
             if let Some(dialog) = button
                 .ancestor(adw::Dialog::static_type())
@@ -1442,6 +1503,32 @@ fn mse_row(
         .build()
 }
 
+/// The JavaScript that calls one of the hook's entry points with a frame
+/// token and a MediaSource id. The token is quoted as JSON, so whatever a
+/// hook chose as its name arrives as one string argument.
+fn hook_call(function: &str, frame: &str, ms: i64) -> String {
+    let frame = serde_json::to_string(frame).unwrap_or_else(|_| "\"\"".to_owned());
+    format!("window.{function}({frame}, {ms})")
+}
+
+/// Tell the page a capture is over, so its hook stops encoding every append
+/// for a listener that is no longer there.
+fn disarm(capture: &ActiveCapture) {
+    let Some(view) = capture.view.upgrade() else {
+        return;
+    };
+    let Some((frame, remote)) = capture.mse.borrow().remote_source(capture.ms) else {
+        return;
+    };
+    view.evaluate_javascript(
+        &hook_call("__snatchDisarm", &frame, remote),
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        |_| {},
+    );
+}
+
 /// A filename for a capture, from the page's title.
 fn capture_name(view: &webkit6::WebView) -> String {
     let title = view.title().map(|t| t.to_string()).unwrap_or_default();
@@ -1457,10 +1544,19 @@ fn capture_name(view: &webkit6::WebView) -> String {
         .collect();
     let cleaned = cleaned.trim();
     if cleaned.is_empty() {
-        "capture".to_owned()
-    } else {
-        cleaned.chars().take(120).collect()
+        return "capture".to_owned();
     }
+    // Bytes, not characters: a title of wide characters that is 120 of the
+    // latter is more than the 255 bytes a file name may hold, and the mux
+    // failed on it with ENAMETOOLONG.
+    let mut taken = String::new();
+    for character in cleaned.chars() {
+        if taken.len() + character.len_utf8() > 180 {
+            break;
+        }
+        taken.push(character);
+    }
+    taken.trim().to_owned()
 }
 
 fn row(ui: &Rc<Ui>, hit: &Hit, queued: &Rc<RefCell<Vec<String>>>) -> gtk::ListBoxRow {

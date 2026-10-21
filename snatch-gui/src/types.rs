@@ -604,8 +604,14 @@ pub enum UiEvent {
     /// A job was accepted by an engine (from the browser or the CLI socket).
     /// `kind` lets the window show the page that job landed on.
     Added { name: String, kind: JobKind },
-    /// A page arrived that the user should pick media from.
-    SniffRequested { url: String },
+    /// A page arrived that the user should pick media from, with the
+    /// browser's cookies and headers for it: a page behind a login, or a
+    /// site that asks yt-dlp to prove it is not a robot, reads as empty
+    /// without them.
+    SniffRequested {
+        url: String,
+        headers: crate::stream::Headers,
+    },
     /// A full picture of every download aria2 currently knows about.
     Snapshot(Vec<DownloadStatus>),
     /// The aria2 RPC endpoint is answering.
@@ -630,6 +636,9 @@ pub enum UiEvent {
     Archive(crate::archive::ArchiveEvent),
     /// A recursive crawl of a site.
     Mirror(crate::mirror::MirrorEvent),
+    /// Something a background task wants the reader to know, as a toast:
+    /// a tool that was updated, say.
+    Notice(String),
 }
 
 #[cfg(test)]

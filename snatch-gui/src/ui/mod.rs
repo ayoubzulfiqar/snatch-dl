@@ -665,8 +665,12 @@ impl Ui {
             return;
         }
 
-        let busy = self.downloads.summary().active > 0
-            || self.torrents.summary().active > 0
+        // Paused and scheduled downloads count as unfinished: shutting the
+        // machine down because the user pressed Pause All, or because the
+        // schedule window just closed, is the opposite of "when everything
+        // finishes".
+        let busy = self.downloads.summary().pending > 0
+            || self.torrents.summary().pending > 0
             || self.backend.gallery.running_count() > 0
             || self.backend.video.running_count() > 0
             || self.backend.wget.running_count() > 0
@@ -816,12 +820,9 @@ impl Ui {
     fn remember_drawer(&self, open: bool) {
         let backend = self.backend.clone();
         backend.clone().spawn(async move {
-            let mut settings = backend.settings();
-            if settings.interface.sidebar_open == open {
-                return;
-            }
-            settings.interface.sidebar_open = open;
-            if let Err(error) = backend.persist_only(settings).await {
+            if let Err(error) =
+                backend.update_settings(|settings| settings.interface.sidebar_open = open)
+            {
                 log::debug!("could not remember the drawer state: {error:#}");
             }
         });
@@ -845,8 +846,6 @@ impl Ui {
             ui.history.select_toggle().set_visible(name == PAGE_HISTORY);
             if name == PAGE_HISTORY {
                 ui.history.reload(&ui);
-                ui.watch_clipboard();
-                ui.start_housekeeping();
             }
             // While the drawer floats over the content, picking a destination
             // should reveal what was chosen. At full width it stays put.
@@ -934,12 +933,9 @@ impl Ui {
         let backend = self.backend.clone();
         let name = name.to_owned();
         backend.clone().spawn(async move {
-            let mut settings = backend.settings();
-            if settings.interface.last_page == name {
-                return;
-            }
-            settings.interface.last_page = name;
-            if let Err(error) = backend.persist_only(settings).await {
+            if let Err(error) =
+                backend.update_settings(|settings| settings.interface.last_page = name)
+            {
                 log::debug!("could not remember the page: {error:#}");
             }
         });
@@ -990,7 +986,7 @@ impl Ui {
         });
         self.add_action("proxies", proxy::present);
         self.add_action("extract-video", |ui| ui.present_video_dialog());
-        self.add_action("sniff", |ui| sniff::present(ui, None));
+        self.add_action("sniff", |ui| sniff::present(ui, None, Default::default()));
         // The in-app browser, for pages nothing outside them can see into.
         #[cfg(feature = "webview")]
         self.add_action("browse", |ui| {
@@ -1027,8 +1023,6 @@ impl Ui {
                         Ok(count) => {
                             ui.toast(&format!("Forgot {count} entries; files kept"));
                             ui.history.reload(&ui);
-                            ui.watch_clipboard();
-                            ui.start_housekeeping();
                         }
                         Err(error) => ui.toast(&format!("{error:#}")),
                     }
@@ -1096,6 +1090,13 @@ impl Ui {
         match event {
             UiEvent::Added { name, kind } => {
                 self.toast(&format!("Added {name}"));
+                // The switch on the Settings page decides. Off, the hand-off
+                // is still announced by the toast, but the window stays where
+                // it is and on the page the user was on -- which, if that is
+                // Browse or Settings, is where they are working.
+                if !self.backend.settings().interface.raise_on_capture {
+                    return;
+                }
                 // Show the page the job actually landed on: a magnet caught in
                 // the browser is confusing if the window opens on Downloads.
                 self.select_page(match kind {
@@ -1110,7 +1111,9 @@ impl Ui {
                     | JobKind::Stream
                     | JobKind::Unknown => PAGE_DOWNLOADS,
                 });
-                self.raise_if_hidden();
+                // `present` is what brings a window forward; the old check
+                // for `is_visible` only ever caught a minimised one.
+                self.window.present();
             }
             UiEvent::Snapshot(list) => {
                 let summary = self.downloads.apply(self, &list);
@@ -1141,10 +1144,11 @@ impl Ui {
                 self.set_badge(PAGE_SCRAPER, self.backend.gallery.running_count());
             }
             UiEvent::Media(event) => self.downloads.handle_media(self, event),
-            UiEvent::SniffRequested { url } => {
+            UiEvent::SniffRequested { url, headers } => {
                 self.raise_if_hidden();
-                sniff::present(self, Some(url));
+                sniff::present(self, Some(url), headers);
             }
+            UiEvent::Notice(message) => self.toast(&message),
             UiEvent::Video(event) => {
                 self.downloads.handle_video(self, event);
                 self.refresh_title();
@@ -1229,7 +1233,16 @@ impl Ui {
             JobKind::Scrape => self.scraper.start(self, request.url),
             JobKind::Video => self.add_video(request.url),
             JobKind::Stream => self.start_recording(&request),
-            JobKind::Sniff => sniff::present(self, Some(request.url)),
+            JobKind::Sniff => sniff::present(
+                self,
+                Some(request.url.clone()),
+                crate::stream::Headers {
+                    referer: request.referer.clone(),
+                    user_agent: request.user_agent.clone(),
+                    cookies: request.cookies.clone(),
+                    extra: request.extra_headers(),
+                },
+            ),
             // A listing is answered on the socket and queues nothing, so it
             // never reaches the window. Saying so beats adding it silently to
             // a page it does not belong on.
@@ -1274,14 +1287,28 @@ impl Ui {
             return;
         }
 
+        // A bulk add with "start later" is added paused like any other, and
+        // needs the same bookkeeping or nothing ever starts it.
+        let start_at = request
+            .start_at
+            .filter(|start_at| *start_at > crate::settings::now_unix());
+        let name = request.display_name();
+        let weak = Rc::downgrade(self);
         let backend = self.backend.clone();
         glib::spawn_future_local(async move {
             let client = backend.aria2.clone();
-            if let Err(error) = backend
+            match backend
                 .offload(async move { client.add_uri(&request).await })
                 .await
             {
-                log::warn!("could not queue a bulk-added file: {error:#}");
+                Ok(gid) => {
+                    if let Some(start_at) = start_at
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.remember_scheduled_start(gid, name, start_at);
+                    }
+                }
+                Err(error) => log::warn!("could not queue a bulk-added file: {error:#}"),
             }
         });
     }
@@ -1290,7 +1317,7 @@ impl Ui {
         // Nearly every project that publishes a file publishes its digest
         // beside it, and nobody goes and checks. Look before queueing, so
         // verification costs the user nothing.
-        if request.checksum.is_none() && self.backend.settings().download.verify_downloads {
+        if self.backend.wants_checksum_lookup(&request) {
             let weak = Rc::downgrade(self);
             let backend = self.backend.clone();
             glib::spawn_future_local(async move {
@@ -1301,28 +1328,14 @@ impl Ui {
                     .or_else(|| crate::types::name_from_url(&url))
                     .unwrap_or_default();
 
-                let proxies = std::sync::Arc::clone(&backend.proxies);
+                // The same lookup the browser socket makes, so the setting
+                // means one thing. A failed lookup is not a failed download:
+                // it only means this one will not be verified.
                 let probe = {
+                    let backend = backend.clone();
                     let filename = filename.clone();
-                    async move {
-                        let proxy = proxies
-                            .resolve_for("checksum", crate::network::Engine::Http)
-                            .unwrap_or(None);
-                        let client = proxies.client(proxy.as_ref())?;
-                        // A server that never answers must not hold up the
-                        // download it was only ever going to annotate.
-                        let found = tokio::time::timeout(
-                            std::time::Duration::from_secs(8),
-                            crate::checksum::discover(&client, &url, &filename),
-                        )
-                        .await
-                        .ok()
-                        .flatten();
-                        Ok(found)
-                    }
+                    async move { Ok(backend.discover_checksum(&url, &filename).await) }
                 };
-                // A failed lookup is not a failed download: it only means
-                // this one will not be verified.
                 let found = backend.offload(probe).await.unwrap_or_else(|error| {
                     log::debug!("no checksum lookup: {error:#}");
                     None
@@ -1473,26 +1486,34 @@ impl Ui {
             let gids: Vec<String> = due.iter().map(|(gid, _, _)| gid.clone()).collect();
             let client = backend.aria2.clone();
             let db = backend.db.clone();
-            let started = gids.clone();
             let result = backend
                 .offload(async move {
-                    for gid in &started {
-                        // One failure must not strand the rest: a download the
-                        // user already resumed by hand is not an error.
-                        if let Err(error) = client.unpause(gid).await {
-                            log::info!("could not start {gid} on schedule: {error:#}");
+                    // Only a download that was actually released is forgotten.
+                    // If aria2 is down or mid-restart at the due minute, the
+                    // row stays scheduled and the next tick tries again,
+                    // instead of leaving it paused with no reason shown.
+                    let mut released = Vec::with_capacity(gids.len());
+                    for gid in gids {
+                        match client.unpause(&gid).await {
+                            Ok(()) => released.push(gid),
+                            // The user already resumed or removed it by hand.
+                            Err(error) if is_gone_or_not_paused(&error) => released.push(gid),
+                            Err(error) => {
+                                log::info!("could not start {gid} on schedule: {error:#}");
+                            }
                         }
                     }
-                    db.unschedule_starts(started).await
+                    let count = released.len();
+                    db.unschedule_starts(released).await?;
+                    Ok(count)
                 })
                 .await;
-            if let Err(error) = result {
-                log::warn!("could not clear scheduled starts: {error:#}");
+            match result {
+                Ok(0) => {}
+                Ok(1) => ui.toast(&format!("{} has started", due[0].1)),
+                Ok(count) => ui.toast(&format!("{count} scheduled downloads have started")),
+                Err(error) => log::warn!("could not clear scheduled starts: {error:#}"),
             }
-            ui.toast(&match due.len() {
-                1 => format!("{} has started", due[0].1),
-                count => format!("{count} scheduled downloads have started"),
-            });
         });
     }
 
@@ -1911,7 +1932,7 @@ impl Ui {
                     .parse::<u64>()
                     .ok()
                     .filter(|value| *value > 0)
-                    .map(|value| value * 60),
+                    .and_then(|value| value.checked_mul(60)),
                 height: match quality.selected() {
                     1 => Some(1080),
                     2 => Some(720),
@@ -2038,9 +2059,28 @@ impl Ui {
         if !settings.download.extract_archives {
             return;
         }
-        let Some(archive) = crate::archive::identify(&path) else {
+        // A later volume of a set is looked at through its first one, so a
+        // set is unpacked whichever part lands last.
+        let entry = crate::archive::entry_point(&path).unwrap_or_else(|| path.clone());
+        let Some(archive) = crate::archive::identify(&entry) else {
             return;
         };
+        if !crate::archive::volumes_ready(&archive) {
+            log::info!(
+                "{} is part of a set that is still downloading; waiting for the rest",
+                path.display()
+            );
+            return;
+        }
+        // Two parts finishing in the same poll must not unpack the set twice.
+        if self
+            .pending_archives
+            .borrow()
+            .values()
+            .any(|job| job.archive.first == archive.first)
+        {
+            return;
+        }
 
         let backend = self.backend.clone();
         let queue = std::sync::Arc::clone(&backend.archives);
@@ -2720,10 +2760,13 @@ impl Ui {
 
     /// Open a path (or its parent directory) in the user's file manager.
     pub fn reveal(&self, path: &Path) {
-        let target = if path.is_file() {
-            path.parent().unwrap_or(path)
-        } else {
+        // Anything that is not a directory -- a file, or a file that has
+        // since been deleted -- opens as its folder. Handing the file
+        // manager the address of a missing file opens nothing.
+        let target = if path.is_dir() {
             path
+        } else {
+            path.parent().unwrap_or(path)
         };
         let uri = gio::File::for_path(target).uri();
         if let Err(error) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
@@ -2907,7 +2950,18 @@ fn main_menu() -> gio::Menu {
 pub struct PageSummary {
     pub total: usize,
     pub active: usize,
+    /// Everything not yet finished, paused and queued included. This is what
+    /// "when everything finishes" waits for; `active` alone would call a
+    /// paused queue finished.
+    pub pending: usize,
     pub speed: u64,
+}
+
+/// Whether an `unpause` failure means the download is no longer ours to
+/// start: already running, already gone, or never paused in the first place.
+fn is_gone_or_not_paused(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("not found") || text.contains("not paused") || text.contains("cannot be unpaused")
 }
 
 #[cfg(test)]

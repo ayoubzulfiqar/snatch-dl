@@ -18,10 +18,20 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::time::sleep;
 
+use crate::network::{Engine, ProxyEndpoint, ProxyManager};
 use crate::types::{DownloadRequest, UiEvent, name_from_url};
 
-pub const RPC_SECRET: &str = "snatch_secret";
-pub const RPC_PORT: u16 = 6800;
+/// The assignment slot the proxy table is consulted with for a new download.
+///
+/// A download has no GID until aria2 has accepted it, so the only thing that
+/// can decide its route at add time is this key, or the default proxy that
+/// `resolve` falls back to. Per-download routing afterwards goes through
+/// [`Aria2Client::route`], keyed by GID.
+pub const PROXY_KEY: &str = "download";
+
+/// How long to wait for aria2 to report a download paused before changing an
+/// option on it. `pause` returns before the state machine has moved.
+const PAUSE_SETTLE: Duration = Duration::from_secs(3);
 
 /// Only ask aria2 for the fields the UI actually renders; `tellStopped` on a
 /// long history is otherwise needlessly chatty.
@@ -72,7 +82,18 @@ pub struct Aria2Client {
     http: wreq::Client,
     endpoint: String,
     token: String,
+    /// The loopback port the daemon is told to listen on.
+    ///
+    /// Picked at startup rather than fixed at 6800. A fixed port with a
+    /// fixed secret meant any local process could drive the daemon -- and,
+    /// through the per-download `dir` option, write anywhere this user can
+    /// -- and two users on one machine silently shared one daemon.
+    port: u16,
+    /// The RPC secret, fresh for every launch, for the same reason.
+    secret: String,
     download_dir: PathBuf,
+    /// Where a new download's route is looked up.
+    proxies: Arc<ProxyManager>,
     /// Per-download options, re-read on every add so a settings change
     /// affects the next download without a restart.
     options: Arc<RwLock<Vec<(String, String)>>>,
@@ -81,7 +102,11 @@ pub struct Aria2Client {
 }
 
 impl Aria2Client {
-    pub fn new(download_dir: PathBuf, options: Arc<RwLock<Vec<(String, String)>>>) -> Result<Self> {
+    pub fn new(
+        download_dir: PathBuf,
+        options: Arc<RwLock<Vec<(String, String)>>>,
+        proxies: Arc<ProxyManager>,
+    ) -> Result<Self> {
         let http = wreq::Client::builder()
             .timeout(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(3))
@@ -91,11 +116,17 @@ impl Aria2Client {
             .build()
             .context("could not build the HTTP client used for aria2 RPC")?;
 
+        let port = free_loopback_port().context("could not find a port for aria2's RPC")?;
+        let secret = random_secret();
+
         Ok(Self {
             http,
-            endpoint: format!("http://127.0.0.1:{RPC_PORT}/jsonrpc"),
-            token: format!("token:{RPC_SECRET}"),
+            endpoint: format!("http://127.0.0.1:{port}/jsonrpc"),
+            token: format!("token:{secret}"),
+            port,
+            secret,
             download_dir,
+            proxies,
             options,
             categorise: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
@@ -144,7 +175,10 @@ impl Aria2Client {
             // Keep the common "daemon is down" case short: it is surfaced in
             // toasts and in the reply the browser extension shows the user.
             Err(error) if error.is_connect() => {
-                bail!("{method}: aria2 is not listening on 127.0.0.1:{RPC_PORT}")
+                bail!(
+                    "{method}: aria2 is not listening on 127.0.0.1:{}",
+                    self.port
+                )
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("{method}: the aria2 RPC call failed"));
@@ -295,6 +329,19 @@ impl Aria2Client {
             options.insert("pause".to_owned(), json!("true"));
         }
 
+        // The route. An unusable pairing -- a SOCKS proxy, which aria2 cannot
+        // speak -- is an error rather than a silent direct connection: the
+        // whole promise of the proxy table is that nothing goes out behind
+        // the user's back. This used to be missing entirely, so every aria2
+        // transfer went direct whatever the table said.
+        if let Some(proxy) = self
+            .proxies
+            .resolve_for(PROXY_KEY, Engine::Aria2)
+            .context("the download cannot use the configured proxy")?
+        {
+            options.insert("all-proxy".to_owned(), json!(proxy.url()));
+        }
+
         // Every source for the same file. aria2 spreads its connections
         // across the mirrors and fails over between them, so one slow host
         // does not decide the speed.
@@ -303,6 +350,73 @@ impl Aria2Client {
             vec![json!(request.sources()), Value::Object(options)],
         )
         .await
+    }
+
+    /// The status string aria2 reports for one download.
+    async fn status_of(&self, gid: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Status {
+            #[serde(default)]
+            status: String,
+        }
+        Ok(self
+            .call::<Status>("aria2.tellStatus", vec![json!(gid), json!(["status"])])
+            .await?
+            .status)
+    }
+
+    /// Send one download through `proxy` from now on, or directly for `None`.
+    ///
+    /// aria2 only lets a proxy be changed on a download that is waiting or
+    /// paused, so a running one is paused around the change and resumed
+    /// afterwards, which reopens its connections through the new route. A
+    /// download that has already finished has nothing left to route.
+    pub async fn route(&self, gid: &str, proxy: Option<&ProxyEndpoint>) -> Result<()> {
+        if let Some(proxy) = proxy
+            && !proxy.supports(Engine::Aria2)
+        {
+            bail!(
+                "proxy '{}' is {} and aria2 can only use HTTP proxies",
+                proxy.label,
+                proxy.scheme
+            );
+        }
+
+        let status = self.status_of(gid).await?;
+        if matches!(status.as_str(), "complete" | "error" | "removed") {
+            bail!("the download has already finished");
+        }
+        let was_active = status == "active";
+        if was_active {
+            self.pause(gid).await?;
+            // The state moves on the next pass of aria2's loop; changing an
+            // option before then is refused.
+            let deadline = tokio::time::Instant::now() + PAUSE_SETTLE;
+            while self.status_of(gid).await? == "active" {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        let mut options = Map::new();
+        options.insert(
+            "all-proxy".to_owned(),
+            json!(proxy.map(ProxyEndpoint::url).unwrap_or_default()),
+        );
+        let changed = self
+            .call::<Value>(
+                "aria2.changeOption",
+                vec![json!(gid), Value::Object(options)],
+            )
+            .await
+            .map(drop);
+
+        if was_active && let Err(error) = self.unpause(gid).await {
+            log::warn!("could not resume {gid} after rerouting it: {error:#}");
+        }
+        changed
     }
 
     /// Everything aria2 knows about, in one round trip per bucket.
@@ -579,7 +693,10 @@ pub async fn supervise(client: Aria2Client, config: Aria2Config, events: Sender<
                 }
             }
 
-            log::warn!("aria2 stopped answering on port {RPC_PORT}; restarting it");
+            log::warn!(
+                "aria2 stopped answering on port {}; restarting it",
+                client.port
+            );
             let _ = events
                 .send(UiEvent::Aria2Down(
                     "aria2 stopped responding — restarting".to_owned(),
@@ -589,23 +706,27 @@ pub async fn supervise(client: Aria2Client, config: Aria2Config, events: Sender<
             continue;
         }
 
-        match build_command(&config).spawn() {
+        match build_command(&config, &client).spawn() {
             Ok(mut spawned) => {
                 if let Some(stderr) = spawned.stderr.take() {
                     tokio::spawn(forward_stderr(stderr));
                 }
-                // Replacing the slot drops (and kills) any previous daemon.
-                drop(child.replace(spawned));
+                // Dropping the previous slot kills any half-dead daemon.
+                drop(child.take());
 
-                if let Err(error) = wait_until_ready(&client).await {
-                    drop(child.take());
-                    let _ = events
-                        .send(UiEvent::Aria2Down(format!(
-                            "aria2c started but its RPC never came up: {error:#}"
-                        )))
-                        .await;
-                } else {
-                    continue; // the top of the loop will publish Aria2Up
+                match wait_until_ready(&client, &mut spawned).await {
+                    Ok(_) => {
+                        child = Some(spawned);
+                        continue; // the top of the loop will publish Aria2Up
+                    }
+                    Err(error) => {
+                        drop(spawned);
+                        let _ = events
+                            .send(UiEvent::Aria2Down(format!(
+                                "aria2c started but its RPC never came up: {error:#}"
+                            )))
+                            .await;
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -629,15 +750,17 @@ pub async fn supervise(client: Aria2Client, config: Aria2Config, events: Sender<
     }
 }
 
-fn build_command(config: &Aria2Config) -> Command {
+fn build_command(config: &Aria2Config, client: &Aria2Client) -> Command {
     let mut command = Command::new("aria2c");
     command
         .arg("--enable-rpc")
         .arg("--rpc-listen-all=false")
         // NOTE: --rpc-listen-port, not --listen-port; the latter is the
         // BitTorrent peer port and would collide with the RPC socket.
-        .arg(format!("--rpc-listen-port={RPC_PORT}"))
-        .arg(format!("--rpc-secret={RPC_SECRET}"))
+        .arg(format!("--rpc-listen-port={}", client.port))
+        // aria2 blanks the secret out of its own argv, so it is not left
+        // readable in `ps` for the life of the daemon.
+        .arg(format!("--rpc-secret={}", client.secret))
         .arg("--rpc-allow-origin-all=false")
         .arg(format!("--dir={}", config.download_dir.display()))
         // Resume support. The segmenting and limits are appended below from
@@ -678,19 +801,63 @@ fn build_command(config: &Aria2Config) -> Command {
     command
 }
 
-async fn wait_until_ready(client: &Aria2Client) -> Result<String> {
+/// Poll the RPC endpoint until it answers, or the daemon exits first.
+///
+/// An exit is reported straight away with its status. Before this the loop
+/// polled for the full twenty seconds against a child that had already died
+/// -- a port in use is enough -- and then reported that the RPC "never came
+/// up", with the real reason only in the log.
+async fn wait_until_ready(client: &Aria2Client, child: &mut Child) -> Result<String> {
     let mut last_error = None;
     for _ in 0..READY_ATTEMPTS {
         match client.version().await {
             Ok(version) => {
-                log::info!("aria2 {version} is ready on port {RPC_PORT}");
+                log::info!("aria2 {version} is ready on port {}", client.port);
                 return Ok(version);
             }
             Err(error) => last_error = Some(error),
         }
-        sleep(READY_INTERVAL).await;
+        tokio::select! {
+            exited = child.wait() => {
+                let status = exited.context("could not wait for aria2c")?;
+                bail!("aria2c exited with {status} (its stderr is in the log)");
+            }
+            _ = sleep(READY_INTERVAL) => {}
+        }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("aria2 did not become ready")))
+}
+
+/// A loopback port nothing is listening on right now.
+///
+/// Bound and released, so there is a window in which something else could
+/// take it; aria2 then fails to start and `supervise` reports the exit.
+fn free_loopback_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("could not bind a loopback port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Thirty-two hex characters from the kernel's pool, or from the hash
+/// seed when `/dev/urandom` cannot be read, which never happens on Linux.
+fn random_secret() -> String {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 16];
+    let read = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok();
+    if !read {
+        use std::hash::{BuildHasher, Hasher};
+        for chunk in bytes.chunks_mut(8) {
+            let word = std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+                .to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn forward_stderr(stderr: ChildStderr) {

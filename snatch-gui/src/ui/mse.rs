@@ -37,20 +37,61 @@ enum Message {
     Ready,
     /// A MediaSource opened.
     #[serde(rename = "open")]
-    Open { ms: i64 },
+    Open {
+        #[serde(default)]
+        f: String,
+        ms: i64,
+    },
     /// A track was added to a MediaSource, with its MIME type.
     #[serde(rename = "track")]
-    Track { ms: i64, sb: i64, mime: String },
+    Track {
+        #[serde(default)]
+        f: String,
+        ms: i64,
+        sb: i64,
+        mime: String,
+    },
     /// A chunk of a track, once capture is armed.
     #[serde(rename = "data")]
-    Data { sb: i64, b64: String },
+    Data {
+        #[serde(default)]
+        f: String,
+        sb: i64,
+        b64: String,
+    },
     /// A track grew while unarmed -- how much is held, for the counter.
     #[serde(rename = "grow")]
-    Grow { ms: i64, bytes: u64 },
+    Grow {
+        #[serde(default)]
+        f: String,
+        ms: i64,
+        bytes: u64,
+    },
     /// A MediaSource ended.
     #[serde(rename = "end")]
-    End { ms: i64 },
+    End {
+        #[serde(default)]
+        f: String,
+        ms: i64,
+    },
+    /// A frame answered an arming. `ok` false means it had no such source,
+    /// so nothing will ever arrive for that capture.
+    #[serde(rename = "armed")]
+    Armed {
+        #[serde(default)]
+        f: String,
+        ms: i64,
+        ok: bool,
+    },
 }
+
+/// The frame a message came from.
+///
+/// The hook runs once per frame -- the page and every iframe in it -- and
+/// each copy numbers its MediaSources from one, so a frame token is what
+/// tells two streams apart. An older hook sends none, which reads as the
+/// empty string and keeps a single frame working as before.
+type Frame = String;
 
 /// What a received message means for the page's UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +100,8 @@ pub enum Update {
     Present { ms: i64, bytes: u64 },
     /// The stream signalled its own end.
     Ended { ms: i64 },
+    /// The page answered an arming; `false` means it found nothing to arm.
+    Armed { ms: i64, ok: bool },
     /// Nothing the UI needs to act on.
     Quiet,
 }
@@ -94,6 +137,13 @@ pub struct MseCapture {
     dir: PathBuf,
     sources: BTreeMap<i64, Source>,
     tracks: BTreeMap<i64, Track>,
+    /// `(frame, the id the page uses)` -> the local id used everywhere here.
+    source_ids: BTreeMap<(Frame, i64), i64>,
+    track_ids: BTreeMap<(Frame, i64), i64>,
+    /// Local source id -> what the page knows it as, for arming it there.
+    remote_sources: BTreeMap<i64, (Frame, i64)>,
+    next_source: i64,
+    next_track: i64,
 }
 
 impl MseCapture {
@@ -103,7 +153,42 @@ impl MseCapture {
             dir,
             sources: BTreeMap::new(),
             tracks: BTreeMap::new(),
+            source_ids: BTreeMap::new(),
+            track_ids: BTreeMap::new(),
+            remote_sources: BTreeMap::new(),
+            next_source: 1,
+            next_track: 1,
         }
+    }
+
+    /// The local id of a source the page named, minted on first sight.
+    fn source_id(&mut self, frame: &str, ms: i64) -> i64 {
+        let key = (frame.to_owned(), ms);
+        if let Some(local) = self.source_ids.get(&key) {
+            return *local;
+        }
+        let local = self.next_source;
+        self.next_source += 1;
+        self.source_ids.insert(key.clone(), local);
+        self.remote_sources.insert(local, key);
+        local
+    }
+
+    /// The local id of a track the page named, minted on first sight.
+    fn track_id(&mut self, frame: &str, sb: i64) -> i64 {
+        let key = (frame.to_owned(), sb);
+        if let Some(local) = self.track_ids.get(&key) {
+            return *local;
+        }
+        let local = self.next_track;
+        self.next_track += 1;
+        self.track_ids.insert(key, local);
+        local
+    }
+
+    /// The frame and id the page knows a source by: what arming has to say.
+    pub fn remote_source(&self, ms: i64) -> Option<(Frame, i64)> {
+        self.remote_sources.get(&ms).cloned()
     }
 
     /// Whether a MediaSource has been armed for capture.
@@ -174,6 +259,11 @@ impl MseCapture {
         }
         self.sources.clear();
         self.tracks.clear();
+        self.source_ids.clear();
+        self.track_ids.clear();
+        self.remote_sources.clear();
+        self.next_source = 1;
+        self.next_track = 1;
     }
 
     /// Take one message from the hook and act on it.
@@ -191,7 +281,12 @@ impl MseCapture {
         };
         match message {
             Message::Ready => Update::Quiet,
-            Message::Open { ms } => {
+            Message::Armed { f, ms, ok } => match self.source_ids.get(&(f, ms)) {
+                Some(local) => Update::Armed { ms: *local, ok },
+                None => Update::Quiet,
+            },
+            Message::Open { f, ms } => {
+                let ms = self.source_id(&f, ms);
                 self.sources.entry(ms).or_insert_with(|| Source {
                     tracks: Vec::new(),
                     armed: false,
@@ -200,7 +295,9 @@ impl MseCapture {
                 });
                 Update::Present { ms, bytes: 0 }
             }
-            Message::Track { ms, sb, mime } => {
+            Message::Track { f, ms, sb, mime } => {
+                let ms = self.source_id(&f, ms);
+                let sb = self.track_id(&f, sb);
                 self.sources.entry(ms).or_insert_with(|| Source {
                     tracks: Vec::new(),
                     armed: false,
@@ -220,17 +317,32 @@ impl MseCapture {
                 });
                 Update::Quiet
             }
-            Message::Grow { ms, bytes } => {
+            Message::Grow { f, ms, bytes } => {
+                let Some(ms) = self.source_ids.get(&(f, ms)).copied() else {
+                    return Update::Quiet;
+                };
                 if let Some(source) = self.sources.get_mut(&ms) {
                     source.held = bytes;
                 }
                 Update::Present { ms, bytes }
             }
-            Message::Data { sb, b64 } => {
+            Message::Data { f, sb, b64 } => {
+                let Some(sb) = self.track_ids.get(&(f, sb)).copied() else {
+                    return Update::Quiet;
+                };
                 let ms = self.source_of(sb);
-                let paused = ms
-                    .and_then(|ms| self.sources.get(&ms))
-                    .is_some_and(|source| source.paused);
+                let source = ms.and_then(|ms| self.sources.get(&ms));
+                // Only a source the reader armed is written. The hook sends
+                // data only after arming, but the handler is reachable from
+                // the page itself, and an unarmed write would let a page fill
+                // the disk with no row and no stop button.
+                let Some(source) = source else {
+                    return Update::Quiet;
+                };
+                if !source.armed {
+                    return Update::Quiet;
+                }
+                let paused = source.paused;
                 // Paused: let the chunk go by unwritten, so the file skips what
                 // played while paused instead of stitching a gap into it.
                 if !paused {
@@ -244,7 +356,10 @@ impl MseCapture {
                     None => Update::Quiet,
                 }
             }
-            Message::End { ms } => Update::Ended { ms },
+            Message::End { f, ms } => match self.source_ids.get(&(f, ms)) {
+                Some(local) => Update::Ended { ms: *local },
+                None => Update::Quiet,
+            },
         }
     }
 
@@ -258,6 +373,11 @@ impl MseCapture {
 
     /// Decode a chunk and append it to its track's file, opening it if needed.
     fn write(&mut self, sb: i64, b64: &str) {
+        // The track first, the decode second: a chunk for a track that was
+        // never opened is dropped before any work is done on it.
+        if !self.tracks.contains_key(&sb) {
+            return;
+        }
         let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -406,12 +526,52 @@ impl MseCapture {
     }
 }
 
+/// Where capture scratch files live: a `captures` directory under Snatch's
+/// own data directory, on real disk.
+///
+/// Not `std::env::temp_dir()`: on Fedora and most of its relatives `/tmp`
+/// is tmpfs, so a long capture was being held in RAM after all, and ran the
+/// machine out of it. Leftovers from a crash are swept the first time this
+/// is asked for; the files are only ever useful to the process that wrote
+/// them. Falls back to the temp directory when the data directory cannot be
+/// had, which is better than no capture at all.
+pub fn scratch_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let Ok(root) = crate::paths::data_dir().map(|dir| dir.join("captures")) else {
+            return std::env::temp_dir();
+        };
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Only what a process that is no longer running left behind.
+                // The test binaries share this directory with a running app,
+                // and must not sweep a capture that app is writing.
+                let Some(owner) = name
+                    .strip_prefix("snatch-mse-")
+                    .or_else(|| name.strip_prefix("snatch-save-"))
+                    .and_then(|rest| rest.split('-').next())
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if owner != std::process::id() && !Path::new(&format!("/proc/{owner}")).exists() {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        let _ = std::fs::create_dir_all(&root);
+        root
+    })
+    .clone()
+}
+
 /// A fresh directory a `SavePlan` owns, apart from any capture engine's.
 fn save_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("snatch-save-{}-{n}", std::process::id()))
+    scratch_root().join(format!("snatch-save-{}-{n}", std::process::id()))
 }
 
 /// A capture ready to be muxed to a file. Owns its inputs, so it holds nothing
@@ -431,7 +591,7 @@ impl SavePlan {
     /// A player usually feeds video and audio as separate tracks, so each is
     /// an input and the streams are copied into one container without
     /// re-encoding.
-    pub async fn mux(self, dest: &Path, stem: &str) -> Result<PathBuf> {
+    pub async fn mux(&self, dest: &Path, stem: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(dest)
             .with_context(|| format!("could not create {}", dest.display()))?;
         let output = crate::stream::unique_path(dest, stem, self.container);
@@ -444,20 +604,18 @@ impl SavePlan {
             .arg("-loglevel")
             .arg("error");
         for input in &self.inputs {
-            command.arg("-i").arg(input);
+            // fMP4 pieces concatenated by appending have baseline timestamps
+            // that a plain copy can trip over; regenerating them is safe and
+            // fixes the "non-monotonous DTS" a raw concat would hit. It is a
+            // demuxer flag, so it has to come before each input -- after
+            // them it applied to the muxer, which ignores it.
+            command.arg("-fflags").arg("+genpts").arg("-i").arg(input);
         }
         // Take a stream from each input, so a two-input mux keeps both.
         for index in 0..self.inputs.len() {
             command.arg("-map").arg(index.to_string());
         }
-        command
-            .arg("-c")
-            .arg("copy")
-            // fMP4 pieces concatenated by appending have baseline timestamps
-            // that a plain copy can trip over; regenerating them is safe and
-            // fixes the "non-monotonous DTS" a raw concat would hit.
-            .arg("-fflags")
-            .arg("+genpts");
+        command.arg("-c").arg("copy");
         if self.container == "mp4" {
             command.arg("-movflags").arg("+faststart");
         }
@@ -483,6 +641,49 @@ impl SavePlan {
             bail!("could not mux the capture: {reason}");
         }
         Ok(output)
+    }
+}
+
+impl SavePlan {
+    /// Mux into `dest`, and when that fails keep the raw tracks there instead.
+    ///
+    /// A plan deletes its scratch directory when it is dropped, which after a
+    /// failed mux deleted the only copy of the capture. No ffmpeg, a full
+    /// disk or a name the filesystem refuses are all ordinary, and none of
+    /// them is a reason to lose an hour of video.
+    pub async fn mux_or_salvage(mut self, dest: &Path, name: &str) -> Result<PathBuf> {
+        let failure = match self.mux(dest, name).await {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
+        };
+        let inputs = std::mem::take(&mut self.inputs);
+        let mut kept = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let extension = if self.container == "mp4" {
+                "m4s"
+            } else {
+                "webm"
+            };
+            let target =
+                crate::stream::unique_path(dest, &format!("{name}.track-{}", index + 1), extension);
+            let moved = match std::fs::rename(input, &target) {
+                Ok(()) => Ok(()),
+                // Across filesystems a rename cannot work; copying can.
+                Err(_) => std::fs::copy(input, &target).map(drop),
+            };
+            match moved {
+                Ok(()) => kept.push(target),
+                Err(error) => log::warn!("could not keep {}: {error}", input.display()),
+            }
+        }
+        if kept.is_empty() {
+            return Err(failure);
+        }
+        let listed: Vec<String> = kept.iter().map(|path| path.display().to_string()).collect();
+        Err(failure.context(format!(
+            "the raw capture was kept instead, as {}",
+            listed.join(" and ")
+        )))
     }
 }
 

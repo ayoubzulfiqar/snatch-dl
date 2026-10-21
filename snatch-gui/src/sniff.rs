@@ -246,6 +246,15 @@ pub struct SniffOptions {
     pub probe: bool,
     /// Path to yt-dlp, when it is available.
     pub yt_dlp: Option<PathBuf>,
+    /// The proxy the page fetch went through, for yt-dlp to use as well.
+    /// Without it the DOM was read through the proxy and the extractor
+    /// contacted the site directly.
+    pub proxy: Option<String>,
+    /// What the browser sent for this page: cookies, referer, the site's own
+    /// headers. Put on the page fetch and handed to yt-dlp, so a page that is
+    /// only readable signed in -- or a site that wants proof the reader is
+    /// not a robot -- is read the way the browser read it.
+    pub headers: crate::stream::Headers,
 }
 
 impl Default for SniffOptions {
@@ -254,6 +263,8 @@ impl Default for SniffOptions {
             use_extractor: true,
             probe: true,
             yt_dlp: None,
+            proxy: None,
+            headers: crate::stream::Headers::default(),
         }
     }
 }
@@ -272,9 +283,19 @@ pub async fn sniff(
 
     let mut notes = Vec::new();
 
-    let response = client
+    let mut request = client
         .get(base.as_str())
-        .header(wreq::header::ACCEPT, "text/html,*/*")
+        .header(wreq::header::ACCEPT, "text/html,*/*");
+    if let Some(cookies) = options.headers.cookies.as_deref() {
+        request = request.header(wreq::header::COOKIE, cookies);
+    }
+    if let Some(referer) = options.headers.referer.as_deref() {
+        request = request.header(wreq::header::REFERER, referer);
+    }
+    for (name, value) in &options.headers.extra {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("could not fetch {base}"))?
@@ -321,13 +342,21 @@ pub async fn sniff(
 
     if options.use_extractor {
         match options.yt_dlp.as_ref() {
-            Some(binary) => match extractor_candidates(binary, effective.as_str()).await {
-                Ok(found) => candidates.extend(found),
-                // A site yt-dlp does not know is the common case, not an error.
-                Err(error) => {
-                    log::debug!("yt-dlp found nothing for {effective}: {error:#}");
+            Some(_) => {
+                match extractor_candidates(
+                    effective.as_str(),
+                    options.proxy.as_deref(),
+                    &options.headers,
+                )
+                .await
+                {
+                    Ok(found) => candidates.extend(found),
+                    // A site yt-dlp does not know is the common case, not an error.
+                    Err(error) => {
+                        log::debug!("yt-dlp found nothing for {effective}: {error:#}");
+                    }
                 }
-            },
+            }
             None => notes
                 .push("yt-dlp is not installed, so streaming sites were not inspected".to_owned()),
         }
@@ -698,32 +727,18 @@ fn dedupe(candidates: &mut Vec<Candidate>) {
 }
 
 /// Ask yt-dlp what the page really contains.
-async fn extractor_candidates(binary: &std::path::Path, page: &str) -> Result<Vec<Candidate>> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::process::Command::new(binary)
-            .arg("--dump-single-json")
-            .arg("--no-warnings")
-            .arg("--no-playlist")
-            .arg("--ignore-config")
-            .arg("--")
-            .arg(page)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("yt-dlp timed out")?
-    .context("could not run yt-dlp")?;
-
-    if !output.status.success() {
-        bail!("yt-dlp does not recognise this page");
-    }
-
+async fn extractor_candidates(
+    page: &str,
+    proxy: Option<&str>,
+    headers: &crate::stream::Headers,
+) -> Result<Vec<Candidate>> {
+    // The format probe's invocation, with everything it has learned to
+    // give yt-dlp: a JavaScript runtime, retries, the proxy, the browser's
+    // cookies and its errors worded. A bare `--dump-single-json` of its own
+    // failed on YouTube.
+    let output = crate::ytdlp::dump_single_json(page, headers, proxy).await?;
     let info: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("yt-dlp returned malformed JSON")?;
+        serde_json::from_slice(&output).context("yt-dlp returned malformed JSON")?;
 
     let title = info
         .get("title")
@@ -1227,6 +1242,8 @@ mod tests {
                 use_extractor: false,
                 probe: true,
                 yt_dlp: None,
+                proxy: None,
+                headers: Default::default(),
             },
         )
         .await
@@ -1310,6 +1327,8 @@ mod tests {
                 use_extractor: false,
                 probe: false,
                 yt_dlp: None,
+                proxy: None,
+                headers: Default::default(),
             },
         )
         .await

@@ -23,8 +23,18 @@ use crate::types::{DownloadRequest, IpcResponse, JobKind, UiEvent};
 
 /// A hand-off is a URL plus a cookie header; 256 KiB is generous.
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
-/// A client that cannot complete a request in this long is broken or hostile.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(45);
+/// A client that cannot send its one line in this long is broken or hostile.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest any request may take to answer, as a backstop only.
+///
+/// Every slow step has a cap of its own -- yt-dlp 30s, streamlink 20s,
+/// ffprobe 30s -- and a format listing can walk all three. The native host
+/// waits 90 seconds for exactly that reason, so this is longer still: the
+/// GUI must never be the one that gives up first. It used to be 45 seconds
+/// around the whole exchange, which cut a slow page off mid-chain and turned
+/// a recordable broadcast into "Snatch closed the connection without
+/// answering".
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Bind the socket, clearing a stale file left behind by a crash.
 ///
@@ -64,9 +74,9 @@ pub async fn serve(listener: UnixListener, backend: Backend, events: Sender<UiEv
                 let backend = backend.clone();
                 let events = events.clone();
                 tokio::spawn(async move {
-                    let outcome = timeout(CLIENT_TIMEOUT, handle(stream, backend, events))
+                    let outcome = timeout(ANSWER_TIMEOUT, handle(stream, backend, events))
                         .await
-                        .unwrap_or_else(|_| Err(anyhow!("the client timed out")));
+                        .unwrap_or_else(|_| Err(anyhow!("the request took too long to answer")));
                     if let Err(error) = outcome {
                         log::warn!("IPC client rejected: {error:#}");
                     }
@@ -85,9 +95,9 @@ async fn handle(stream: UnixStream, backend: Backend, events: Sender<UiEvent>) -
     let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES));
 
     let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
+    let read = timeout(REQUEST_TIMEOUT, reader.read_line(&mut line))
         .await
+        .map_err(|_| anyhow!("the client did not send a request in time"))?
         .context("could not read the IPC request")?;
 
     if read == 0 {
@@ -174,7 +184,7 @@ async fn accept_request(
         }
 
         log::info!("trying what the page loaded for {name}");
-        let probe = stream_listing(&request).await;
+        let probe = stream_listing(&request, backend.proxies.as_ref()).await;
         if !probe.formats.is_empty() {
             log::info!(
                 "found {} playable address(es) on {name}",
@@ -190,6 +200,7 @@ async fn accept_request(
         events
             .send(UiEvent::SniffRequested {
                 url: request.url.clone(),
+                headers: stream_headers(&request),
             })
             .await
             .ok()
@@ -223,20 +234,26 @@ async fn accept_request(
             .to_string(),
         // Honour the configured engine here too: this is the path every
         // browser hand-off takes, so routing only the UI through the setting
-        // would leave it looking broken.
+        // would leave it looking broken. The same goes for "Verify downloads":
+        // the window looked for a published digest before queueing and this
+        // path did not, so the setting was silently off for every file that
+        // arrived from the browser -- which is most of them.
         JobKind::Download => match backend.settings().download.engine {
             crate::settings::HttpEngine::Wget => backend
                 .wget
                 .clone()
                 .start(
-                    request.clone(),
+                    with_published_checksum(backend, &request).await,
                     backend.settings(),
                     backend.proxies.clone(),
                     backend.wget_events.clone(),
                 )?
                 .to_string(),
             crate::settings::HttpEngine::Aria2 => {
-                let gid = backend.aria2.add_uri(&request).await?;
+                let gid = backend
+                    .aria2
+                    .add_uri(&with_published_checksum(backend, &request).await)
+                    .await?;
                 // add_uri adds a scheduled download paused. Without the
                 // matching database row nothing would ever start it, so this
                 // path has to record it exactly as the UI does.
@@ -314,6 +331,28 @@ async fn accept_request(
     // A closed channel just means the window went away first.
     let _ = events.send(UiEvent::Added { name, kind }).await;
     Ok(IpcResponse::accepted(id))
+}
+
+/// The request with a published digest attached, when one can be found.
+///
+/// Left exactly as it was when the setting is off, the sender supplied a
+/// checksum of its own, or nothing is published beside the file. The lookup
+/// is capped by the backend, so a server that never answers cannot hold the
+/// hand-off up for longer than the browser is prepared to wait.
+async fn with_published_checksum(backend: &Backend, request: &DownloadRequest) -> DownloadRequest {
+    let mut request = request.clone();
+    if !backend.wants_checksum_lookup(&request) {
+        return request;
+    }
+    let filename = request
+        .sanitized_filename()
+        .or_else(|| crate::types::name_from_url(&request.url))
+        .unwrap_or_default();
+    if let Some((checksum, source)) = backend.discover_checksum(&request.url, &filename).await {
+        log::info!("verifying {filename} against {source}");
+        request.checksum = Some(checksum.aria2_value());
+    }
+    request
 }
 
 /// Whether an address is a playlist, which only ffmpeg can follow.
@@ -412,10 +451,22 @@ fn broadcast_listing(resolved: crate::streamlink::Resolved) -> crate::ytdlp::Med
 /// Two kinds arrive together and are told apart by what they are, not by
 /// where they came from: a playlist is recorded with ffmpeg, and a plain file
 /// is fetched by the downloader, which is far quicker at it and can resume.
-async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
+async fn stream_listing(
+    request: &DownloadRequest,
+    proxies: &crate::network::ProxyManager,
+) -> crate::ytdlp::MediaProbe {
     use crate::ytdlp::FormatSource;
 
     let headers = stream_headers(request);
+    // The proxy a recording of any of these would use. One ffmpeg cannot
+    // speak is logged and the probes go without; the rows are still offered.
+    let proxy_url = match proxies.resolve_for("stream-probe", crate::network::Engine::Ffmpeg) {
+        Ok(proxy) => proxy.map(|proxy| proxy.url()),
+        Err(error) => {
+            log::info!("probing without a proxy: {error:#}");
+            None
+        }
+    };
 
     // Nothing was watched loading. The address itself is still worth opening:
     // plenty of pages yt-dlp has never heard of *are* the media -- a bare
@@ -445,8 +496,8 @@ async fn stream_listing(request: &DownloadRequest) -> crate::ytdlp::MediaProbe {
     };
 
     let (streams, files) = futures::future::join(
-        crate::stream::describe_all(watched_streams, &headers),
-        crate::stream::describe_all(watched_files, &headers),
+        crate::stream::describe_all(watched_streams, &headers, proxy_url.as_deref()),
+        crate::stream::describe_all(watched_files, &headers, proxy_url.as_deref()),
     )
     .await;
 
@@ -588,6 +639,16 @@ mod fallback_tests {
     use super::*;
     use crate::ytdlp::FormatSource;
 
+    /// A proxy table with nothing in it, so every probe goes direct.
+    fn test_proxies() -> crate::network::ProxyManager {
+        let path = std::env::temp_dir().join(format!(
+            "snatch-ipc-test-proxies-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        crate::network::ProxyManager::load(path)
+    }
+
     #[test]
     fn a_playlist_is_recorded_and_a_file_is_downloaded() {
         // Only ffmpeg can follow a playlist, and only it speaks these
@@ -652,7 +713,7 @@ mod fallback_tests {
             )
         };
 
-        let probe = stream_listing(&request).await;
+        let probe = stream_listing(&request, &test_proxies()).await;
         assert_eq!(
             probe.formats.len(),
             1,
@@ -704,7 +765,7 @@ mod fallback_tests {
             streams: streams.clone(),
             ..crate::types::DownloadRequest::from_url("https://feed.example/".to_owned())
         };
-        let probe = stream_listing(&request).await;
+        let probe = stream_listing(&request, &test_proxies()).await;
         assert_eq!(probe.formats.len(), 1, "{:?}", probe.formats);
         assert_eq!(
             probe.formats[0].url.as_deref(),
@@ -866,7 +927,7 @@ mod fallback_tests {
         let request = DownloadRequest::from_url(format!("http://127.0.0.1:{port}/clip.mp4"));
         assert!(request.streams.is_empty() && request.files.is_empty());
 
-        let probe = stream_listing(&request).await;
+        let probe = stream_listing(&request, &test_proxies()).await;
         assert_eq!(probe.formats.len(), 1, "{:?}", probe.formats);
         let row = &probe.formats[0];
         // Fetched by the downloader, not recorded: it is a finished file.

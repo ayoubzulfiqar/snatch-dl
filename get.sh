@@ -173,7 +173,10 @@ if [ -n "${SUMS}" ] && need sha256sum; then
   if [ -f "${WORK}/SHA256SUMS" ]; then
     EXPECTED=$(grep " $(basename "${FILE}")\$" "${WORK}/SHA256SUMS" | awk '{print $1}')
     ACTUAL=$(sha256sum "${FILE}" | awk '{print $1}')
-    if [ -n "${EXPECTED}" ] && [ "${EXPECTED}" != "${ACTUAL}" ]; then
+    # An asset missing from the manifest is as suspicious as a wrong digest;
+    # it used to be reported as verified.
+    [ -n "${EXPECTED}" ] || die "SHA256SUMS has no entry for $(basename "${FILE}") — refusing to install it"
+    if [ "${EXPECTED}" != "${ACTUAL}" ]; then
       die "checksum mismatch — refusing to install $(basename "${FILE}")"
     fi
     info "checksum verified"
@@ -210,12 +213,27 @@ case "${FAMILY}" in
     [ -n "${ROOT}" ] || die "the tarball did not contain what was expected"
     ${SUDO} install -Dm755 "${ROOT}/snatch-gui" /usr/bin/snatch-gui
     ${SUDO} install -Dm755 "${ROOT}/snatch-nmh" /usr/bin/snatch-nmh
-    ${SUDO} install -Dm644 "${ROOT}/extension/manifest.json" \
-      /usr/share/snatch-dl/extension/manifest.json
-    ${SUDO} install -Dm644 "${ROOT}/extension/background.js" \
-      /usr/share/snatch-dl/extension/background.js
-    ${SUDO} install -Dm644 "${ROOT}/extension/content.js" \
-      /usr/share/snatch-dl/extension/content.js
+    # The whole directory, icons included: a manifest that names icons the
+    # directory does not hold makes Chrome refuse to load the extension at
+    # all. Firefox gets its own manifest beside the same scripts.
+    ${SUDO} mkdir -p /usr/share/snatch-dl/extension /usr/share/snatch-dl/extension-firefox
+    for member in manifest.json background.js content.js; do
+      ${SUDO} install -Dm644 "${ROOT}/extension/${member}" \
+        "/usr/share/snatch-dl/extension/${member}"
+    done
+    for icon in "${ROOT}"/extension/icons/*.png; do
+      [ -f "${icon}" ] || continue
+      ${SUDO} install -Dm644 "${icon}" "/usr/share/snatch-dl/extension/icons/$(basename "${icon}")"
+      ${SUDO} install -Dm644 "${icon}" "/usr/share/snatch-dl/extension-firefox/icons/$(basename "${icon}")"
+    done
+    if [ -f "${ROOT}/packaging/extension-firefox/manifest.json" ]; then
+      ${SUDO} install -Dm644 "${ROOT}/packaging/extension-firefox/manifest.json" \
+        /usr/share/snatch-dl/extension-firefox/manifest.json
+      ${SUDO} install -Dm644 "${ROOT}/extension/background.js" \
+        /usr/share/snatch-dl/extension-firefox/background.js
+      ${SUDO} install -Dm644 "${ROOT}/extension/content.js" \
+        /usr/share/snatch-dl/extension-firefox/content.js
+    fi
     if [ -d "${ROOT}/packaging/native-messaging" ]; then
       ${SUDO} install -Dm644 "${ROOT}/packaging/native-messaging/chromium.json" \
         /etc/opt/chrome/native-messaging-hosts/com.snatch.dl.nmh.json

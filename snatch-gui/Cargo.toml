@@ -56,6 +56,10 @@ wreq-util = "0.2"
 # needed with the browser, so it rides the same feature.
 base64 = { version = "0.22", optional = true }
 
+# `killpg`, so cancelling a yt-dlp job also ends the ffmpeg and JavaScript
+# runtime it spawned. Already in the tree through tokio.
+libc = "0.2"
+
 # Reads a DASH manifest properly, so `MPD@type` answers "is this live?"
 # instead of it being inferred from whether ffprobe reported a duration.
 # Parser only -- `default-features = false` drops its own HTTP stack, which

@@ -519,11 +519,17 @@ pub fn validate_url(url: &str) -> Result<()> {
 }
 
 /// Ask ffprobe what is at this address, without recording any of it.
-pub async fn probe(url: &str, headers: &Headers) -> Result<StreamInfo> {
+pub async fn probe(url: &str, headers: &Headers, proxy_url: Option<&str>) -> Result<StreamInfo> {
     validate_url(url)?;
 
     let binary = ffprobe_binary();
     let mut command = Command::new(&binary);
+    // ffprobe has no proxy flag; its HTTP protocol reads this, for an
+    // `http://` proxy only, which is what `Engine::Ffmpeg` guarantees. Left
+    // unset the probe went direct past a proxy the recording would use.
+    if let Some(proxy) = proxy_url {
+        command.env("http_proxy", proxy).env("https_proxy", proxy);
+    }
     command
         .arg("-v")
         .arg("error")
@@ -683,19 +689,25 @@ const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 /// network, unreadable XML -- and the caller keeps its guess. Deliberately
 /// cheap to be wrong about: the manifest is a few kilobytes of the thing we
 /// were about to fetch anyway.
-async fn dash_liveness(url: &str, headers: &Headers) -> Option<(bool, Option<Duration>)> {
+async fn dash_liveness(
+    url: &str,
+    headers: &Headers,
+    proxy_url: Option<&str>,
+) -> Option<(bool, Option<Duration>)> {
     if !matches!(extension_of(url).as_deref(), Some("mpd")) {
         return None;
     }
 
-    // No proxy, matching what ffprobe does on this same path. The manifest is
+    // Through the same proxy the recording will use. The manifest is
     // fetched as the browser, for the same reason everything else is.
-    let mut request = wreq::Client::builder()
+    let mut builder = wreq::Client::builder()
         .timeout(PROBE_TIMEOUT)
-        .emulation(crate::network::browser_profile())
-        .build()
-        .ok()?
-        .get(url);
+        .emulation(crate::network::browser_profile());
+    builder = match proxy_url {
+        Some(proxy) => builder.proxy(wreq::Proxy::all(proxy).ok()?),
+        None => builder.no_proxy(),
+    };
+    let mut request = builder.build().ok()?.get(url);
     if let Some(referer) = headers.referer.as_deref() {
         request = request.header(wreq::header::REFERER, referer);
     }
@@ -747,14 +759,18 @@ pub fn candidates(urls: &[String]) -> Vec<String> {
     wanted
 }
 
-pub async fn describe_all(urls: &[String], headers: &Headers) -> Vec<(String, StreamInfo)> {
+pub async fn describe_all(
+    urls: &[String],
+    headers: &Headers,
+    proxy_url: Option<&str>,
+) -> Vec<(String, StreamInfo)> {
     let wanted = candidates(urls);
 
     let probes = wanted.into_iter().map(|url| async move {
-        match probe(&url, headers).await {
+        match probe(&url, headers, proxy_url).await {
             Ok(mut info) => {
                 // The manifest outranks ffprobe's silence on both counts.
-                if let Some((live, duration)) = dash_liveness(&url, headers).await {
+                if let Some((live, duration)) = dash_liveness(&url, headers, proxy_url).await {
                     info.live = Some(live);
                     if !live && info.duration.is_none() {
                         info.duration = duration;
@@ -863,11 +879,44 @@ fn apply_hls_tolerance(command: &mut Command, url: &str) {
     if !is_hls(url) {
         return;
     }
-    command
-        .arg("-extension_picky")
-        .arg("0")
-        .arg("-seg_max_retry")
-        .arg("10");
+    // The option every ffmpeg since 3.4 has: segments may have any
+    // extension. The two below were added in 6.1 and 7.1, and an ffmpeg
+    // that does not know an option refuses the whole command -- so on the
+    // LTS distributions every HLS probe and recording failed with "Option
+    // extension_picky not found" until these were gated.
+    command.arg("-allowed_extensions").arg("ALL");
+    let known = hls_options();
+    if known.extension_picky {
+        command.arg("-extension_picky").arg("0");
+    }
+    if known.seg_max_retry {
+        command.arg("-seg_max_retry").arg("10");
+    }
+}
+
+/// Which of the newer HLS demuxer options this ffmpeg understands.
+#[derive(Debug, Clone, Copy)]
+struct HlsOptions {
+    extension_picky: bool,
+    seg_max_retry: bool,
+}
+
+/// Asked once per process, by reading the demuxer's own option list.
+fn hls_options() -> HlsOptions {
+    static KNOWN: std::sync::OnceLock<HlsOptions> = std::sync::OnceLock::new();
+    *KNOWN.get_or_init(|| {
+        let listing = std::process::Command::new(ffmpeg_binary())
+            .args(["-hide_banner", "-h", "demuxer=hls"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        HlsOptions {
+            extension_picky: listing.contains("extension_picky"),
+            seg_max_retry: listing.contains("seg_max_retry"),
+        }
+    })
 }
 
 /// Keep a recording alive across the things that happen to long ones.
@@ -886,6 +935,13 @@ fn apply_hls_tolerance(command: &mut Command, url: &str) {
 /// it would leave the recording running against a stream that is over.
 fn apply_reconnect(command: &mut Command) {
     command
+        // A connection that stalls without closing -- the wifi handover,
+        // again -- would otherwise leave ffmpeg blocked in a read forever,
+        // and with it the recording and the Stop button, which ffmpeg only
+        // looks at between packets. Half a minute of nothing is an error,
+        // and an error is what the options below know how to retry.
+        .arg("-rw_timeout")
+        .arg("30000000")
         .arg("-reconnect")
         .arg("1")
         // The one that matters here: a live stream is not seekable, and
@@ -1062,6 +1118,10 @@ const MEANINGFUL_PART: Duration = Duration::from_secs(10);
 /// of those in a row is not a hiccup.
 const GIVE_UP_AFTER: u32 = 3;
 
+/// The most times one recording is ever picked up again. A broadcast that
+/// drops this often is not being recorded, it is being retried.
+const MOST_CONTINUATIONS: u32 = 500;
+
 /// What to do when a part of a recording ends on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Continuation {
@@ -1168,10 +1228,19 @@ pub async fn record(
                 "stream job {job_id} waits {}s before starting",
                 wait.as_secs()
             );
-            tokio::select! {
-                _ = sleep(wait) => {}
-                _ = control.recv() => {
-                    bail!("stopped before the recording was due to start")
+            let due = tokio::time::Instant::now() + wait;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(due) => break,
+                    command = control.recv() => match command {
+                        Some(Control::Stop) | None => {
+                            bail!("stopped before the recording was due to start")
+                        }
+                        // Nothing is running yet, so there is nothing to
+                        // pause or resume; the wait simply goes on. Before
+                        // this any button ended the job.
+                        Some(Control::Pause) | Some(Control::Resume) => continue,
+                    }
                 }
             }
         }
@@ -1193,7 +1262,13 @@ pub async fn record(
     // Undescribed, it is recorded as what it almost certainly is: a
     // broadcast, into Matroska so Stop leaves a playable file, with no `-map`
     // so ffmpeg chooses the best video and audio itself.
-    let info = match probe(url, headers).await {
+    // The route the recording will take, so the probe sees what it sees. A
+    // proxy ffmpeg cannot use is refused here with the same words.
+    let probe_proxy = proxies
+        .resolve_for(&format!("stream:{job_id}"), Engine::Ffmpeg)
+        .context("the stream cannot use the configured proxy")?
+        .map(|proxy| proxy.url());
+    let info = match probe(url, headers, probe_proxy.as_deref()).await {
         Ok(info) => info,
         Err(error) => {
             log::warn!(
@@ -1239,6 +1314,11 @@ pub async fn record(
     let mut recorded = Duration::ZERO;
     // Continuations in a row that came back with nothing. See `PartEnd::Source`.
     let mut empty_continuations = 0u32;
+    // Every continuation, as a backstop against picking a source up forever.
+    let mut continuations = 0u32;
+    // Whether a part ended in an error that was not picked up again, so the
+    // file is less than the programme.
+    let mut cut_short = false;
 
     loop {
         let recorded_before = recorded;
@@ -1254,7 +1334,14 @@ pub async fn record(
         };
 
         let seek = resume_seek(&info, *skip, recorded);
-        let part = directory.join(format!("{stem}.part{}.{extension}", parts.len() + 1));
+        // The job id keeps two recordings that chose the same stem apart:
+        // nothing exists under the final name until the join, so a second
+        // recording of the same programme -- a batch of channels on one
+        // host, say -- would otherwise append to the same part file.
+        let part = directory.join(format!(
+            "{stem}.job{job_id}.part{}.{extension}",
+            parts.len() + 1
+        ));
         let outcome = run_part(
             job_id,
             url,
@@ -1316,11 +1403,23 @@ pub async fn record(
             PartEnd::Source => {
                 let open_ended = limit.is_none_or(|limit| limit.is_zero());
                 let captured = recorded.saturating_sub(recorded_before);
-                match keep_recording(info.is_live(), open_ended, captured, empty_continuations) {
+                // Only a part that *failed* is picked up again. A clean exit
+                // is ffmpeg saying the source ended on its own terms: a
+                // playlist that announced its end, or a file. Liveness is a
+                // guess whenever ffprobe could not measure a length, and
+                // treating a finite source as a dropped broadcast recorded
+                // it from the start, over and over, until the disk filled.
+                let decision = if !failed || continuations >= MOST_CONTINUATIONS {
+                    Continuation::Done
+                } else {
+                    keep_recording(info.is_live(), open_ended, captured, empty_continuations)
+                };
+                match decision {
                     Continuation::Done => {
                         // Not a broadcast to pick up again, but it did stop
                         // before it should have, and the row should say so.
                         if failed {
+                            cut_short = true;
                             let _ = events
                                 .send(VideoEvent::Title {
                                     job_id,
@@ -1343,7 +1442,10 @@ pub async fn record(
                             .await;
                         break;
                     }
-                    Continuation::Again(empty) => empty_continuations = empty,
+                    Continuation::Again(empty) => {
+                        empty_continuations = empty;
+                        continuations += 1;
+                    }
                 }
                 log::info!(
                     "stream job {job_id}: the stream stopped arriving after {}s of this part; \
@@ -1422,7 +1524,17 @@ pub async fn record(
     // without a word. Another job finishing on that name in the meantime must
     // not have its file quietly overwritten.
     let final_path = unique_path(directory.as_path(), &stem, extension);
-    join_parts(job_id, parts, &final_path, events).await
+    let output = join_parts(job_id, parts, &final_path, events).await?;
+    if cut_short {
+        // The file is kept and named, and the job is a failure: a signed
+        // address that expired halfway used to be reported as "Saved", and
+        // nobody could tell the forty minutes were twelve.
+        bail!(
+            "the recording stopped early; what was captured is in {}",
+            output.display()
+        );
+    }
+    Ok(output)
 }
 
 /// The parts that actually hold something.
@@ -1637,8 +1749,11 @@ async fn run_part(
         .arg(output);
 
     let task_key = format!("stream:{job_id}");
+    // `Engine::Ffmpeg`: libavformat reads `http_proxy` only when it starts
+    // with `http://`, and connects directly for anything else without a
+    // word. A SOCKS proxy is therefore refused here rather than bypassed.
     if let Some(proxy) = proxies
-        .resolve_for(&task_key, Engine::Subprocess)
+        .resolve_for(&task_key, Engine::Ffmpeg)
         .context("the stream cannot use the configured proxy")?
     {
         log::info!("stream job {job_id} routed through {}", proxy.redacted());
@@ -2480,7 +2595,7 @@ mod stop_tests {
             let port = serve(path, Duration::ZERO).await;
             let url = format!("http://127.0.0.1:{port}/{name}");
 
-            let (live, duration) = dash_liveness(&url, &Headers::default())
+            let (live, duration) = dash_liveness(&url, &Headers::default(), None)
                 .await
                 .unwrap_or_else(|| panic!("{name} should be readable as a manifest"));
             assert_eq!(live, expected_live, "{name}");
@@ -2490,7 +2605,7 @@ mod stop_tests {
         // Anything that is not a manifest is left to ffprobe, and costs no
         // request at all: the extension is checked before the network is.
         assert!(
-            dash_liveness("https://c.example/clip.mp4", &Headers::default())
+            dash_liveness("https://c.example/clip.mp4", &Headers::default(), None)
                 .await
                 .is_none()
         );
@@ -2666,7 +2781,7 @@ mod stop_tests {
         // Without it, the server answers 403 and there is nothing to record.
         let bare = Headers::default();
         assert!(
-            probe(&url, &bare).await.is_err(),
+            probe(&url, &bare, None).await.is_err(),
             "a server that refuses the request must not look readable"
         );
 
@@ -2683,7 +2798,7 @@ mod stop_tests {
             "the header must survive the trip onto the recording"
         );
 
-        let info = probe(&url, &job.headers)
+        let info = probe(&url, &job.headers, None)
             .await
             .expect("the guarded server lets us in");
         assert!(info.has_video(), "and hands over the clip itself");
@@ -2853,10 +2968,10 @@ mod stop_tests {
         let during = files_in(&dir);
         assert_eq!(
             during,
-            ["pause test.part1.mp4"],
+            ["pause test.job4.part1.mp4"],
             "unexpected files: {during:?}"
         );
-        let first = crate::processor::probe_duration(&dir.join("pause test.part1.mp4"))
+        let first = crate::processor::probe_duration(&dir.join("pause test.job4.part1.mp4"))
             .await
             .expect("ffprobe reads the paused part")
             .expect("the paused part has a duration")

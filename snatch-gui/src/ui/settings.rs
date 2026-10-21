@@ -45,6 +45,19 @@ impl SettingsPage {
         &self.root
     }
 
+    /// Throw the rows away and build them again from the saved settings.
+    ///
+    /// Change handlers fire while the rows are being populated, so `loading`
+    /// is held for the duration to keep them from marking the page dirty.
+    fn rebuild(&self, ui: &Rc<Ui>) {
+        self.loading.set(true);
+        while let Some(child) = self.root.first_child() {
+            self.root.remove(&child);
+        }
+        self.build(ui);
+        self.loading.set(false);
+    }
+
     /// Populate the page. Called once, after `Ui` exists.
     pub fn build(&self, ui: &Rc<Ui>) {
         *self.draft.borrow_mut() = ui.backend().settings();
@@ -55,6 +68,7 @@ impl SettingsPage {
         self.add_media_group(&page, ui);
         self.add_schedule_group(&page, ui);
         self.add_interface_group(&page, ui);
+        self.add_tools_group(&page, ui);
         self.add_actions_group(&page, ui);
 
         self.root.append(&page);
@@ -659,6 +673,68 @@ impl SettingsPage {
         page.add(&group);
     }
 
+    fn add_tools_group(&self, page: &adw::PreferencesPage, ui: &Rc<Ui>) {
+        let draft = self.draft.borrow().clone();
+        let group = adw::PreferencesGroup::builder()
+            .title("Tools")
+            .description(
+                "yt-dlp and gallery-dl change under the sites they read every few weeks. \
+                 Snatch can fetch their latest release for itself, without root, and use \
+                 it ahead of the copy your distribution ships.",
+            )
+            .build();
+
+        let last = draft.tools.last_update_check;
+        let auto = adw::SwitchRow::builder()
+            .title("Keep yt-dlp and gallery-dl up to date")
+            .subtitle(if last > 0 {
+                format!(
+                    "Checked once a week. Last checked {}.",
+                    glib::DateTime::from_unix_local(last)
+                        .ok()
+                        .and_then(|when| when.format("%-d %B %Y").ok())
+                        .map(|text| text.to_string())
+                        .unwrap_or_else(|| "a while ago".to_owned())
+                )
+            } else {
+                "Checked once a week. Not checked yet.".to_owned()
+            })
+            .active(draft.tools.auto_update)
+            .build();
+        auto.connect_active_notify({
+            let this = self.clone_handles();
+            let ui = Rc::downgrade(ui);
+            move |row| {
+                let Some(ui) = ui.upgrade() else { return };
+                let on = row.is_active();
+                this.edit(&ui, |settings| settings.tools.auto_update = on);
+            }
+        });
+        group.add(&auto);
+
+        let check = adw::ActionRow::builder()
+            .title("Check for updates now")
+            .subtitle("Installs a newer release of either tool if there is one")
+            .activatable(true)
+            .build();
+        let button = gtk::Button::builder()
+            .label("Check")
+            .valign(gtk::Align::Center)
+            .build();
+        check.add_suffix(&button);
+        check.set_activatable_widget(Some(&button));
+        button.connect_clicked({
+            let ui = Rc::downgrade(ui);
+            move |button| {
+                let Some(ui) = ui.upgrade() else { return };
+                super::deps::check_for_updates(&ui, button);
+            }
+        });
+        group.add(&check);
+
+        page.add(&group);
+    }
+
     fn add_actions_group(&self, page: &adw::PreferencesPage, ui: &Rc<Ui>) {
         let group = adw::PreferencesGroup::new();
 
@@ -719,6 +795,8 @@ impl SettingsPage {
 
         reset.connect_clicked({
             let ui = Rc::downgrade(ui);
+            let handles = self.clone_handles();
+            let root = self.root.clone();
             move |_| {
                 let Some(ui) = ui.upgrade() else { return };
                 let dialog = adw::AlertDialog::builder()
@@ -730,6 +808,8 @@ impl SettingsPage {
                 dialog.set_close_response("keep");
 
                 let weak = Rc::downgrade(&ui);
+                let handles = handles.clone();
+                let root = root.clone();
                 dialog.connect_response(None, move |_, response| {
                     if response != "reset" {
                         return;
@@ -737,11 +817,26 @@ impl SettingsPage {
                     let Some(ui) = weak.upgrade() else { return };
                     let backend = ui.backend().clone();
                     let inner = Rc::downgrade(&ui);
+                    let handles = handles.clone();
+                    let root = root.clone();
                     glib::spawn_future_local(async move {
                         let outcome = backend.apply_settings(Settings::default()).await;
                         let Some(ui) = inner.upgrade() else { return };
                         match outcome {
-                            Ok(_) => ui.toast("Settings reset — restart Snatch to apply them all"),
+                            Ok(_) => {
+                                // The rows still showed the old values and the
+                                // draft still held them, so the next Apply
+                                // quietly undid the reset. Rebuild the page
+                                // from the defaults instead.
+                                SettingsPage {
+                                    root,
+                                    draft: handles.draft,
+                                    loading: handles.loading,
+                                }
+                                .rebuild(&ui);
+                                ui.clear_settings_dirty();
+                                ui.toast("Settings reset — restart Snatch to apply them all");
+                            }
                             Err(error) => ui.toast(&format!("{error:#}")),
                         }
                     });

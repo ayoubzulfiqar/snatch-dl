@@ -38,6 +38,15 @@ pub enum Engine {
     Http,
     /// External helpers (`yt-dlp`, `gallery-dl`) that take a `--proxy` flag.
     Subprocess,
+    /// wget and wget2, which read `http_proxy` from the environment and
+    /// speak HTTP proxies only. Kept apart from [`Engine::Http`], which
+    /// admits SOCKS5 because wreq can speak it: handing wget a `socks5://`
+    /// address produced an opaque handshake error instead of the up-front
+    /// refusal every other engine gives.
+    Wget,
+    /// ffmpeg and ffprobe, which honour `http_proxy` only when it starts
+    /// with `http://` and silently connect directly otherwise.
+    Ffmpeg,
 }
 
 impl Engine {
@@ -47,6 +56,8 @@ impl Engine {
             Engine::Torrent => "torrents",
             Engine::Http => "internal requests",
             Engine::Subprocess => "scrapers",
+            Engine::Wget => "wget downloads",
+            Engine::Ffmpeg => "recordings",
         }
     }
 }
@@ -81,9 +92,13 @@ impl ProxyScheme {
     pub fn engines(self) -> &'static [Engine] {
         match self {
             // aria2 speaks HTTP proxies; librqbit does not.
-            ProxyScheme::Http | ProxyScheme::Https => {
-                &[Engine::Aria2, Engine::Http, Engine::Subprocess]
-            }
+            ProxyScheme::Http | ProxyScheme::Https => &[
+                Engine::Aria2,
+                Engine::Http,
+                Engine::Subprocess,
+                Engine::Wget,
+                Engine::Ffmpeg,
+            ],
             // librqbit speaks SOCKS5; aria2 has no SOCKS support whatsoever.
             ProxyScheme::Socks5 => &[Engine::Torrent, Engine::Http, Engine::Subprocess],
         }
@@ -594,8 +609,19 @@ impl ProxyManager {
     /// itself the way a browser does, all the way down to the TLS handshake.
     /// See [`browser_profile`] for why that is not just a user agent string.
     pub fn client(&self, endpoint: Option<&ProxyEndpoint>) -> Result<wreq::Client> {
+        self.client_with_timeout(endpoint, PROBE_TIMEOUT)
+    }
+
+    /// [`Self::client`] with a different overall timeout, for a transfer
+    /// that legitimately takes longer than a probe: a tool's release
+    /// binary, say.
+    pub fn client_with_timeout(
+        &self,
+        endpoint: Option<&ProxyEndpoint>,
+        timeout: Duration,
+    ) -> Result<wreq::Client> {
         let mut builder = wreq::Client::builder()
-            .timeout(PROBE_TIMEOUT)
+            .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT)
             // Sets the handshake, the HTTP/2 settings and the header set
             // together. Deliberately no `.user_agent()` after it: a Chrome

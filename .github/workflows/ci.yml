@@ -81,6 +81,13 @@ jobs:
               digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
               ident = "".join(chr(ord("a") + int(c, 16)) for c in digest)
               print(f"extension id: {ident}")
+              # The static host manifest the packages ship pins this id. A
+              # key change that forgot it would leave every packaged install
+              # with an add-on the host refuses to talk to.
+              pinned = json.loads(pathlib.Path("packaging/native-messaging/chromium.json").read_text())
+              origins = pinned.get("allowed_origins", [])
+              if origins != [f"chrome-extension://{ident}/"]:
+                  problems.append(f"packaging/native-messaging/chromium.json allows {origins}, but the key gives {ident}")
 
           version = re.search(r'^version = "([^"]+)"', pathlib.Path("Cargo.toml").read_text(), re.M)
           if version and manifest.get("version") != version.group(1):

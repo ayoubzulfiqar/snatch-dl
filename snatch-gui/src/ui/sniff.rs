@@ -22,7 +22,10 @@ const PAGE_BUSY: &str = "busy";
 const PAGE_RESULTS: &str = "results";
 
 /// Open the dialog, optionally pre-filled with a URL.
-pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
+///
+/// `headers` are what the browser sent for that page -- its cookies above
+/// all -- so a page that is only readable signed in is read signed in.
+pub fn present(ui: &Rc<Ui>, prefill: Option<String>, headers: crate::stream::Headers) {
     let entry = gtk::Entry::builder()
         .placeholder_text("https://example.com/page-with-media")
         .input_purpose(gtk::InputPurpose::Url)
@@ -175,6 +178,7 @@ pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
         let use_extractor = use_extractor.clone();
         let probe = probe.clone();
         let header = header.clone();
+        let headers = headers.clone();
 
         move |_| {
             let Some(ui) = ui.upgrade() else { return };
@@ -192,6 +196,9 @@ pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
                 use_extractor: use_extractor.is_active(),
                 probe: probe.is_active(),
                 yt_dlp: crate::deps::resolve(crate::deps::Tool::YtDlp, &backend.managed_bin_dir),
+                // Filled in below, once the route is known.
+                proxy: None,
+                headers: headers.clone(),
             };
 
             let stack = stack.clone();
@@ -213,6 +220,10 @@ pub fn present(ui: &Rc<Ui>, prefill: Option<String>) {
                             .resolve_for("sniff", crate::network::Engine::Http)
                             .unwrap_or(None);
                         let client = proxies.client(proxy.as_ref())?;
+                        // yt-dlp goes the same way as the page fetch; before
+                        // this it read the page directly past the proxy.
+                        let mut options = options;
+                        options.proxy = proxy.as_ref().map(|proxy| proxy.url());
                         crate::sniff::sniff(&target, client, options).await
                     })
                     .await;

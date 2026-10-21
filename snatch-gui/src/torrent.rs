@@ -171,6 +171,9 @@ impl TorrentSnapshot {
 /// A running sequential pump.
 struct Pump {
     file_index: usize,
+    /// Which start of pumping this is, so a task that ends can tell whether
+    /// the slot still belongs to it before clearing it.
+    generation: u64,
     task: JoinHandle<()>,
 }
 
@@ -188,8 +191,18 @@ pub struct TorrentEngine {
     download_dir: PathBuf,
     /// torrent id -> active sequential pump.
     pumps: RwLock<HashMap<usize, Pump>>,
+    /// Counts the pumps ever started, for [`Pump::generation`].
+    pump_generation: std::sync::atomic::AtomicU64,
     /// The proxy the session was built with, for display.
     proxy_label: Option<String>,
+    /// The runtime the session lives on.
+    ///
+    /// `set_sequential` is called straight from a toggle on the Torrents
+    /// page, on the GLib thread, which has no runtime context of its own. A
+    /// bare `tokio::spawn` there panics, and the panic is an abort.
+    handle: tokio::runtime::Handle,
+    /// Stop seeding a finished torrent at this share ratio; 0 seeds forever.
+    seed_ratio: f64,
 }
 
 impl TorrentEngine {
@@ -203,6 +216,7 @@ impl TorrentEngine {
         download_dir: PathBuf,
         state_dir: PathBuf,
         proxies: &ProxyManager,
+        settings: &crate::settings::TorrentSettings,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&download_dir)
             .with_context(|| format!("could not create {}", download_dir.display()))?;
@@ -217,39 +231,16 @@ impl TorrentEngine {
             log::info!("routing torrent traffic through {}", proxy.redacted());
         }
 
-        let options = SessionOptions {
-            // DHT and peer exchange are the whole point of using a real engine.
-            dht: Some(librqbit::DhtSessionConfig::default()),
-            fastresume: true,
-            persistence: Some(librqbit::SessionPersistenceConfig::Json {
-                folder: Some(state_dir),
-            }),
-            // Without a listener librqbit only makes outgoing connections:
-            // no peer can reach us, which halves the usable swarm and makes
-            // seeding impossible. A port of 0 lets the OS pick.
-            //
-            // A SOCKS5 proxy carries outgoing connections only, so binding a
-            // public listener would leak the real address; skip it when the
-            // session is proxied.
-            listen: (proxy.is_none()).then(|| librqbit::ListenerOptions {
-                mode: librqbit::ListenerMode::TcpAndUtp,
-                enable_upnp_port_forwarding: true,
-                ..Default::default()
-            }),
-            connect: Some(ConnectionOptions {
-                proxy_url: proxy.as_ref().map(|proxy| proxy.url()),
-                ..Default::default()
-            }),
-            client_name_and_version: Some(concat!("Snatch ", env!("CARGO_PKG_VERSION")).to_owned()),
-            ..Default::default()
-        };
+        let options = session_options(proxy.as_ref(), settings, state_dir);
+        let dht_enabled = options.dht.is_some();
 
         let session = Session::new_with_opts(download_dir.clone(), options)
             .await
             .context("could not start the BitTorrent session")?;
 
         log::info!(
-            "BitTorrent session ready (DHT enabled, listening on {:?})",
+            "BitTorrent session ready (DHT {}, listening on {:?})",
+            if dht_enabled { "enabled" } else { "off" },
             session.listen_addr()
         );
 
@@ -257,8 +248,22 @@ impl TorrentEngine {
             session,
             download_dir,
             pumps: RwLock::new(HashMap::new()),
+            pump_generation: std::sync::atomic::AtomicU64::new(0),
             proxy_label: proxy.map(|proxy| proxy.label),
+            handle: tokio::runtime::Handle::current(),
+            seed_ratio: settings.seed_ratio,
         }))
+    }
+
+    /// Cap the session's upload rate from now on; 0 lifts the cap.
+    ///
+    /// The one torrent setting librqbit lets change while running, so the
+    /// Settings page can say "applies immediately" truthfully for it.
+    pub fn set_upload_limit_kib(&self, kib: u64) {
+        let bps = u32::try_from(kib.saturating_mul(1024)).unwrap_or(u32::MAX);
+        self.session
+            .ratelimits
+            .set_upload_bps(std::num::NonZeroU32::new(bps));
     }
 
     #[allow(dead_code, reason = "the UI uses Backend::download_dir")]
@@ -428,17 +433,41 @@ impl TorrentEngine {
             bail!("torrent {id} has {count} files, so there is no file {file_index}");
         }
 
+        let generation = self
+            .pump_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine = Arc::clone(self);
-        let task = tokio::spawn(async move {
+        let task = self.handle.spawn(async move {
             if let Err(error) = pump_sequentially(handle, file_index).await {
                 log::warn!("sequential download for torrent {id} stopped: {error:#}");
             }
-            // Clear our own slot so the UI stops claiming it is sequential.
-            engine.pumps_mut().remove(&id);
+            // Clear our own slot so the UI stops claiming it is sequential --
+            // but only our own: a replacement pump may be in the slot by now.
+            let mut pumps = engine.pumps_mut();
+            if pumps
+                .get(&id)
+                .is_some_and(|pump| pump.generation == generation)
+            {
+                pumps.remove(&id);
+            }
         });
 
-        // Replacing an entry drops the old Pump, which aborts its task.
-        self.pumps_mut().insert(id, Pump { file_index, task });
+        {
+            // Replacing an entry drops the old Pump, which aborts its task.
+            let mut pumps = self.pumps_mut();
+            pumps.insert(
+                id,
+                Pump {
+                    file_index,
+                    generation,
+                    task,
+                },
+            );
+            // A pump that failed before its slot existed could not clear it.
+            if pumps.get(&id).is_some_and(|pump| pump.task.is_finished()) {
+                pumps.remove(&id);
+            }
+        }
         log::info!("sequential download enabled for torrent {id}, file {file_index}");
         Ok(())
     }
@@ -474,9 +503,39 @@ impl TorrentEngine {
 
         loop {
             ticker.tick().await;
-            if updates.send(self.snapshot()).await.is_err() {
+            let snapshot = self.snapshot();
+            self.enforce_seed_ratio(&snapshot).await;
+            if updates.send(snapshot).await.is_err() {
                 log::debug!("torrent watcher stopping: the UI is gone");
                 return;
+            }
+        }
+    }
+
+    /// Stop seeding anything that has given back its share.
+    ///
+    /// The setting existed and was shown on the Settings page, but nothing
+    /// read it, so "stop at 2.0" seeded forever like everything else.
+    async fn enforce_seed_ratio(&self, snapshot: &[TorrentSnapshot]) {
+        if self.seed_ratio <= 0.0 {
+            return;
+        }
+        for torrent in snapshot {
+            if torrent.phase != TorrentPhase::Seeding || !torrent.finished {
+                continue;
+            }
+            let Some(ratio) = torrent.ratio() else {
+                continue;
+            };
+            if ratio < self.seed_ratio {
+                continue;
+            }
+            log::info!(
+                "torrent {} reached a share ratio of {ratio:.2}; stopping",
+                torrent.id
+            );
+            if let Err(error) = self.pause(torrent.id).await {
+                log::warn!("could not stop seeding torrent {}: {error:#}", torrent.id);
             }
         }
     }
@@ -489,6 +548,56 @@ impl TorrentEngine {
             pumps.clear();
         }
         self.session.stop().await;
+    }
+}
+
+/// The session options the settings and the proxy ask for.
+///
+/// Kept apart from `start` so it can be checked without a session. Until
+/// this existed every option was hard-coded: DHT always on, a public
+/// listener whenever there was no proxy, no peer cap and no upload cap --
+/// so the four torrent settings on the Settings page did nothing at all,
+/// and the note beside them saying "restart to apply" was not true either.
+fn session_options(
+    proxy: Option<&crate::network::ProxyEndpoint>,
+    settings: &crate::settings::TorrentSettings,
+    state_dir: PathBuf,
+) -> SessionOptions {
+    let proxied = proxy.is_some();
+    SessionOptions {
+        // DHT speaks UDP straight to the network. A SOCKS5 proxy cannot carry
+        // it, so with one set the lookups would announce the real address to
+        // every node queried -- the one thing a proxied session must not do.
+        dht: (settings.enable_dht && !proxied).then(librqbit::DhtSessionConfig::default),
+        fastresume: true,
+        persistence: Some(librqbit::SessionPersistenceConfig::Json {
+            folder: Some(state_dir),
+        }),
+        // Without a listener librqbit only makes outgoing connections: no
+        // peer can reach us, which halves the usable swarm and makes seeding
+        // impossible. A port of 0 lets the OS pick.
+        //
+        // A SOCKS5 proxy carries outgoing connections only, so binding a
+        // public listener would leak the real address; skip it when the
+        // session is proxied, and when the user asked for none.
+        listen: (settings.accept_incoming && !proxied).then(|| librqbit::ListenerOptions {
+            mode: librqbit::ListenerMode::TcpAndUtp,
+            enable_upnp_port_forwarding: true,
+            ..Default::default()
+        }),
+        connect: Some(ConnectionOptions {
+            proxy_url: proxy.map(|proxy| proxy.url()),
+            ..Default::default()
+        }),
+        peer_limit: Some(settings.max_peers.max(1) as usize),
+        ratelimits: librqbit::limits::LimitsConfig {
+            upload_bps: std::num::NonZeroU32::new(
+                u32::try_from(settings.max_upload_kib.saturating_mul(1024)).unwrap_or(u32::MAX),
+            ),
+            download_bps: None,
+        },
+        client_name_and_version: Some(concat!("Snatch ", env!("CARGO_PKG_VERSION")).to_owned()),
+        ..Default::default()
     }
 }
 
@@ -706,5 +815,59 @@ mod tests {
         snapshot.progress_bytes = 0;
         assert_eq!(snapshot.fraction(), 0.0);
         assert!(snapshot.ratio().is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_option_tests {
+    use super::*;
+    use crate::network::ProxyEndpoint;
+    use crate::settings::TorrentSettings;
+
+    fn state_dir() -> PathBuf {
+        std::env::temp_dir().join("snatch-session-options")
+    }
+
+    /// Every one of these was hard-coded before, and the Settings page
+    /// claimed otherwise.
+    #[test]
+    fn the_torrent_settings_reach_the_session() {
+        let settings = TorrentSettings {
+            max_upload_kib: 100,
+            enable_dht: false,
+            accept_incoming: false,
+            max_peers: 42,
+            ..TorrentSettings::default()
+        };
+        let options = session_options(None, &settings, state_dir());
+        assert!(options.dht.is_none(), "DHT was switched off");
+        assert!(options.listen.is_none(), "no listener was asked for");
+        assert_eq!(options.peer_limit, Some(42));
+        assert_eq!(
+            options.ratelimits.upload_bps.map(|bps| bps.get()),
+            Some(100 * 1024)
+        );
+
+        let defaults = session_options(None, &TorrentSettings::default(), state_dir());
+        assert!(defaults.dht.is_some());
+        assert!(defaults.listen.is_some());
+        assert!(defaults.ratelimits.upload_bps.is_none(), "0 means no cap");
+    }
+
+    /// A SOCKS proxy carries TCP only: DHT and the listener would both
+    /// announce the real address.
+    #[test]
+    fn a_proxied_session_neither_listens_nor_queries_dht() {
+        let proxy = ProxyEndpoint::parse("hop", "socks5://127.0.0.1:1080").expect("parses");
+        let options = session_options(Some(&proxy), &TorrentSettings::default(), state_dir());
+        assert!(options.dht.is_none());
+        assert!(options.listen.is_none());
+        assert!(
+            options
+                .connect
+                .as_ref()
+                .and_then(|connect| connect.proxy_url.as_deref())
+                .is_some_and(|url| url.starts_with("socks5://"))
+        );
     }
 }

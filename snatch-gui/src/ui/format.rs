@@ -112,6 +112,11 @@ pub fn boxed_list() -> gtk::ListBox {
     gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
+        // Hug the rows. Inside a scrolled page the list is handed the whole
+        // viewport, and a boxed list paints its card over everything it is
+        // given -- so one finished scrape was drawn as a card the height of
+        // the window, with the row at the top of an empty white field.
+        .valign(gtk::Align::Start)
         .build()
 }
 

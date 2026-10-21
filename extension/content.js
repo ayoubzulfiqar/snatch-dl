@@ -756,7 +756,13 @@
     if (!host) {
       return;
     }
-    const parent = document.fullscreenElement || document.documentElement;
+    let parent = document.fullscreenElement || document.documentElement;
+    // A `<video>` taken fullscreen by itself is painted above everything, but
+    // its children are fallback content and never rendered -- so the pill
+    // has to sit beside it, in whatever contains it.
+    if (parent instanceof HTMLMediaElement) {
+      parent = parent.parentElement || document.documentElement;
+    }
     if (host.parentNode !== parent) {
       parent.appendChild(host);
     }

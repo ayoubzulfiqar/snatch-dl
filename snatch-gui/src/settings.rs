@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Which program performs plain HTTP/FTP downloads.
@@ -370,6 +370,29 @@ pub fn parse_hhmm(value: &str) -> Option<u32> {
     Some(hours * 60 + minutes)
 }
 
+/// The external tools Snatch can install for itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ToolSettings {
+    /// Fetch a newer yt-dlp or gallery-dl once a week, without being asked.
+    ///
+    /// Sites change under these tools every few weeks, and a yt-dlp from a
+    /// distribution package is routinely months behind: the usual shape of
+    /// "video extraction stopped working" is nothing more than that.
+    pub auto_update: bool,
+    /// Unix time of the last completed check, so a week is measured from it.
+    pub last_update_check: i64,
+}
+
+impl Default for ToolSettings {
+    fn default() -> Self {
+        Self {
+            auto_update: true,
+            last_update_check: 0,
+        }
+    }
+}
+
 /// Everything the user can configure.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -379,6 +402,7 @@ pub struct Settings {
     pub torrent: TorrentSettings,
     pub media: MediaSettings,
     pub interface: InterfaceSettings,
+    pub tools: ToolSettings,
 }
 
 impl Settings {
@@ -409,8 +433,17 @@ impl Settings {
             .with_context(|| format!("could not create {}", parent.display()))?;
         let bytes = serde_json::to_vec_pretty(self).context("could not encode settings")?;
 
-        // Write and rename, so a crash cannot truncate the file.
-        let temporary = path.with_extension("json.tmp");
+        // Write and rename, so a crash cannot truncate the file. The scratch
+        // name is unique per write: two saves in flight at once -- the page
+        // switch and the drawer toggle both remember themselves -- used to
+        // share one, and a rename racing a write left a truncated file that
+        // the next launch silently replaced with the defaults.
+        static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temporary = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::write(&temporary, &bytes)
             .with_context(|| format!("could not write {}", temporary.display()))?;
         std::fs::rename(&temporary, path)
@@ -457,13 +490,21 @@ impl Settings {
     }
 
     /// The download directory, or `None` to use the XDG one.
+    ///
+    /// A leading `~` means the home directory, because that is what anyone
+    /// typing a path into a text field expects it to mean.
     pub fn download_dir_override(&self) -> Option<PathBuf> {
         let value = self.interface.download_dir.trim();
         if value.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(value))
+            return None;
         }
+        if let Some(rest) = value.strip_prefix('~')
+            && (rest.is_empty() || rest.starts_with('/'))
+            && let Some(home) = dirs::home_dir()
+        {
+            return Some(home.join(rest.trim_start_matches('/')));
+        }
+        Some(PathBuf::from(value))
     }
 
     /// aria2 command-line arguments that can only be set when it starts.
@@ -552,6 +593,29 @@ impl Settings {
             ),
         ]
     }
+}
+
+/// Check that a chosen download folder can actually be used, creating it if
+/// it does not exist yet.
+///
+/// Typed into a text field, so it can be anything: relative (which would be
+/// created wherever the process happened to start), a path through a regular
+/// file, or somewhere this user cannot write. Any of those used to be saved
+/// as-is and then fail `create_dir_all` on the next launch, which stopped the
+/// application starting at all with no way to fix it from inside.
+pub fn prepare_download_dir(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("the download folder must be an absolute path");
+    }
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    if !path.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    let probe = path.join(format!(".snatch-write-check-{}", std::process::id()));
+    std::fs::write(&probe, b"").with_context(|| format!("{} is not writable", path.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// The folder a file of this kind belongs in.
@@ -854,5 +918,42 @@ mod schedule_tests {
         settings.schedule.start = "99:99".to_owned();
         let settings = settings.clamped();
         assert_eq!(settings.schedule.start, ScheduleSettings::default().start);
+    }
+}
+
+#[cfg(test)]
+mod download_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_folder_is_refused() {
+        // Saved as-is, this was created relative to wherever the process
+        // started and then stopped the next launch dead.
+        assert!(prepare_download_dir(Path::new("downloads")).is_err());
+    }
+
+    #[test]
+    fn a_folder_through_a_file_is_refused() {
+        let file = std::env::temp_dir().join(format!("snatch-dir-check-{}", std::process::id()));
+        std::fs::write(&file, b"").expect("write");
+        assert!(prepare_download_dir(&file.join("inside")).is_err());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_usable_folder_is_created_and_accepted() {
+        let dir = std::env::temp_dir().join(format!("snatch-dir-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        prepare_download_dir(&dir).expect("usable");
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tilde_means_home() {
+        let mut settings = Settings::default();
+        settings.interface.download_dir = "~/Films".to_owned();
+        let home = dirs::home_dir().expect("a home");
+        assert_eq!(settings.download_dir_override(), Some(home.join("Films")));
     }
 }

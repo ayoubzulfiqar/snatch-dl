@@ -87,7 +87,15 @@ pub enum GalleryEvent {
         path: PathBuf,
         skipped: bool,
     },
+    /// gallery-dl is retrying or grumbling; nothing is lost yet.
     Warning {
+        batch_id: i64,
+        message: String,
+    },
+    /// gallery-dl gave up on one file. Counted as a failure; a warning is
+    /// not, which is the difference between "1 failed" and the "11 failed"
+    /// a single dead file used to show after ten retries.
+    FileFailed {
         batch_id: i64,
         message: String,
     },
@@ -96,6 +104,13 @@ pub enum GalleryEvent {
         state: JobState,
         error: Option<String>,
     },
+}
+
+/// How a batch's run came to an end without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Finished,
+    Cancelled,
 }
 
 /// One parsed line of gallery-dl output.
@@ -207,6 +222,8 @@ fn strip_tags(line: &str) -> String {
 pub struct GalleryEngine {
     db: Database,
     jobs: Mutex<HashMap<i64, JoinHandle<()>>>,
+    /// One stop request per running batch; see `cancel`.
+    stops: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl GalleryEngine {
@@ -214,6 +231,7 @@ impl GalleryEngine {
         Arc::new(Self {
             db,
             jobs: Mutex::new(HashMap::new()),
+            stops: Mutex::new(HashMap::new()),
         })
     }
 
@@ -234,12 +252,25 @@ impl GalleryEngine {
         self.jobs().values().filter(|t| !t.is_finished()).count()
     }
 
-    /// Abort a batch. `kill_on_drop` turns the abort into a killed subprocess.
+    /// Ask a batch to stop.
+    ///
+    /// Cooperative rather than an abort: aborting the task dropped the
+    /// future mid-run, which killed gallery-dl but skipped the bookkeeping
+    /// after it, so the row stayed "Running" and the database row stayed
+    /// `running` until the next launch marked it as a crash. The task sees
+    /// the request, kills the child itself, and finishes the batch as
+    /// cancelled like any other ending. Safe from any thread: it only sends.
     pub fn cancel(&self, batch_id: i64) {
-        if let Some(task) = self.jobs().remove(&batch_id) {
-            task.abort();
-            log::info!("cancelled scrape batch {batch_id}");
+        if let Some(stop) = self.stops().remove(&batch_id) {
+            let _ = stop.send(());
+            log::info!("cancelling scrape batch {batch_id}");
         }
+    }
+
+    fn stops(&self) -> std::sync::MutexGuard<'_, HashMap<i64, tokio::sync::oneshot::Sender<()>>> {
+        self.stops
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Queue a scrape and return its database id immediately.
@@ -268,14 +299,21 @@ impl GalleryEngine {
             })
             .await;
 
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        self.stops().insert(batch_id, stop);
+
         let engine = Arc::clone(self);
         let task = tokio::spawn(async move {
             let outcome = engine
-                .run(batch_id, &url, &config, proxies.as_ref(), &events)
+                .run(batch_id, &url, &config, proxies.as_ref(), &events, stopped)
                 .await;
 
             let (state, error) = match outcome {
-                Ok(()) => (JobState::Complete, None),
+                Ok(Ending::Finished) => (JobState::Complete, None),
+                Ok(Ending::Cancelled) => {
+                    log::info!("scrape batch {batch_id} was cancelled");
+                    (JobState::Cancelled, None)
+                }
                 Err(error) => {
                     log::warn!("scrape batch {batch_id} failed: {error:#}");
                     (JobState::Failed, Some(format!("{error:#}")))
@@ -293,6 +331,7 @@ impl GalleryEngine {
                 })
                 .await;
             engine.jobs().remove(&batch_id);
+            engine.stops().remove(&batch_id);
         });
 
         self.jobs().insert(batch_id, task);
@@ -306,7 +345,8 @@ impl GalleryEngine {
         config: &GalleryConfig,
         proxies: &ProxyManager,
         events: &mpsc::Sender<GalleryEvent>,
-    ) -> Result<()> {
+        stopped: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<Ending> {
         std::fs::create_dir_all(&config.destination)
             .with_context(|| format!("could not create {}", config.destination.display()))?;
 
@@ -390,12 +430,22 @@ impl GalleryEngine {
         let mut total_seen = 0u64;
         let mut last_error: Option<String> = None;
         let (mut stdout_open, mut stderr_open) = (true, true);
+        let mut stopped = std::pin::pin!(stopped);
+        let mut cancelled = false;
 
         // Both streams must be drained concurrently: gallery-dl blocks once a
         // pipe buffer fills, so reading them in sequence would deadlock on any
         // batch bigger than a page of output.
         while stdout_open || stderr_open {
             tokio::select! {
+                _ = &mut stopped, if !cancelled => {
+                    cancelled = true;
+                    // Killed here rather than by dropping it, so the pipes
+                    // still drain to EOF below and the exit is waited for.
+                    if let Err(error) = child.start_kill() {
+                        log::debug!("scrape {batch_id}: could not kill gallery-dl: {error}");
+                    }
+                },
                 line = stdout.next_line(), if stdout_open => match line {
                     Ok(Some(line)) => {
                         self.handle_stdout(batch_id, &line, events).await;
@@ -425,6 +475,9 @@ impl GalleryEngine {
             .await
             .context("could not wait for gallery-dl to exit")?;
 
+        if cancelled {
+            return Ok(Ending::Cancelled);
+        }
         if !status.success() {
             let code = status
                 .code()
@@ -435,7 +488,7 @@ impl GalleryEngine {
                 None => bail!("gallery-dl exited with {code}"),
             }
         }
-        Ok(())
+        Ok(Ending::Finished)
     }
 
     async fn handle_stdout(&self, batch_id: i64, line: &str, events: &mpsc::Sender<GalleryEvent>) {
@@ -483,7 +536,7 @@ impl GalleryEngine {
                 }
                 *last_error = Some(message.clone());
                 let _ = events
-                    .send(GalleryEvent::Warning { batch_id, message })
+                    .send(GalleryEvent::FileFailed { batch_id, message })
                     .await;
             }
             Line::Warning(message) => {
@@ -538,9 +591,14 @@ pub fn destination_for(base: &Path, url: &str) -> PathBuf {
                 '_'
             }
         })
+        // A host is at most 253 bytes; anything longer is not one, and a
+        // single path component past 255 bytes cannot be created anyway.
+        .take(200)
         .collect();
 
-    if safe.is_empty() {
+    // `..` survives the character filter and would resolve to the parent of
+    // the base, so a host made of nothing but dots is no host at all.
+    if safe.is_empty() || safe.bytes().all(|byte| byte == b'.') {
         base.to_path_buf()
     } else {
         base.join(safe)
@@ -673,5 +731,33 @@ mod tests {
         assert!(validate_url("").is_err());
         assert!(validate_url("https://example.com/a\nX: y").is_err());
         assert!(validate_url("example.com").is_err());
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+
+    #[test]
+    fn a_host_of_dots_never_escapes_the_base() {
+        let base = Path::new("/d/Snatch Galleries");
+        assert_eq!(destination_for(base, "https://../x"), base);
+        assert_eq!(destination_for(base, "https://www.../x"), base);
+        assert_eq!(
+            destination_for(base, "https://a.example/x"),
+            base.join("a.example")
+        );
+    }
+
+    #[test]
+    fn an_absurd_host_is_clamped_to_a_creatable_name() {
+        let base = Path::new("/d");
+        let long = format!("https://{}/x", "h".repeat(5000));
+        let component = destination_for(base, &long);
+        let name = component
+            .file_name()
+            .expect("a component")
+            .to_string_lossy();
+        assert!(name.len() <= 200, "{} bytes", name.len());
     }
 }

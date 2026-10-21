@@ -5,6 +5,7 @@
 //! cannot serve BitTorrent. Each row states which engines it can carry, and
 //! the default-proxy selector refuses a choice that would strand one of them.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -121,16 +122,26 @@ pub fn present(ui: &Rc<Ui>) {
     dialog.present(Some(ui.window()));
 }
 
-fn refill(group: &adw::PreferencesGroup, ui: &Rc<Ui>) {
-    // PreferencesGroup has no "clear", so remove what we added last time.
-    let mut stale = Vec::new();
-    let mut child = group.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        if let Ok(row) = widget.clone().downcast::<adw::ActionRow>() {
-            stale.push(row);
+/// Every `ActionRow` below a widget, depth first.
+fn collect_rows(widget: &gtk::Widget, found: &mut Vec<adw::ActionRow>) {
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        child = current.next_sibling();
+        if let Ok(row) = current.clone().downcast::<adw::ActionRow>() {
+            found.push(row);
+        } else {
+            collect_rows(&current, found);
         }
     }
+}
+
+fn refill(group: &adw::PreferencesGroup, ui: &Rc<Ui>) {
+    // PreferencesGroup has no "clear", so remove what we added last time.
+    // The rows are not the group's direct children -- they sit in a list box
+    // inside a box inside it -- so the whole subtree is walked. Looking only
+    // one level down found nothing, and every rebuild appended a second set.
+    let mut stale = Vec::new();
+    collect_rows(group.upcast_ref::<gtk::Widget>(), &mut stale);
     for row in stale {
         group.remove(&row);
     }
@@ -225,13 +236,23 @@ fn build_row(
     default_toggle.connect_toggled({
         let ui = Rc::downgrade(ui);
         let label = proxy.label.clone();
+        // `set_active` fires this handler again, synchronously. Reverting a
+        // failed change from inside it re-entered here with the opposite
+        // wish, failed again, reverted again -- and a full disk, which is
+        // what a download manager produces, took the stack down with it.
+        let reverting = Rc::new(Cell::new(false));
         move |button| {
+            if reverting.get() {
+                return;
+            }
             let Some(ui) = ui.upgrade() else { return };
             let wanted = button.is_active();
             let choice = if wanted { Some(label.as_str()) } else { None };
             if let Err(error) = ui.backend().proxies.set_default(choice) {
                 ui.toast(&format!("{error:#}"));
+                reverting.set(true);
                 button.set_active(!wanted);
+                reverting.set(false);
             } else if wanted {
                 ui.toast(&format!("New jobs will use {label}"));
             }

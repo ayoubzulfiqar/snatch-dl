@@ -136,7 +136,6 @@ const COPIED_HEADERS = new Set([
   "user-agent",
   "cookie",
   "x-requested-with",
-  "x-forwarded-for",
   "x-csrf-token",
   "x-api-key",
   "x-auth-token",
@@ -292,6 +291,41 @@ function hostOf(url) {
   }
 }
 
+/**
+ * Whether the browser lets this extension see every site.
+ *
+ * Chromium grants `host_permissions` at install. Firefox treats them as
+ * optional for a Manifest V3 add-on: nothing is granted until the reader
+ * turns them on, and until then `webRequest` never fires, the cookie store
+ * refuses, and the content script is not injected. The `downloads` API needs
+ * no host permission, so the capture still ran -- the browser's download was
+ * cancelled and Snatch fetched the address with no cookies, which on any
+ * page behind a login is a 403 for a file the browser would have got.
+ */
+async function hasHostAccess() {
+  if (!api.permissions || typeof api.permissions.contains !== "function") {
+    return true;
+  }
+  try {
+    return await api.permissions.contains({ origins: ["<all_urls>"] });
+  } catch (error) {
+    return true;
+  }
+}
+
+/** Ask for the host access the capture depends on. Needs a user gesture. */
+async function requestHostAccess() {
+  if (!api.permissions || typeof api.permissions.request !== "function") {
+    return true;
+  }
+  try {
+    return await api.permissions.request({ origins: ["<all_urls>"] });
+  } catch (error) {
+    console.warn("Snatch: could not ask for host access", error);
+    return false;
+  }
+}
+
 /** Sites the user dismissed the button on, with the × on the pill. */
 async function hiddenSites() {
   if (hiddenSitesCache !== null) {
@@ -375,7 +409,16 @@ async function broadcastOverlay() {
 
 async function refreshAction() {
   const enabled = await isEnabled();
+  const access = await hasHostAccess();
   try {
+    if (!access) {
+      await api.action.setTitle({
+        title: "Snatch needs permission to see every site - click to grant it"
+      });
+      await api.action.setBadgeText({ text: "!" });
+      await api.action.setBadgeBackgroundColor({ color: "#e01b24" });
+      return;
+    }
     await api.action.setTitle({
       title: enabled
         ? "Snatch is capturing downloads - click to pause"
@@ -853,22 +896,44 @@ function sendNative(message) {
   });
 }
 
-async function cookieHeader(url) {
+/**
+ * The Cookie header the browser would send to `url` from a page on `site`.
+ *
+ * Two queries, because the browser keeps two jars. A plain `getAll` returns
+ * only unpartitioned cookies; the ones a third-party CDN set while embedded
+ * on a site live in a partition keyed by that site and are only returned
+ * when asked for by it. A player's CDN cookie is very often of the second
+ * kind, and leaving it out is a 403 on a stream that plays fine in the tab.
+ */
+async function cookieHeader(url, site) {
+  const found = new Map();
+  const collect = async (query) => {
+    const cookies = await api.cookies.getAll(query);
+    for (const cookie of cookies) {
+      if (cookie.name && !found.has(cookie.name)) {
+        found.set(cookie.name, cookie.value);
+      }
+    }
+  };
   try {
     const query = { url: url };
     if (IS_FIREFOX) {
       // Return cookies regardless of first-party isolation.
       query.firstPartyDomain = null;
     }
-    const cookies = await api.cookies.getAll(query);
-    return cookies
-      .filter((cookie) => cookie.name)
-      .map((cookie) => cookie.name + "=" + cookie.value)
-      .join("; ");
+    await collect(query);
   } catch (error) {
     console.warn("Snatch: could not read cookies for", url, error);
-    return "";
   }
+  const topLevelSite = originOf(site || url);
+  if (topLevelSite) {
+    try {
+      await collect({ url: url, partitionKey: { topLevelSite: topLevelSite } });
+    } catch (error) {
+      // An older browser without partitioned cookies; nothing to add.
+    }
+  }
+  return Array.from(found, ([name, value]) => name + "=" + value).join("; ");
 }
 
 /** Build the wire payload and push it to the native host. */
@@ -883,7 +948,7 @@ async function handOff(details) {
     return sendNative(message);
   }
 
-  const cookies = await cookieHeader(details.url);
+  const cookies = await cookieHeader(details.url, details.referer);
   if (cookies) {
     message.cookies = cookies;
   }
@@ -939,7 +1004,21 @@ async function handOff(details) {
 // Capture
 // ---------------------------------------------------------------------------
 
-/** Take over a download the browser has just started. */
+/**
+ * Take over a download the browser has just started.
+ *
+ * The order matters, and every step is checked rather than assumed:
+ *
+ *   1. Pause it, and confirm it is paused. A file that had already arrived
+ *      in full -- anything small -- completes regardless, and is left to the
+ *      browser: cancelling a completed item is a silent no-op in Chromium,
+ *      and erasing it afterwards hid a finished file from the shelf while
+ *      Snatch fetched a second copy.
+ *   2. Cancel it, and confirm it is interrupted, for the same reason.
+ *   3. Hand it to Snatch. Only on success is the item erased from the shelf;
+ *      on failure the browser is asked to carry on with it, and failing
+ *      that to start it again, so a download is never simply lost.
+ */
 async function hijack(item) {
   if (!(await isEnabled())) {
     return;
@@ -949,27 +1028,53 @@ async function hijack(item) {
   if (!isHijackable(url) || item.state !== "in_progress") {
     return;
   }
+  if (item.byExtensionId && item.byExtensionId === api.runtime.id) {
+    return; // our own doing
+  }
   if (passThrough.delete(url)) {
     return; // we handed this one back to the browser on purpose
+  }
+  // Without host access there are no cookies and no headers to send along,
+  // and a download the browser would have managed becomes a 403 in Snatch.
+  if (!(await hasHostAccess())) {
+    console.warn("Snatch: leaving the download to the browser; host access is not granted");
+    void refreshAction();
+    return;
+  }
+
+  const hint = takeHint(url) || takeHint(item.url) || {};
+  // A download produced by a form POST cannot be repeated with a GET of the
+  // same address: what comes back is an error page named after the file.
+  if (hint.method && hint.method !== "GET") {
+    console.info("Snatch: leaving a", hint.method, "download to the browser");
+    return;
+  }
+
+  try {
+    await api.downloads.pause(item.id);
+  } catch (error) {
+    console.info("Snatch: the browser download was not in flight; leaving it", error);
+    return;
+  }
+  let current = await lookupDownload(item.id);
+  if (!current || current.state !== "in_progress" || !current.paused) {
+    console.info("Snatch: the browser download finished before it could be taken over");
+    return;
   }
 
   try {
     await api.downloads.cancel(item.id);
   } catch (error) {
-    // The download finished or vanished before we got here. Leave it alone
-    // rather than risk fetching the same file twice.
     console.warn("Snatch: could not cancel the browser download", error);
     return;
   }
-  try {
-    await api.downloads.erase({ id: item.id });
-  } catch (error) {
-    console.warn("Snatch: could not erase the cancelled download", error);
+  current = await lookupDownload(item.id);
+  if (!current || current.state !== "interrupted") {
+    console.info("Snatch: the browser download completed anyway; leaving it on the shelf");
+    return;
   }
 
-  const hint = takeHint(url) || takeHint(item.url) || {};
   const filename = pickFilename(item, hint, url);
-
   try {
     await handOff({
       url: url,
@@ -983,19 +1088,52 @@ async function hijack(item) {
       mime: item.mime || hint.mime,
       size: item.totalBytes > 0 ? item.totalBytes : hint.size
     });
-    console.info("Snatch: handed off", filename || url);
-    flashBadge("ok", "#3584e4");
   } catch (error) {
-    console.error("Snatch: hand-off failed", error);
+    console.error("Snatch: hand-off failed; giving the download back to the browser", error);
     flashBadge("!", "#e01b24");
-    // Never silently lose a download: give it back to the browser.
-    passThrough.add(url);
-    try {
-      await api.downloads.download({ url: url });
-    } catch (fallbackError) {
-      passThrough.delete(url);
-      console.error("Snatch: the browser fallback also failed", fallbackError);
-    }
+    await giveBack(item.id, url);
+    return;
+  }
+
+  console.info("Snatch: handed off", filename || url);
+  flashBadge("ok", "#3584e4");
+  try {
+    await api.downloads.erase({ id: item.id });
+  } catch (error) {
+    console.warn("Snatch: could not erase the cancelled download", error);
+  }
+}
+
+/** The browser's current record of one download, or null. */
+async function lookupDownload(id) {
+  try {
+    const found = await api.downloads.search({ id: id });
+    return Array.isArray(found) && found.length > 0 ? found[0] : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * Let the browser finish a download Snatch could not take.
+ *
+ * Resuming keeps the Referer and the chosen location; it works when the
+ * server allows ranges. Otherwise the download is started again from the
+ * address, which is the one thing that is always possible.
+ */
+async function giveBack(id, url) {
+  try {
+    await api.downloads.resume(id);
+    return;
+  } catch (error) {
+    // Not resumable; start over below.
+  }
+  passThrough.add(url);
+  try {
+    await api.downloads.download({ url: url });
+  } catch (fallbackError) {
+    passThrough.delete(url);
+    console.error("Snatch: the browser fallback also failed", fallbackError);
   }
 }
 
@@ -1247,11 +1385,17 @@ async function attachAccess(payload, pageUrl, mediaUrls) {
   // Read through the cookie store rather than off the wire: that reaches the
   // httpOnly session cookies a request listener is never shown, and those are
   // the ones a signed-in page depends on.
-  const cookies = await cookieHeader(pageUrl);
+  const cookies = await cookieHeader(pageUrl, pageUrl);
   if (cookies) {
     payload.cookies = cookies;
   }
-  const observed = headersFor(mediaUrls || []);
+  // Only the headers of the host the player is on, not of every host the
+  // tab touched. The set goes on every request Snatch makes for this page,
+  // so a token seen on one CDN would otherwise be presented to the page,
+  // to another CDN, and to whatever advert happened to load alongside.
+  const urls = mediaUrls || [];
+  const primary = urls.length > 0 ? originOf(urls[0]) : "";
+  const observed = headersFor(urls.filter((url) => originOf(url) === primary));
   // Already sent above, and a duplicate is how a request ends up with two
   // Referers and is refused by a server that reads the second one.
   delete observed.referer;
@@ -1307,6 +1451,15 @@ api.webRequest.onBeforeRequest.addListener(
         tabId: details.tabId
       });
     }
+    // A navigation that was not a GET -- an export button posting a form --
+    // produces a download that cannot be repeated by address alone.
+    if (
+      (details.type === "main_frame" || details.type === "sub_frame") &&
+      typeof details.method === "string" &&
+      details.method.toUpperCase() !== "GET"
+    ) {
+      rememberHint(details.url, { method: details.method.toUpperCase() });
+    }
   },
   { urls: WEB_REQUEST_FILTER.urls, types: WEB_REQUEST_TYPES }
 );
@@ -1344,14 +1497,17 @@ function watchOutgoingHeaders() {
     }
   };
 
+  // The same kinds `onBeforeRequest` watches. Without the filter every
+  // image, script, font and beacon on every page went through this.
+  const filter = { urls: WEB_REQUEST_FILTER.urls, types: WEB_REQUEST_TYPES };
   try {
-    api.webRequest.onSendHeaders.addListener(listener, WEB_REQUEST_FILTER, [
+    api.webRequest.onSendHeaders.addListener(listener, filter, [
       "requestHeaders",
       "extraHeaders"
     ]);
   } catch (error) {
     console.warn("Snatch: extraHeaders is unavailable here", error);
-    api.webRequest.onSendHeaders.addListener(listener, WEB_REQUEST_FILTER, ["requestHeaders"]);
+    api.webRequest.onSendHeaders.addListener(listener, filter, ["requestHeaders"]);
   }
 }
 
@@ -1389,7 +1545,7 @@ api.webRequest.onHeadersReceived.addListener(
       size: contentLength ? Number.parseInt(contentLength, 10) : undefined
     });
   },
-  WEB_REQUEST_FILTER,
+  { urls: WEB_REQUEST_FILTER.urls, types: WEB_REQUEST_TYPES },
   ["responseHeaders"]
 );
 
@@ -1414,8 +1570,19 @@ api.downloads.onCreated.addListener((item) => {
 });
 
 api.action.onClicked.addListener(() => {
-  isEnabled()
-    .then((enabled) => setEnabled(!enabled))
+  hasHostAccess()
+    .then(async (access) => {
+      if (!access) {
+        // A click is the user gesture the permission prompt needs. Granting
+        // it is the whole point of the click, so the toggle is left alone.
+        if (await requestHostAccess()) {
+          void refreshAction();
+          void armOpenTabs();
+        }
+        return;
+      }
+      await setEnabled(!(await isEnabled()));
+    })
     .catch((error) => console.error("Snatch: could not toggle capture", error));
 });
 

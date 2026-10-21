@@ -189,7 +189,11 @@ fn parse_range(body: &str) -> Option<Vec<String>> {
         let mut current = start;
         while current <= end && values.len() <= MAX_EXPANSION {
             values.push(format!("{current:0width$}"));
-            current += step;
+            // A range ending near u64::MAX must stop rather than wrap.
+            let Some(next) = current.checked_add(step) else {
+                break;
+            };
+            current = next;
         }
     } else {
         // Counting down is a real thing people want, and refusing it would
@@ -407,5 +411,21 @@ mod tests {
     #[test]
     fn an_empty_line_expands_to_nothing() {
         assert!(expand("   ").expect("expands").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn a_range_ending_at_the_top_of_u64_does_not_overflow() {
+        let urls = expand("https://x.test/[18446744073709551610-18446744073709551615].bin")
+            .expect("expands");
+        assert_eq!(urls.len(), 6, "{urls:?}");
+        assert!(
+            urls.last()
+                .is_some_and(|url| url.contains("18446744073709551615"))
+        );
     }
 }

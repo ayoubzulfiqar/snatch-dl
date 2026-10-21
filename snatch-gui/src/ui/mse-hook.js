@@ -31,9 +31,32 @@
   window.__snatchMseInstalled = true;
 
   var CHANNEL = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.snatchMse;
-  if (!CHANNEL || typeof window.MediaSource === "undefined") {
+  if (!CHANNEL) {
     return;
   }
+
+  // This frame's name on the wire.
+  //
+  // The hook runs once per frame -- the page and every iframe in it -- and
+  // each copy numbers its MediaSources from one. All of them post through the
+  // one channel, which carries no frame of its own, so without this a player
+  // in an iframe (which is where most embedded players live, Google Drive's
+  // included) and a MediaSource in the page around it were both "ms 1" and
+  // the bytes of two streams were written into one file. Worse, arming is a
+  // script run in the main frame, which never reached the iframe at all: the
+  // capture started, nothing ever arrived, and Save said "nothing was
+  // captured". The token tells the frames apart; the relay below carries the
+  // arming down to the frame it is meant for.
+  var FRAME = (function () {
+    try {
+      if (window.crypto && window.crypto.randomUUID) {
+        return window.crypto.randomUUID();
+      }
+    } catch (error) {
+      // Fall through to the weaker name.
+    }
+    return "f" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  })();
 
   var nextMs = 1;
   var nextSb = 1;
@@ -83,10 +106,63 @@
 
   function post(message) {
     try {
+      message.f = FRAME;
       CHANNEL.postMessage(JSON.stringify(message));
     } catch (error) {
       // A dead channel must never break the page.
     }
+  }
+
+  // Pass an instruction from the Rust side on to every child frame. Each
+  // frame's own hook does the same, so it reaches every frame on the page
+  // however deeply the player is nested, cross-origin included.
+  function relay(instruction) {
+    for (var i = 0; i < window.frames.length; i += 1) {
+      try {
+        window.frames[i].postMessage(instruction, "*");
+      } catch (error) {
+        // A frame that refuses a message is not the one we are looking for.
+      }
+    }
+  }
+
+  // Act on an instruction meant for this frame, or pass it on.
+  function instruct(instruction) {
+    if (!instruction || instruction.__snatch !== "mse" || typeof instruction.frame !== "string") {
+      return;
+    }
+    if (instruction.frame !== FRAME) {
+      relay(instruction);
+      return;
+    }
+    if (instruction.op === "arm") {
+      arm(instruction.ms);
+    } else if (instruction.op === "disarm") {
+      disarm(instruction.ms);
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    try {
+      instruct(event.data);
+    } catch (error) {
+      // Never let bookkeeping break the page.
+    }
+  });
+
+  // The entry points the Rust side calls, in the main frame only. The frame
+  // token decides where the instruction ends up.
+  window.__snatchArm = function (frame, msId) {
+    instruct({ __snatch: "mse", op: "arm", frame: String(frame), ms: msId });
+    return true;
+  };
+  window.__snatchDisarm = function (frame, msId) {
+    instruct({ __snatch: "mse", op: "disarm", frame: String(frame), ms: msId });
+    return true;
+  };
+
+  if (typeof window.MediaSource === "undefined") {
+    return;
   }
 
   // A fast base64 that does not overflow the stack on a multi-megabyte chunk:
@@ -229,6 +305,12 @@
 
   var appendBuffer = window.SourceBuffer.prototype.appendBuffer;
   window.SourceBuffer.prototype.appendBuffer = function (data) {
+    // The real append first. It throws when the buffer is updating or full,
+    // and every player answers that by evicting and appending the very same
+    // segment again -- recording the refused attempt put the segment in the
+    // file twice. The bytes are copied by the append, so they are still the
+    // caller's to read afterwards.
+    var result = appendBuffer.apply(this, arguments);
     try {
       if (this.__snatchId !== undefined) {
         onAppend(this.__snatchId, data);
@@ -236,7 +318,7 @@
     } catch (error) {
       // Copying the bytes must never stop them being appended.
     }
-    return appendBuffer.apply(this, arguments);
+    return result;
   };
 
   var endOfStream = window.MediaSource.prototype.endOfStream;
@@ -251,14 +333,21 @@
     return endOfStream.apply(this, arguments);
   };
 
-  // Called from the Rust side when the reader chooses to capture a stream.
-  // Emits the init segment it kept, then lets every later append through.
-  window.__snatchArm = function (msId) {
+  // The reader chose to capture a stream in this frame. Emits the init
+  // segment it kept, then lets every later append through. Answered on the
+  // wire either way, so the other side can tell a capture that started from
+  // one that found nothing to start.
+  function arm(msId) {
     var source = sources.get(msId);
-    if (!source || source.armed) {
+    if (!source) {
+      post({ t: "armed", ms: msId, ok: false });
       return false;
     }
+    if (source.armed) {
+      return true;
+    }
     source.armed = true;
+    post({ t: "armed", ms: msId, ok: true });
     source.buffers.forEach(function (sbId) {
       var state = buffers.get(sbId);
       if (!state) {
@@ -280,7 +369,17 @@
       state.initBytes = 0;
     });
     return true;
-  };
+  }
+
+  // The capture was saved or thrown away: stop encoding and shipping every
+  // append, which costs the player's thread tens of milliseconds a segment
+  // for nothing once nobody is listening.
+  function disarm(msId) {
+    var source = sources.get(msId);
+    if (source) {
+      source.armed = false;
+    }
+  }
 
   post({ t: "ready" });
 })();

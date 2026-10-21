@@ -408,6 +408,210 @@ fn source_for(tool: Tool) -> Result<Source> {
     })
 }
 
+/// More than any release of yt-dlp or gallery-dl has ever been, by a wide
+/// margin; past it the body is being read into memory for nothing.
+const MAX_TOOL_BYTES: u64 = 256 << 20;
+
+/// How long a release download may take, all in.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A week, which is how often the tools are looked at when auto-update is on.
+pub const UPDATE_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The HTTP client the installer uses: through the proxy table, so a machine
+/// that reaches the web only through a proxy can still fetch a tool, with a
+/// timeout sized for a forty-megabyte binary rather than a probe.
+fn installer_client(proxies: &crate::network::ProxyManager) -> Result<wreq::Client> {
+    let proxy = proxies
+        .resolve_for("install", crate::network::Engine::Http)
+        .context("the tool download cannot use the configured proxy")?;
+    proxies.client_with_timeout(proxy.as_ref(), INSTALL_TIMEOUT)
+}
+
+/// The latest published release of a tool, as upstream names it.
+async fn latest_release(tool: Tool, http: &wreq::Client) -> Result<Release> {
+    let source = source_for(tool)?;
+    http.get(source.api)
+        .send()
+        .await
+        .with_context(|| format!("could not reach the {} release API", tool.title()))?
+        .error_for_status()
+        .with_context(|| format!("the {} release API returned an error", tool.title()))?
+        .json()
+        .await
+        .with_context(|| format!("could not parse the {} release metadata", tool.title()))
+}
+
+/// The numbers in a version, in order, so two can be compared.
+///
+/// yt-dlp uses dates (`2025.09.26`, sometimes `2025.09.26.1`), gallery-dl
+/// semantic versions with a `v` in front of the tag (`v1.30.9`) and none in
+/// front of what `--version` prints, and a development build adds `-dev`.
+/// Numbers compared field by field cover all of it; anything that is not a
+/// number is a separator.
+fn version_numbers(version: &str) -> Vec<u64> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// Whether `latest` is a newer version than `current`.
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let latest = version_numbers(latest);
+    let current = version_numbers(current);
+    if latest.is_empty() {
+        return false;
+    }
+    let width = latest.len().max(current.len());
+    let pad = |numbers: &[u64]| -> Vec<u64> {
+        let mut padded = numbers.to_vec();
+        padded.resize(width, 0);
+        padded
+    };
+    pad(&latest) > pad(&current)
+}
+
+/// What an update pass did for one tool.
+#[derive(Debug, Clone)]
+pub enum UpdateOutcome {
+    /// Already the latest, or upstream has nothing for this machine.
+    Current { tool: Tool, version: Option<String> },
+    /// A newer release was installed.
+    Updated {
+        tool: Tool,
+        from: Option<String>,
+        to: String,
+    },
+    /// Could not be checked or installed.
+    Failed { tool: Tool, error: String },
+}
+
+/// Bring every self-installable tool up to its latest release.
+///
+/// A tool is replaced whenever upstream has something newer than the copy
+/// in use -- a distribution package included, because the copy Snatch
+/// installs takes precedence on `PATH` and a months-old yt-dlp is the usual
+/// reason extraction stops working. Each tool is handled on its own, so one
+/// failing does not stop the others.
+pub async fn update_all(
+    managed_dir: &Path,
+    proxies: &crate::network::ProxyManager,
+) -> Vec<UpdateOutcome> {
+    let mut outcomes = Vec::new();
+    let http = match installer_client(proxies) {
+        Ok(http) => http,
+        Err(error) => {
+            for tool in Tool::ALL.into_iter().filter(|tool| tool.self_installable()) {
+                outcomes.push(UpdateOutcome::Failed {
+                    tool,
+                    error: format!("{error:#}"),
+                });
+            }
+            return outcomes;
+        }
+    };
+
+    for tool in Tool::ALL.into_iter().filter(|tool| tool.self_installable()) {
+        let current = match resolve(tool, managed_dir) {
+            Some(path) => probe_version(&path, tool).await,
+            None => None,
+        };
+        let latest = match latest_release(tool, &http).await {
+            Ok(release) => release.tag_name,
+            Err(error) => {
+                outcomes.push(UpdateOutcome::Failed {
+                    tool,
+                    error: format!("{error:#}"),
+                });
+                continue;
+            }
+        };
+        let wanted = match &current {
+            Some(version) => is_newer(&latest, version),
+            // Missing altogether: installing it is the update.
+            None => true,
+        };
+        if !wanted {
+            outcomes.push(UpdateOutcome::Current {
+                tool,
+                version: current,
+            });
+            continue;
+        }
+        log::info!(
+            "{}: {} is available (have {}); updating",
+            tool.title(),
+            latest,
+            current.as_deref().unwrap_or("nothing")
+        );
+        match install(tool, managed_dir, proxies, |_| {}).await {
+            Ok(_) => outcomes.push(UpdateOutcome::Updated {
+                tool,
+                from: current,
+                to: latest.trim_start_matches('v').to_owned(),
+            }),
+            Err(error) => outcomes.push(UpdateOutcome::Failed {
+                tool,
+                error: format!("{error:#}"),
+            }),
+        }
+    }
+    outcomes
+}
+
+/// Keep the self-installable tools current, once a week, for as long as
+/// Snatch runs.
+///
+/// The first look is a minute after launch, so a start-up is not slowed by
+/// two release lookups, and then every few hours the week is re-checked --
+/// the interval is measured from the last completed check, which is saved,
+/// so a machine that is only ever on for an hour at a time still gets its
+/// turn. The outcome reaches the window as a toast; a failure is only
+/// logged, because nagging about a release server once a week helps nobody.
+pub async fn keep_tools_current(
+    backend: crate::backend::Backend,
+    events: async_channel::Sender<crate::types::UiEvent>,
+) {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    loop {
+        let settings = backend.settings();
+        let now = crate::settings::now_unix();
+        if settings.tools.auto_update
+            && now.saturating_sub(settings.tools.last_update_check) >= UPDATE_INTERVAL_SECS
+        {
+            log::info!("weekly tool update: checking for newer releases");
+            let outcomes = update_all(&backend.managed_bin_dir, backend.proxies.as_ref()).await;
+            if let Err(error) =
+                backend.update_settings(|settings| settings.tools.last_update_check = now)
+            {
+                log::warn!("could not record the tool update check: {error:#}");
+            }
+            for outcome in outcomes {
+                match outcome {
+                    UpdateOutcome::Updated { tool, from, to } => {
+                        let notice = match from {
+                            Some(from) => format!("Updated {} from {from} to {to}", tool.title()),
+                            None => format!("Installed {} {to}", tool.title()),
+                        };
+                        let _ = events.send(crate::types::UiEvent::Notice(notice)).await;
+                    }
+                    UpdateOutcome::Current { tool, version } => log::info!(
+                        "{} is current ({})",
+                        tool.title(),
+                        version.unwrap_or_else(|| "not installed".to_owned())
+                    ),
+                    UpdateOutcome::Failed { tool, error } => {
+                        log::warn!("could not update {}: {error}", tool.title());
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+    }
+}
+
 /// Download, verify and install one self-installable tool.
 ///
 /// The checksum is checked **before** the file is made executable, and the
@@ -416,28 +620,14 @@ fn source_for(tool: Tool) -> Result<Source> {
 pub async fn install(
     tool: Tool,
     managed_dir: &Path,
+    proxies: &crate::network::ProxyManager,
     report: impl Fn(InstallProgress),
 ) -> Result<PathBuf> {
     let source = source_for(tool)?;
     report(InstallProgress::Resolving);
 
-    let http = wreq::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(15))
-        .user_agent(concat!("Snatch/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("could not build the HTTP client")?;
-
-    let release: Release = http
-        .get(source.api)
-        .send()
-        .await
-        .with_context(|| format!("could not reach the {} release API", tool.title()))?
-        .error_for_status()
-        .with_context(|| format!("the {} release API returned an error", tool.title()))?
-        .json()
-        .await
-        .with_context(|| format!("could not parse the {} release metadata", tool.title()))?;
+    let http = installer_client(proxies)?;
+    let release = latest_release(tool, &http).await?;
 
     let find = |name: &str| -> Option<&ReleaseAsset> {
         release.assets.iter().find(|asset| asset.name == name)
@@ -491,12 +681,29 @@ pub async fn install(
         .context("the download returned an error")?;
 
     let total = response.content_length();
-    let mut body = Vec::with_capacity(total.unwrap_or(8 << 20) as usize);
+    if total.is_some_and(|total| total > MAX_TOOL_BYTES) {
+        bail!(
+            "{} is {} bytes, which is far larger than any release of it",
+            binary_asset.name,
+            total.unwrap_or_default()
+        );
+    }
+    // The announced length decides the first allocation but is capped: it
+    // is a header from the network, and reserving whatever it says in one
+    // go is how a bad answer takes the whole process down.
+    let mut body = Vec::with_capacity(total.unwrap_or(8 << 20).min(64 << 20) as usize);
     report(InstallProgress::Downloading { received: 0, total });
 
     let mut stream = std::pin::pin!(response.bytes_stream());
     while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
         let chunk = chunk.context("the download was interrupted")?;
+        if body.len() as u64 + chunk.len() as u64 > MAX_TOOL_BYTES {
+            bail!(
+                "{} grew past {} bytes; giving up",
+                binary_asset.name,
+                MAX_TOOL_BYTES
+            );
+        }
         body.extend_from_slice(&chunk);
         report(InstallProgress::Downloading {
             received: body.len() as u64,
@@ -549,7 +756,9 @@ fn set_executable(path: &Path) -> Result<()> {
 fn expected_digest(manifest: &str, asset: &str) -> Option<String> {
     for line in manifest.lines() {
         let mut parts = line.split_whitespace();
-        let digest = parts.next()?;
+        // A blank line is skipped, not the end of the search: `?` here made
+        // one empty line above the entry hide every digest below it.
+        let Some(digest) = parts.next() else { continue };
         let Some(name) = parts.next() else { continue };
         let name = name.trim_start_matches('*');
         if name == asset && digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -742,5 +951,48 @@ cccc222222222222222222222222222222222222222222222222222222222222  yt-dlp_linux_a
         for tool in [Tool::Ffmpeg, Tool::YtDlp, Tool::GalleryDl] {
             assert!(!tool.required(), "{} should be optional", tool.title());
         }
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn a_blank_line_does_not_hide_the_digest_below_it() {
+        let digest = "a".repeat(64);
+        let manifest = format!("\n\n{digest}  yt-dlp_linux\n");
+        assert_eq!(expected_digest(&manifest, "yt-dlp_linux"), Some(digest));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn newer_releases_are_recognised_in_both_version_styles() {
+        // yt-dlp dates, with and without a point release.
+        assert!(is_newer("2025.09.26", "2025.09.05"));
+        assert!(is_newer("2025.09.26.1", "2025.09.26"));
+        assert!(!is_newer("2025.09.26", "2025.09.26"));
+        assert!(!is_newer("2025.09.05", "2025.09.26"));
+        // gallery-dl tags carry a `v`; `--version` does not, and a
+        // development build has a suffix.
+        assert!(is_newer("v1.30.9", "1.30.8"));
+        assert!(!is_newer("v1.30.9", "1.30.9"));
+        assert!(is_newer("v1.31.0", "1.30.9-dev"));
+        assert!(!is_newer("v1.30.9", "1.31.0-dev"));
+        // Nothing to compare against is never "newer".
+        assert!(!is_newer("", "1.0.0"));
+        assert!(!is_newer("latest", "1.0.0"));
+    }
+
+    #[test]
+    fn version_numbers_ignore_everything_but_the_numbers() {
+        assert_eq!(version_numbers("v1.30.9"), vec![1, 30, 9]);
+        assert_eq!(version_numbers("2025.09.26.1"), vec![2025, 9, 26, 1]);
+        assert_eq!(version_numbers("1.31.0-dev"), vec![1, 31, 0]);
+        assert!(version_numbers("latest").is_empty());
     }
 }

@@ -283,7 +283,14 @@ where
 {
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(url) = line.trim().strip_prefix("Enqueue ") {
+        // "Enqueue <url>" up to Wget2 2.2, "Enqueuing <url>" from 2.3: the
+        // wording changed and every preview came back with only the start
+        // page in it.
+        let trimmed = line.trim();
+        if let Some(url) = trimmed
+            .strip_prefix("Enqueuing ")
+            .or_else(|| trimmed.strip_prefix("Enqueue "))
+        {
             let mut held = collected
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
@@ -314,7 +321,8 @@ where
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
-        if line.starts_with("Enqueue ") {
+        // "Enqueue" up to Wget2 2.2, "Enqueuing" from 2.3.
+        if line.starts_with("Enqueue ") || line.starts_with("Enqueuing ") {
             progress.discovered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -479,10 +487,14 @@ impl MirrorEngine {
         let _ = events.send(MirrorEvent::Started { job_id, host }).await;
 
         let mut command = Command::new(crate::wget::wget_binary());
+        // Run inside the root rather than naming it with `--directory-prefix`:
+        // Wget2 2.3 joins an absolute prefix onto itself and writes the tree
+        // under `<root>/<root>/<host>/`, where nothing would find it. Both
+        // wgets write `<host>/...` below the working directory when no
+        // prefix is given.
         command
+            .current_dir(&self.root)
             .args(config.common_args())
-            .arg("--directory-prefix")
-            .arg(&self.root)
             .arg("--user-agent")
             .arg(&settings.download.user_agent)
             .arg("--tries")
@@ -569,8 +581,10 @@ fn spawn(mut command: Command) -> Result<tokio::process::Child> {
 
 /// wget reads proxies from the environment, so this is how one is applied.
 fn apply_proxy(command: &mut Command, proxies: &ProxyManager, key: &str) -> Result<()> {
+    // wget speaks HTTP proxies only; `Engine::Wget` refuses a SOCKS one up
+    // front instead of exporting it and failing on the first connection.
     let proxy = proxies
-        .resolve_for(key, Engine::Http)
+        .resolve_for(key, Engine::Wget)
         .context("the crawl cannot use the configured proxy")?;
     if let Some(proxy) = proxy {
         command.env("http_proxy", proxy.url());

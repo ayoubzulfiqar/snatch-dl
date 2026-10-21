@@ -169,6 +169,11 @@ impl ScraperPage {
                     row.note_warning(&message);
                 }
             }
+            GalleryEvent::FileFailed { batch_id, message } => {
+                if let Some(row) = self.rows.borrow().get(&batch_id) {
+                    row.note_failure(&message);
+                }
+            }
             GalleryEvent::Finished {
                 batch_id,
                 state,
@@ -372,7 +377,14 @@ impl BatchRow {
         }
     }
 
+    /// A retry or a grumble: shown, but not counted against the batch.
     fn note_warning(&self, message: &str) {
+        self.root.set_subtitle(&glib::markup_escape_text(message));
+        self.render();
+    }
+
+    /// One file gallery-dl gave up on.
+    fn note_failure(&self, message: &str) {
         self.counters.borrow_mut().failed += 1;
         self.root.set_subtitle(&glib::markup_escape_text(message));
         self.render();
@@ -432,8 +444,16 @@ fn thumbnail(path: &Path) -> gtk::Widget {
         .build();
 
     // Loading is best effort: a partially written file simply shows nothing.
-    match gdk::Texture::from_filename(path) {
-        Ok(texture) => picture.set_paintable(Some(&texture)),
+    //
+    // Decoded at thumbnail size, not at the photo's: `Texture::from_filename`
+    // kept every 12-megapixel scrape result in memory as 48 MB of pixels to
+    // show 96 of them across, and a page of restored batches held a gigabyte
+    // of thumbnails. The loader scales JPEG and PNG while decoding, so this
+    // is quicker as well as smaller.
+    let scaled =
+        gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, THUMBNAIL_PX * 2, THUMBNAIL_PX * 2, true);
+    match scaled {
+        Ok(pixbuf) => picture.set_paintable(Some(&gdk::Texture::for_pixbuf(&pixbuf))),
         Err(error) => log::debug!("no thumbnail for {}: {error}", path.display()),
     }
 

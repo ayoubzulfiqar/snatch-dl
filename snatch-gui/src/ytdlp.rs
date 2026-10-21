@@ -140,7 +140,15 @@ const JS_RUNTIMES: [&str; 4] = ["deno", "node", "quickjs", "bun"];
 ///
 /// Naming every engine that is actually here costs nothing and asks the user
 /// to install nothing. yt-dlp picks its favourite from the ones it is given.
-fn apply_js_runtime(command: &mut Command) {
+fn apply_js_runtime(command: &mut Command, binary: &str) {
+    // The flag arrived with yt-dlp's 2025 runtime rework. A distribution's
+    // older build rejects it outright -- "no such option" and exit 2 -- so
+    // every probe and every download failed, with a message that said
+    // nothing about why, on exactly the machines least likely to have a
+    // current yt-dlp. Asked once per binary and remembered.
+    if !supports_js_runtimes(binary) {
+        return;
+    }
     for runtime in JS_RUNTIMES {
         if let Some(path) = crate::deps::which(runtime) {
             // With the path attached, a runtime outside PATH -- a `bun` under
@@ -153,6 +161,50 @@ fn apply_js_runtime(command: &mut Command) {
             };
         }
     }
+}
+
+/// End a yt-dlp and everything it started, by their shared process group.
+///
+/// TERM first, so yt-dlp and its ffmpeg close what they were writing; the
+/// task abort that follows sends yt-dlp itself a KILL regardless.
+fn kill_group(pid: u32) {
+    let Ok(group) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `killpg` only sends a signal; the group is one this process
+    // created with `process_group(0)`, so it is ours to signal.
+    let failed = unsafe { libc::killpg(group, libc::SIGTERM) } != 0;
+    if failed {
+        log::debug!(
+            "could not signal process group {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Whether this yt-dlp knows `--js-runtimes`, read off its own help text.
+fn supports_js_runtimes(binary: &str) -> bool {
+    static KNOWN: std::sync::OnceLock<Mutex<HashMap<String, bool>>> = std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(answer) = known
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(binary)
+    {
+        return *answer;
+    }
+    let answer = std::process::Command::new(binary)
+        .args(["--ignore-config", "--help"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("--js-runtimes"))
+        .unwrap_or(false);
+    known
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(binary.to_owned(), answer);
+    answer
 }
 
 /// A header value safe to put in an argument. These arrive from a web page.
@@ -412,6 +464,13 @@ fn parse_line(line: &str) -> Line {
 pub struct VideoEngine {
     db: Database,
     jobs: Mutex<HashMap<i64, JoinHandle<()>>>,
+    /// The process group of each running yt-dlp, which is its own pid.
+    ///
+    /// Killing yt-dlp alone leaves the ffmpeg it drives for an HLS download
+    /// or a merge, and the JavaScript runtime it drives for YouTube, running
+    /// on as orphans -- for a live stream, without end. The group takes them
+    /// all together.
+    groups: Mutex<HashMap<i64, u32>>,
     /// The way to reach a running recording, one per stream job.
     ///
     /// Aborting the task kills ffmpeg mid-write. A live recording ends by
@@ -426,6 +485,7 @@ impl VideoEngine {
         Arc::new(Self {
             db,
             jobs: Mutex::new(HashMap::new()),
+            groups: Mutex::new(HashMap::new()),
             controls: Mutex::new(HashMap::new()),
         })
     }
@@ -497,10 +557,19 @@ impl VideoEngine {
         // the recording is ending either way, and the task abort below is what
         // makes this the abrupt version.
         self.controls().remove(&job_id);
+        if let Some(group) = self.groups().remove(&job_id) {
+            kill_group(group);
+        }
         if let Some(task) = self.jobs().remove(&job_id) {
             task.abort();
             log::info!("cancelled video job {job_id}");
         }
+    }
+
+    fn groups(&self) -> std::sync::MutexGuard<'_, HashMap<i64, u32>> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Queue an extraction and return its database id immediately.
@@ -718,8 +787,13 @@ impl VideoEngine {
             // Never read the user's config: Snatch's behaviour must be its own.
             .arg("--ignore-config")
             .arg("--no-simulate")
+            // The folder goes through `-P`, which is not a template: inside
+            // `-o` a `%` in the folder's name was read as a field and every
+            // extraction failed with "Invalid output template".
+            .arg("-P")
+            .arg(&config.destination)
             .arg("-o")
-            .arg(config.destination.join("%(title)s [%(id)s].%(ext)s"));
+            .arg("%(title)s [%(id)s].%(ext)s");
 
         // An exact selector wins: the user picked that resolution by name, so
         // a quality band must not quietly widen it back out.
@@ -759,7 +833,7 @@ impl VideoEngine {
             "--no-playlist"
         });
         apply_headers(&mut command, &config.headers);
-        apply_js_runtime(&mut command);
+        apply_js_runtime(&mut command, &binary);
         apply_resilience(&mut command);
 
         let task_key = format!("video:{job_id}");
@@ -777,6 +851,8 @@ impl VideoEngine {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Its own group, so a cancel can reach the helpers it spawns.
+            .process_group(0)
             .kill_on_drop(true);
 
         let mut child = match command.spawn() {
@@ -786,6 +862,9 @@ impl VideoEngine {
             }
             Err(error) => return Err(error).context("could not start yt-dlp"),
         };
+        if let Some(pid) = child.id() {
+            self.groups().insert(job_id, pid);
+        }
 
         let stdout = child.stdout.take().context("yt-dlp produced no stdout")?;
         let stderr = child.stderr.take().context("yt-dlp produced no stderr")?;
@@ -823,6 +902,7 @@ impl VideoEngine {
             .wait()
             .await
             .context("could not wait for yt-dlp to exit")?;
+        self.groups().remove(&job_id);
 
         if !status.success() {
             let code = status
@@ -1028,8 +1108,11 @@ struct RawFormat {
     format_note: Option<String>,
     #[serde(default)]
     protocol: Option<String>,
+    /// `true`, `false`, or the string `"maybe"` for a manifest whose key
+    /// signalling is ambiguous. Read as JSON rather than as a bool, because
+    /// a bool failed the whole listing on the first `"maybe"`.
     #[serde(default)]
-    has_drm: Option<bool>,
+    has_drm: Option<serde_json::Value>,
     /// The address of this exact rendition. For HLS that is a playlist ffmpeg
     /// can read on its own; for DASH it is a segment template that it cannot.
     #[serde(default)]
@@ -1166,7 +1249,7 @@ impl RawFormat {
 
     fn is_usable(&self) -> bool {
         self.format_id.is_some()
-            && self.has_drm != Some(true)
+            && self.has_drm.as_ref().and_then(serde_json::Value::as_bool) != Some(true)
             && !self.is_storyboard()
             && (self.has_video() || self.has_audio())
     }
@@ -1343,9 +1426,10 @@ fn distil(info: &RawInfo) -> MediaProbe {
             (video_size, video_estimated)
         } else {
             match (video_size, audio_size) {
-                (Some(video), Some(audio)) => {
-                    (Some(video + audio), video_estimated || audio_estimated)
-                }
+                (Some(video), Some(audio)) => (
+                    Some(video.saturating_add(audio)),
+                    video_estimated || audio_estimated,
+                ),
                 (video, _) => (video, video_estimated),
             }
         };
@@ -1450,6 +1534,37 @@ pub async fn probe(
     headers: &crate::stream::Headers,
     proxies: &ProxyManager,
 ) -> Result<MediaProbe> {
+    let proxy = proxies
+        .resolve_for("video-probe", Engine::Subprocess)
+        .context("the format probe cannot use the configured proxy")?;
+    let output = dump_single_json(
+        url,
+        headers,
+        proxy.as_ref().map(|proxy| proxy.url()).as_deref(),
+    )
+    .await?;
+    let info: RawInfo = serde_json::from_slice(&output)
+        .context("yt-dlp printed something that was not a format listing")?;
+    let probe = distil(&info);
+    if probe.formats.is_empty() {
+        bail!("yt-dlp found nothing downloadable on that page");
+    }
+    Ok(probe)
+}
+
+/// Ask yt-dlp to describe a page as JSON, the way the format probe does.
+///
+/// One invocation for every caller that wants yt-dlp's reading of a page:
+/// the same JavaScript runtime, the same headers, retries and proxy, the
+/// same timeout and the same error wording. The media sniffer used to run
+/// its own bare `yt-dlp --dump-single-json`, with none of that -- which on
+/// YouTube, where a JavaScript runtime is needed, failed every time and was
+/// reported as "yt-dlp does not recognise this page".
+pub async fn dump_single_json(
+    url: &str,
+    headers: &crate::stream::Headers,
+    proxy_url: Option<&str>,
+) -> Result<Vec<u8>> {
     let url = url.trim();
     validate_url(url)?;
 
@@ -1463,7 +1578,7 @@ pub async fn probe(
         .arg("--no-colors")
         .arg("--no-progress");
     apply_headers(&mut command, headers);
-    apply_js_runtime(&mut command);
+    apply_js_runtime(&mut command, &binary);
     // Lighter than a download's: someone is watching a spinner, and the whole
     // probe is abandoned at PROBE_TIMEOUT regardless.
     command
@@ -1476,11 +1591,8 @@ pub async fn probe(
         .arg("--retry-sleep")
         .arg("linear=1::2");
 
-    if let Some(proxy) = proxies
-        .resolve_for("video-probe", Engine::Subprocess)
-        .context("the format probe cannot use the configured proxy")?
-    {
-        command.arg("--proxy").arg(proxy.url());
+    if let Some(proxy) = proxy_url {
+        command.arg("--proxy").arg(proxy);
     }
 
     command
@@ -1510,11 +1622,15 @@ pub async fn probe(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // The last `ERROR:` line, or failing that the last line of anything:
+        // a rejected option is reported by the option parser without the
+        // prefix, and "could not read that page" hid what it said.
         let reason = stderr
             .lines()
             .filter_map(|line| line.trim().strip_prefix("ERROR:"))
             .next_back()
-            .map(str::trim);
+            .map(str::trim)
+            .or_else(|| stderr.lines().map(str::trim).rfind(|line| !line.is_empty()));
         match reason {
             Some(reason) => bail!("yt-dlp could not read that page: {reason}"),
             None => bail!("yt-dlp could not read that page"),
@@ -1523,14 +1639,7 @@ pub async fn probe(
     if output.stdout.len() > MAX_PROBE_BYTES {
         bail!("yt-dlp returned an unreasonably large listing");
     }
-
-    let info: RawInfo = serde_json::from_slice(&output.stdout)
-        .context("yt-dlp printed something that was not a format listing")?;
-    let probe = distil(&info);
-    if probe.formats.is_empty() {
-        bail!("yt-dlp found nothing downloadable on that page");
-    }
-    Ok(probe)
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -1548,8 +1657,12 @@ mod tests {
     /// With `--js-runtimes node` the warning and the fallback both go away.
     #[test]
     fn every_javascript_engine_on_the_machine_is_offered_to_yt_dlp() {
+        if !supports_js_runtimes("yt-dlp") {
+            eprintln!("skipping: this yt-dlp has no --js-runtimes");
+            return;
+        }
         let mut command = Command::new("yt-dlp");
-        apply_js_runtime(&mut command);
+        apply_js_runtime(&mut command, "yt-dlp");
         let args: Vec<String> = command
             .as_std()
             .get_args()

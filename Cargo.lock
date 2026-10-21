@@ -3847,6 +3847,7 @@ dependencies = [
  "futures",
  "gtk4",
  "libadwaita",
+ "libc",
  "librqbit",
  "log",
  "regex",

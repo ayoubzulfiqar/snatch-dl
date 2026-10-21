@@ -86,6 +86,69 @@ const SINGLE: [(&str, Format); 8] = [
     (".zip", Format::Zip),
 ];
 
+/// The first volume of the set a later volume belongs to.
+///
+/// `extract_if_archive` is called once per finished file, and `identify`
+/// describes a set only from its first volume. So a set whose first part did
+/// not happen to finish last -- which is nearly every set, since the first
+/// part is queued first -- was never unpacked: the later parts' completions
+/// each looked at themselves, found "not the entry point", and did nothing.
+/// Mapping each part back to the entry point lets every completion re-check
+/// the whole set.
+pub fn entry_point(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_ascii_lowercase();
+    let parent = path.parent().unwrap_or(Path::new("."));
+
+    // `archive.7z.002` -> `archive.7z.001`, keeping the digit width.
+    if let Some((base, number)) = lower.rsplit_once('.')
+        && number.len() >= 2
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && SINGLE.iter().any(|(suffix, _)| base.ends_with(suffix))
+    {
+        let prefix = &name[..name.len() - number.len()];
+        let first = format!("{prefix}{:0width$}", 1, width = number.len());
+        return Some(parent.join(first));
+    }
+
+    // `archive.part2.rar` -> `archive.part1.rar`.
+    if let Some(base) = lower.strip_suffix(".rar")
+        && let Some((_, part)) = base.rsplit_once(".part")
+        && !part.is_empty()
+        && part.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        let stem_len = name.len() - ".rar".len() - part.len();
+        let first = format!("{}{:0width$}.rar", &name[..stem_len], 1, width = part.len());
+        return Some(parent.join(first));
+    }
+
+    // `archive.r00` -> `archive.rar`.
+    if let Some((stem, rest)) = lower.rsplit_once(".r")
+        && rest.len() == 2
+        && rest.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Some(parent.join(format!("{}.rar", &name[..stem.len()])));
+    }
+
+    None
+}
+
+/// Whether every volume of the set is on disk and finished.
+///
+/// aria2 keeps a `<file>.aria2` control file beside anything it is still
+/// writing, and with `--file-allocation=falloc` the file itself exists at
+/// full size from the first byte. Looking at the files alone would see a
+/// complete set of zero-filled volumes and hand 7z a data error.
+pub fn volumes_ready(archive: &Archive) -> bool {
+    archive.parts.iter().all(|part| {
+        part.is_file() && {
+            let mut control = part.as_os_str().to_owned();
+            control.push(".aria2");
+            !Path::new(&control).exists()
+        }
+    })
+}
+
 /// Recognise an archive, and gather its sibling volumes if it has any.
 ///
 /// Returns `None` for anything that is not an archive, and for a volume that
@@ -931,5 +994,61 @@ mod tests {
         assert_eq!(parse_percent("no percentage here"), None);
         // Not a percentage of anything sane.
         assert_eq!(parse_percent("999%"), None);
+    }
+}
+
+#[cfg(test)]
+mod volume_set_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("snatch-volumes-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// The bug: only the first volume described the set, and the first
+    /// volume is queued first, so it almost never finished last.
+    #[test]
+    fn a_later_volume_points_back_at_the_first() {
+        let dir = Path::new("/d");
+        assert_eq!(
+            entry_point(&dir.join("big.7z.003")),
+            Some(dir.join("big.7z.001"))
+        );
+        assert_eq!(
+            entry_point(&dir.join("film.part12.rar")),
+            Some(dir.join("film.part01.rar"))
+        );
+        assert_eq!(
+            entry_point(&dir.join("film.r05")),
+            Some(dir.join("film.rar"))
+        );
+        // A plain archive is its own entry point, and a plain file is nothing.
+        assert_eq!(entry_point(&dir.join("album.zip")), None);
+        assert_eq!(entry_point(&dir.join("notes.txt")), None);
+    }
+
+    #[test]
+    fn a_set_is_ready_only_once_every_volume_has_finished() {
+        let dir = scratch("ready");
+        for part in ["big.7z.001", "big.7z.002", "big.7z.003"] {
+            std::fs::write(dir.join(part), b"x").expect("write");
+        }
+        let archive = identify(&dir.join("big.7z.001")).expect("a volume set");
+        assert_eq!(archive.parts.len(), 3);
+        assert!(volumes_ready(&archive));
+
+        // aria2 keeps a control file beside a volume it is still writing,
+        // while the volume itself already exists at full size.
+        std::fs::write(dir.join("big.7z.002.aria2"), b"").expect("write");
+        assert!(
+            !volumes_ready(&archive),
+            "a volume still downloading is not ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

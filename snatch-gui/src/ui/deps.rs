@@ -20,12 +20,18 @@ use gtk::{gdk, glib};
 
 /// Show the dialog and survey the system.
 pub fn present(ui: &Rc<Ui>) {
+    let update = gtk::Button::builder()
+        .label("Check for updates")
+        .tooltip_text("Fetch a newer yt-dlp or gallery-dl if there is one")
+        .valign(gtk::Align::Center)
+        .build();
     let group = adw::PreferencesGroup::builder()
         .title("External Tools")
         .description(
             "Snatch drives these programs. Torrents need none of them — \
              the BitTorrent engine is built in.",
         )
+        .header_suffix(&update)
         .build();
 
     let page = adw::PreferencesPage::builder()
@@ -43,7 +49,76 @@ pub fn present(ui: &Rc<Ui>) {
 
     let rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     refresh(ui, &group, &rows);
+    update.connect_clicked({
+        let ui = Rc::downgrade(ui);
+        let group = group.clone();
+        let rows = Rc::clone(&rows);
+        move |button| {
+            let Some(ui) = ui.upgrade() else { return };
+            let group = group.clone();
+            let rows = Rc::clone(&rows);
+            let weak = Rc::downgrade(&ui);
+            check_for_updates_then(&ui, button, move || {
+                if let Some(ui) = weak.upgrade() {
+                    refresh(&ui, &group, &rows);
+                }
+            });
+        }
+    });
     dialog.present(Some(ui.window()));
+}
+
+/// Look for newer releases of the self-installable tools, install them, and
+/// say what happened. The button is greyed out while it runs.
+pub fn check_for_updates(ui: &Rc<Ui>, button: &gtk::Button) {
+    check_for_updates_then(ui, button, || {});
+}
+
+fn check_for_updates_then(ui: &Rc<Ui>, button: &gtk::Button, then: impl FnOnce() + 'static) {
+    use crate::deps::UpdateOutcome;
+
+    button.set_sensitive(false);
+    let backend = ui.backend().clone();
+    let managed = backend.managed_bin_dir.clone();
+    let proxies = backend.proxies.clone();
+    let button = button.clone();
+    let weak = Rc::downgrade(ui);
+    glib::spawn_future_local(async move {
+        let outcomes = backend
+            .offload(async move { Ok(crate::deps::update_all(&managed, proxies.as_ref()).await) })
+            .await;
+        button.set_sensitive(true);
+        let Some(ui) = weak.upgrade() else { return };
+        let now = crate::settings::now_unix();
+        if let Err(error) =
+            backend.update_settings(|settings| settings.tools.last_update_check = now)
+        {
+            log::warn!("could not record the tool update check: {error:#}");
+        }
+        let outcomes = match outcomes {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                ui.toast(&format!("{error:#}"));
+                return;
+            }
+        };
+        let mut lines = Vec::new();
+        for outcome in outcomes {
+            lines.push(match outcome {
+                UpdateOutcome::Updated { tool, from, to } => match from {
+                    Some(from) => format!("{} {from} → {to}", tool.title()),
+                    None => format!("{} {to} installed", tool.title()),
+                },
+                UpdateOutcome::Current { tool, version } => match version {
+                    Some(version) => format!("{} {version} is current", tool.title()),
+                    None => format!("{} is not available for this machine", tool.title()),
+                },
+                UpdateOutcome::Failed { tool, error } => format!("{}: {error}", tool.title()),
+            });
+        }
+        ui.toast(&lines.join(" · "));
+        then();
+    });
 }
 
 /// Re-survey and rebuild the list.
@@ -179,6 +254,7 @@ fn install_button(
             let (tx, rx) = async_channel::unbounded::<InstallProgress>();
             let backend = ui.backend().clone();
             let managed = backend.managed_bin_dir.clone();
+            let proxies = backend.proxies.clone();
 
             glib::spawn_future_local({
                 let progress = progress.clone();
@@ -232,7 +308,7 @@ fn install_button(
             glib::spawn_future_local(async move {
                 let outcome = backend
                     .offload(async move {
-                        crate::deps::install(tool, &managed, move |update| {
+                        crate::deps::install(tool, &managed, proxies.as_ref(), move |update| {
                             // An unbounded send only fails once the UI is gone.
                             let _ = tx.send_blocking(update);
                         })
