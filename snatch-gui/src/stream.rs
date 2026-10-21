@@ -1982,8 +1982,24 @@ mod tests {
         };
 
         let hls = args("https://c.example/live/master.m3u8?token=abc");
-        assert!(hls.windows(2).any(|pair| pair == ["-extension_picky", "0"]));
-        assert!(hls.windows(2).any(|pair| pair == ["-seg_max_retry", "10"]));
+        // Every ffmpeg since 3.4 has this one.
+        assert!(
+            hls.windows(2)
+                .any(|pair| pair == ["-allowed_extensions", "ALL"])
+        );
+        // The newer two are passed exactly when the ffmpeg at hand lists
+        // them -- and never otherwise, because an unknown option fails the
+        // whole command. On a machine with no ffmpeg at all (the Arch
+        // package builds in a bare container) neither is passed.
+        let known = hls_options();
+        assert_eq!(
+            hls.windows(2).any(|pair| pair == ["-extension_picky", "0"]),
+            known.extension_picky
+        );
+        assert_eq!(
+            hls.windows(2).any(|pair| pair == ["-seg_max_retry", "10"]),
+            known.seg_max_retry
+        );
 
         for other in [
             "https://c.example/film.mp4",
