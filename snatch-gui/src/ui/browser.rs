@@ -204,18 +204,21 @@ struct BackgroundView {
 /// its time collecting instead of rendering.
 fn browser_context() -> webkit6::WebContext {
     let mut memory = webkit6::MemoryPressureSettings::new();
-    // Per content process, in MB. Generous: most pages sit far below it, and
-    // it exists to catch the one that runs away.
-    memory.set_memory_limit(3072);
+    // Per content process, in MB. Every tab is its own process, so this is
+    // what one runaway page may take before it is stopped -- and three
+    // gigabytes, the previous figure, was more than the machine had to spare
+    // once two such pages and the desktop were counted: the kernel swapped
+    // the whole session out before WebKit ever reached its own ceiling.
+    memory.set_memory_limit(1280);
     // The three thresholds must stay in ascending order, and each setter
     // checks the value against the neighbours already stored -- so they are
     // set highest first, or the defaults reject the ones below them. Kill the
     // content process past the ceiling before it can take the machine with
     // it; that kill is a crash `watch_crashes` catches and reloads from.
-    memory.set_kill_threshold(0.85);
-    memory.set_strict_threshold(0.65);
-    memory.set_conservative_threshold(0.5);
-    memory.set_poll_interval(30.0);
+    memory.set_kill_threshold(0.8);
+    memory.set_strict_threshold(0.6);
+    memory.set_conservative_threshold(0.4);
+    memory.set_poll_interval(10.0);
     webkit6::WebContext::builder()
         .memory_pressure_settings(&memory)
         .build()
@@ -369,8 +372,24 @@ impl BrowserPage {
 
         let weak = Rc::downgrade(self);
         let mse = Rc::clone(mse);
+        // How many messages the hook sends, logged now and then, so a page
+        // that floods the window can be seen to do so.
+        let rate = Rc::new(Cell::new((0u32, std::time::Instant::now())));
         content.connect_script_message_received(Some("snatchMse"), move |_cm, value| {
             let Some(page) = weak.upgrade() else { return };
+            {
+                let (count, since) = rate.get();
+                let count = count + 1;
+                if since.elapsed() >= std::time::Duration::from_secs(10) {
+                    log::debug!(
+                        "browse: {count} capture messages in {}s",
+                        since.elapsed().as_secs()
+                    );
+                    rate.set((0, std::time::Instant::now()));
+                } else {
+                    rate.set((count, since));
+                }
+            }
             let update = mse.borrow_mut().handle(&value.to_str());
             if let super::mse::Update::Present { ms, bytes: 0 } = update {
                 log::info!("browse: in-page video detected (ms {ms})");
@@ -404,9 +423,15 @@ impl BrowserPage {
             {
                 ui.downloads.capture_progress(id, bytes);
             }
-            // A stream appearing or growing may change the counter, but only
-            // for the tab on show -- a background tab must not repaint it.
-            if let super::mse::Update::Present { .. } | super::mse::Update::Ended { .. } = update
+            // A stream appearing or ending changes the counter; one merely
+            // growing does not, and growth arrives many times a second from
+            // every player on the page. Repainting the toolbar on each was
+            // most of what the window was doing on a feed.
+            let counter_changed = matches!(
+                update,
+                super::mse::Update::Present { bytes: 0, .. } | super::mse::Update::Ended { .. }
+            );
+            if counter_changed
                 && page
                     .current_capture()
                     .is_some_and(|current| Rc::ptr_eq(&current, &mse))
@@ -806,6 +831,15 @@ impl BrowserPage {
         // never as a stray window.
         if let Some(settings) = WebViewExt::settings(&view) {
             settings.set_javascript_can_open_windows_automatically(true);
+            // Nothing plays until the reader asks it to. A feed of clips
+            // that all start on their own is two dozen decoders and two
+            // dozen streams at once, which is what took the laptop down --
+            // and the capture is for what the reader is watching, which is
+            // the one they clicked.
+            settings.set_media_playback_requires_user_gesture(true);
+            // No back/forward cache: a page kept alive behind the one on
+            // show is a second copy of everything it allocated.
+            settings.set_enable_page_cache(false);
         }
 
         let hits: Rc<RefCell<Vec<Hit>>> = Rc::new(RefCell::new(Vec::new()));
@@ -903,6 +937,11 @@ impl BrowserPage {
     ) {
         // Crashes in a row with no successful load between them.
         let in_a_row: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        // Memory kills, which a clean load does not forgive: a page that
+        // loads fine and then grows to the ceiling would otherwise be
+        // reloaded forever, each time taking a gigabyte and a minute of CPU
+        // on its way back to the ceiling.
+        let memory_kills: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // A clean load means the page is healthy again; forget past crashes.
         {
@@ -918,14 +957,19 @@ impl BrowserPage {
         let hits = Rc::clone(hits);
         let mse = Rc::clone(mse);
         let tab = tab.downgrade();
+        let memory_kills = Rc::clone(&memory_kills);
         view.connect_web_process_terminated(move |view, reason| {
             let Some(tab) = tab.upgrade() else { return };
             let watched = view.clone();
+            let out_of_memory = reason == webkit6::WebProcessTerminationReason::ExceededMemoryLimit;
             let why = match reason {
                 webkit6::WebProcessTerminationReason::ExceededMemoryLimit => "ran out of memory",
                 webkit6::WebProcessTerminationReason::Crashed => "crashed",
                 _ => "stopped",
             };
+            if out_of_memory {
+                memory_kills.set(memory_kills.get() + 1);
+            }
             // The page is gone; so is anything it had offered.
             hits.borrow_mut().clear();
             // Whatever a capture took before the crash is on disk already;
@@ -938,7 +982,21 @@ impl BrowserPage {
 
             let count = in_a_row.get() + 1;
             in_a_row.set(count);
-            if count > 3 {
+            if out_of_memory && memory_kills.get() >= 2 {
+                // Twice is a pattern, not an accident. The error page stays
+                // up; the reader can reload by hand, or not.
+                log::warn!(
+                    "browse: the page ran out of memory {} times; leaving it stopped",
+                    memory_kills.get()
+                );
+                tab.set_title("Page uses too much memory");
+                if let Some(ui) = page
+                    .as_ref()
+                    .and_then(|page| page.ui.borrow().as_ref().and_then(Weak::upgrade))
+                {
+                    ui.toast("That page keeps running out of memory, so it was stopped");
+                }
+            } else if count > 3 {
                 log::warn!("browse: the page {why} {count} times over; leaving the error page up");
                 tab.set_title("Page keeps crashing");
             } else {

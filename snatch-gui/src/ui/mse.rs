@@ -171,7 +171,37 @@ impl MseCapture {
         self.next_source += 1;
         self.source_ids.insert(key.clone(), local);
         self.remote_sources.insert(local, key);
+        self.forget_stale_sources();
         local
+    }
+
+    /// Keep the table of unarmed sources bounded.
+    ///
+    /// A feed makes a new MediaSource for every clip that scrolls into view
+    /// and never tells anyone when the old one is gone, so the table grew
+    /// by the hundred and the finds dialog listed every one of them. The
+    /// oldest unarmed ones go; an armed source is a capture and stays.
+    fn forget_stale_sources(&mut self) {
+        const MOST_SOURCES: usize = 24;
+        while self.sources.len() > MOST_SOURCES {
+            let Some(oldest) = self
+                .sources
+                .iter()
+                .find(|(_, source)| !source.armed)
+                .map(|(ms, _)| *ms)
+            else {
+                return;
+            };
+            if let Some(source) = self.sources.remove(&oldest) {
+                for sb in source.tracks {
+                    self.tracks.remove(&sb);
+                    self.track_ids.retain(|_, local| *local != sb);
+                }
+            }
+            if let Some(key) = self.remote_sources.remove(&oldest) {
+                self.source_ids.remove(&key);
+            }
+        }
     }
 
     /// The local id of a track the page named, minted on first sight.

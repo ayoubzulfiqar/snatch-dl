@@ -80,7 +80,33 @@
   // on exactly those sites. This caps the total the page can ever hold: the
   // oldest media anywhere is dropped once it is reached. Init segments are
   // kept apart and never counted, because media without one cannot be played.
-  var RING_BYTES = 32 * 1024 * 1024;
+  // Each frame runs its own copy of this hook with its own budget, so on a
+  // page of fifty embedded players the budgets added up to fifty rings --
+  // which is where the memory of a feed went. The page itself keeps a real
+  // lead-in; a frame keeps only a little, enough for the init segment and
+  // the last few seconds, which is what arming mid-stream needs.
+  var IS_TOP = (function () {
+    try {
+      return window === window.top;
+    } catch (error) {
+      return false;
+    }
+  })();
+  var RING_BYTES = IS_TOP ? 16 * 1024 * 1024 : 2 * 1024 * 1024;
+  // Past this many MediaSources the page is a feed -- a wall of autoplaying
+  // clips -- and holding every one's lead-in is pointless and expensive:
+  // each append was being copied so that arming later could begin from the
+  // start. On a feed the copies alone were a steady churn of tens of
+  // megabytes a second through the garbage collector. Beyond this many,
+  // nothing is held for an unarmed source; it is only counted.
+  var HOLD_SOURCES_MAX = IS_TOP ? 6 : 2;
+  // Init segments are kept outside the ring budget; this caps them page-wide.
+  var MAX_INIT_TOTAL = IS_TOP ? 8 * 1024 * 1024 : 1024 * 1024;
+  var initTotal = 0;
+  // How often an unarmed source reports its size. Every append reported
+  // before, which on a feed was hundreds of messages a second, each one
+  // repainting the window.
+  var GROW_INTERVAL_MS = 500;
   // Media chunks held for capture, page-wide: the SourceBuffer id of each, in
   // arrival order, so the globally-oldest can be found to evict.
   var heldOrder = [];
@@ -88,7 +114,7 @@
 
   // A hard ceiling on how many tracks are followed at once. A pathological
   // page cannot make the maps grow without end.
-  var MAX_TRACKS = 256;
+  var MAX_TRACKS = 64;
 
   // Drop the oldest media anywhere until the page is back under budget. The
   // init segment is never here, so it is never dropped.
@@ -177,6 +203,17 @@
     return btoa(binary);
   }
 
+  // How many bytes an append carries, without copying anything.
+  function byteLength(data) {
+    if (data instanceof ArrayBuffer) {
+      return data.byteLength;
+    }
+    if (ArrayBuffer.isView(data)) {
+      return data.byteLength;
+    }
+    return 0;
+  }
+
   // Whichever shape appendBuffer was handed, as bytes we own. Copied rather
   // than referenced: the caller is free to reuse or detach its buffer the
   // instant appendBuffer returns.
@@ -237,41 +274,100 @@
     if (!state) {
       return;
     }
-    var bytes = toBytes(data);
-    if (!bytes || bytes.length === 0) {
+    var length = byteLength(data);
+    if (length === 0) {
       return;
     }
-    state.total += bytes.length;
+    state.total += length;
     var source = sources.get(state.ms);
 
     // Armed: every append goes straight out.
     if (source && source.armed) {
-      post({ t: "data", sb: sbId, seq: state.seq++, b64: base64(bytes) });
+      var sent = toBytes(data);
+      if (sent) {
+        post({ t: "data", sb: sbId, seq: state.seq++, b64: base64(sent) });
+      }
+      return;
+    }
+    // Only a source that is being held for needs a copy of the bytes; on a
+    // feed, counting them is all that happens.
+    if (sources.size > HOLD_SOURCES_MAX) {
+      var tick = Date.now();
+      if (tick - state.lastGrow >= GROW_INTERVAL_MS) {
+        state.lastGrow = tick;
+        post({ t: "grow", ms: state.ms, sb: sbId, bytes: state.total });
+      }
+      return;
+    }
+    var bytes = toBytes(data);
+    if (!bytes || bytes.length === 0) {
       return;
     }
 
     // Not armed: hold it, so arming later still captures the lead-in. The
     // init segment is kept apart and never evicted -- media without it cannot
     // be decoded. Media joins the page-wide ring, and the oldest anywhere is
-    // dropped once the whole page is over budget.
-    if (isInit(bytes) && state.ring.length === 0) {
-      if (state.initBytes + bytes.length <= MAX_INIT_BYTES) {
-        state.init.push(bytes);
-        state.initBytes += bytes.length;
+    // dropped once the whole page is over budget. On a feed nothing is held
+    // at all: see HOLD_SOURCES_MAX.
+    if (sources.size <= HOLD_SOURCES_MAX) {
+      if (isInit(bytes) && state.ring.length === 0) {
+        if (state.initBytes + bytes.length <= MAX_INIT_BYTES && initTotal + bytes.length <= MAX_INIT_TOTAL) {
+          state.init.push(bytes);
+          state.initBytes += bytes.length;
+          initTotal += bytes.length;
+        }
+      } else {
+        state.ring.push(bytes);
+        state.held += bytes.length;
+        heldTotal += bytes.length;
+        heldOrder.push(sbId);
+        evict();
       }
-    } else {
-      state.ring.push(bytes);
-      state.held += bytes.length;
-      heldTotal += bytes.length;
-      heldOrder.push(sbId);
-      evict();
     }
-    post({ t: "grow", ms: state.ms, sb: sbId, bytes: state.initBytes + state.held });
+    // Reported at most twice a second per source; the count is for a
+    // dialog nobody reads at append rate.
+    var now = Date.now();
+    if (now - state.lastGrow >= GROW_INTERVAL_MS) {
+      state.lastGrow = now;
+      post({ t: "grow", ms: state.ms, sb: sbId, bytes: state.initBytes + state.held + (sources.size > HOLD_SOURCES_MAX ? state.total : 0) });
+    }
+  }
+
+  // Let go of what the page has let go of: a feed opens a MediaSource per
+  // clip and abandons it when the clip scrolls away, so the tables are
+  // trimmed to the newest few, oldest unarmed first. Anything held for an
+  // evicted track is given back to the page-wide budgets.
+  var MAX_SOURCES = 24;
+  function forgetOldest() {
+    while (sources.size > MAX_SOURCES) {
+      var victim = null;
+      sources.forEach(function (source, id) {
+        if (victim === null && !source.armed) {
+          victim = id;
+        }
+      });
+      if (victim === null) {
+        return;
+      }
+      sources.get(victim).buffers.forEach(function (sbId) {
+        var state = buffers.get(sbId);
+        if (state) {
+          heldTotal -= state.held;
+          initTotal -= state.initBytes;
+          buffers.delete(sbId);
+        }
+      });
+      heldOrder = heldOrder.filter(function (id) {
+        return buffers.has(id);
+      });
+      sources.delete(victim);
+    }
   }
 
   var addSourceBuffer = window.MediaSource.prototype.addSourceBuffer;
   window.MediaSource.prototype.addSourceBuffer = function (mime) {
     var sb = addSourceBuffer.apply(this, arguments);
+    forgetOldest();
     // A page cannot make us track without limit.
     if (buffers.size >= MAX_TRACKS) {
       return sb;
@@ -294,6 +390,7 @@
         held: 0,
         total: 0,
         seq: 0,
+        lastGrow: 0,
       });
       sources.get(this.__snatchId).buffers.push(sbId);
       post({ t: "track", ms: this.__snatchId, sb: sbId, mime: String(mime || "") });
@@ -358,8 +455,9 @@
       state.init.concat(state.ring).forEach(function (part) {
         post({ t: "data", sb: sbId, seq: state.seq++, b64: base64(part) });
       });
-      // Give the page-wide ring back what this track was holding.
+      // Give the page-wide budgets back what this track was holding.
       heldTotal -= state.held;
+      initTotal -= state.initBytes;
       heldOrder = heldOrder.filter(function (id) {
         return id !== sbId;
       });
