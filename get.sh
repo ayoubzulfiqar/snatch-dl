@@ -288,10 +288,12 @@ ${GREEN}${BOLD}Snatch ${VERSION} is installed.${RESET}
 ${BOLD}Add the browser extension${RESET}
 
   ${BOLD}Chrome, Chromium, Brave, Edge, Opera${RESET}
-    1. Open ${BOLD}chrome://extensions${RESET}
+    1. Open ${BOLD}chrome://extensions${RESET} (${BOLD}brave://extensions${RESET} in Brave)
     2. Turn on ${BOLD}Developer mode${RESET} (top right)
     3. Click ${BOLD}Load unpacked${RESET} and choose this folder:
        ${BOLD}/usr/share/snatch-dl/extension${RESET}
+       ${DIM}(that one, not extension-firefox: Chromium loads the Firefox build
+       but gives it no background, so it captures nothing)${RESET}
 
   ${BOLD}Firefox${RESET}
     1. Open ${BOLD}about:debugging#/runtime/this-firefox${RESET}

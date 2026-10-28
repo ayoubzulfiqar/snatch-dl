@@ -37,10 +37,12 @@ readonly ICONS_DIR="${DATA_HOME}/icons/hicolor"
 readonly CHROMIUM_EXT_DIR="${SOURCE_DIR}/extension"
 
 # Firefox is the one that has to be generated. The two browsers genuinely
-# disagree and no single manifest satisfies both: Manifest V3 in Chromium
-# accepts only `background.service_worker` and rejects `background.scripts`
-# outright, while Firefox has no service-worker background at all and runs an
-# event page declared with `background.scripts`.
+# disagree and no single manifest satisfies both: Manifest V3 in Chromium runs
+# only a `background.service_worker`, and a manifest carrying just
+# `background.scripts` loads there without a word of warning and without any
+# background at all (seen in Brave 1.98 on Chromium 156), while Firefox has no
+# service-worker background and runs an event page declared with
+# `background.scripts`.
 readonly FIREFOX_EXT_DIR="${SOURCE_DIR}/extension-firefox"
 
 # Where earlier versions of this script staged them.
@@ -413,6 +415,38 @@ register_hosts() {
   done
 }
 
+# A Chromium-based browser pointed at the Firefox build shows a healthy
+# "Snatch" card, runs no background for it, and captures nothing; pointed at a
+# directory an earlier version of this script staged and this one removes, it
+# shows a broken one. Every Chromium records the path of each unpacked
+# extension in its profile preferences, so both are cheap to spot, and the
+# first is the mistake the two side-by-side folders invite.
+warn_misloaded_extensions() {
+  local entry root prefs path browser profile
+  local roots=("${CONFIG_HOME}/google-chrome" "${CONFIG_HOME}/chromium")
+  for entry in "${CHROMIUM_OPTIONAL[@]}"; do
+    roots+=("${entry%%|*}")
+  done
+  for root in "${roots[@]}"; do
+    [ -d "${root}" ] || continue
+    browser="$(basename "${root}")"
+    for prefs in "${root}"/*/Preferences "${root}"/*/"Secure Preferences"; do
+      [ -f "${prefs}" ] || continue
+      profile="$(basename "$(dirname "${prefs}")")"
+      for path in "${FIREFOX_EXT_DIR}" "${LEGACY_EXT_DIRS[@]}"; do
+        # Chromium writes its preferences compactly; a hand-edited file may not be.
+        if grep -qF -e "\"path\":\"${path}\"" -e "\"path\": \"${path}\"" "${prefs}" 2>/dev/null; then
+          warn "${browser} (profile ${profile}) has ${path} loaded as an extension"
+          info "  That is not the Chromium build. The browser shows it as healthy but runs no"
+          info "  background for it, so it captures nothing. Remove it on the browser's"
+          info "  extensions page, then \"Load unpacked\" this folder instead:"
+          info "    ${CHROMIUM_EXT_DIR}"
+        fi
+      done
+    done
+  done
+}
+
 check_aria2() {
   if command -v aria2c >/dev/null 2>&1; then
     info "found $(aria2c --version 2>/dev/null | head -n1)"
@@ -687,6 +721,7 @@ main() {
 
   step "Registering the native messaging host"
   register_hosts "${chromium_id}"
+  warn_misloaded_extensions
 
   step "Installing the icon and desktop entry"
   install_icons
@@ -720,13 +755,17 @@ ${BOLD}Load the extension${RESET}
             or use Developer Edition with xpinstall.signatures.required=false
             to keep it permanently)${RESET}
 
-  Chromium  chrome://extensions
+  Chromium, Brave, Edge
+            chrome://extensions (brave://extensions in Brave)
             Enable "Developer mode", then "Load unpacked" and pick the
             ${BOLD}folder${RESET}
             ${CHROMIUM_EXT_DIR}
-            ${DIM}Pick the folder itself, not a file inside it. The id is
-            pinned to ${chromium_id} by the committed key, so the
-            native host keeps working across reloads.${RESET}
+            ${DIM}Pick the folder itself, not a file inside it, and not
+            extension-firefox next to it: that is the Firefox build, which
+            Chromium loads without complaint and without a background, so
+            nothing works. The id is pinned to ${chromium_id} by the
+            committed key, so the native host keeps working across
+            reloads.${RESET}
 
 ${BOLD}Try it${RESET}
 

@@ -68,7 +68,7 @@ jobs:
           if worker != "background.js":
               problems.append("background.service_worker must be background.js")
           if "scripts" in manifest.get("background", {}):
-              problems.append("background.scripts is Firefox-only and Manifest V3 rejects it")
+              problems.append("background.scripts is Firefox-only; Chromium loads it with no background at all")
 
           # install.sh derives the Firefox manifest by replacing everything
           # above this line, and derives the extension id from the key.

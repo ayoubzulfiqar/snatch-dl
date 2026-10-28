@@ -166,6 +166,12 @@ jobs:
           # of the archive, which is what both browsers expect.
           (cd dist/chromium && zip -q -r "../snatch-extension-chromium-${VERSION}.zip" .)
           (cd dist/firefox  && zip -q -r "../snatch-extension-firefox-${VERSION}.zip" .)
+          # Brave is Chromium and loads exactly these files, so its zip is a
+          # copy. It exists because a Brave user scanning the asset list for
+          # their browser's name found only "firefox", took that one, and got
+          # an extension that loads cleanly in Chromium with no background
+          # behind it, so it never captures anything.
+          cp "dist/snatch-extension-chromium-${VERSION}.zip" "dist/snatch-extension-brave-${VERSION}.zip"
           rm -rf dist/chromium dist/firefox
           ls -l dist
 

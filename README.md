@@ -137,12 +137,21 @@ You can also download it from any release as a zip.
 
 ### Chrome, Chromium, Brave, Edge, Opera, Vivaldi
 
-1. Open `chrome://extensions`
+1. Open `chrome://extensions`. In Brave that is `brave://extensions`.
 2. Turn on **Developer mode**. It is in the top right.
 3. Click **Load unpacked**
 4. Pick the folder `/usr/share/snatch-dl/extension`
 
-Pick the **folder**. Not a file inside it.
+Pick the **folder**. Not a file inside it. And not `extension-firefox` next to
+it: that one is for Firefox. A Chromium browser loads it without a word of
+complaint, but runs no background for it, so it never captures anything and
+the button on a video does nothing.
+
+**From a release zip instead.** Brave takes `snatch-extension-brave-<version>.zip`.
+Every other Chromium browser takes `snatch-extension-chromium-<version>.zip`.
+They hold the same files. Unzip into a folder you will keep, then **Load
+unpacked** on that folder. The browser reads it from there at every start, so
+do not delete the folder afterwards.
 
 > You have to use Developer mode. Chrome only takes packed extensions from its
 > own store. There is no way around that unless Snatch goes on the store.
